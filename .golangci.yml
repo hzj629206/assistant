@@ -1,0 +1,147 @@
+# https://github.com/golangci/golangci-lint/blob/HEAD/.golangci.reference.yml
+version: "2"
+
+run:
+    timeout: 10m
+
+# see: https://golangci-lint.run/docs/linters/
+linters:
+    default: all
+    settings:
+        # Finds commonly misspelled English words.
+        misspell:
+            locale: US
+        # Checks assignments with too many blank identifiers (e.g. x, _, _, _, := f()).
+        dogsled:
+            max-blank-identifiers: 3
+        # Provides diagnostics that check for bugs, performance and style issues.
+        gocritic:
+            disabled-checks: []
+            enabled-checks: []
+        # Inspects source code for security problems.
+        gosec:
+            excludes:
+                # Use of weak cryptographic primitive
+                - G401
+                # Blocklisted import weak cryptographic primitive
+                - G501
+                # Profiling endpoint is automatically exposed on /debug/pprof
+                - G108
+                # Use of unsafe calls should be audited
+                - G103
+                # Use of weak random number generator (math/rand or math/rand/v2 instead of crypto/rand)
+                - G404
+                # Potential Integer overflow made by strconv.Atoi result conversion to int16/32
+                - G109
+                # Exported struct field matches secret pattern
+                - G117
+        # It's the set of rules from staticcheck.
+        staticcheck:
+            checks:
+                - all
+                # Incorrect or missing package comment.
+                - -ST1000
+                # The documentation of an exported function should start with the function's name.
+                - -ST1020
+                # The documentation of an exported type should start with type's name.
+                - -ST1021
+                # The documentation of an exported variable or constant should start with variable's name.
+                - -ST1022
+                # Apply De Morgan's law.
+                - -QF1001
+        # Fast, configurable, extensible, flexible, and beautiful linter for Go.
+        revive:
+            rules:
+                # Exported function and methods should have comments.
+                - name: exported
+                  disabled: true
+        # Checks that fmt.Sprintf can be replaced with a faster alternative.
+        perfsprint:
+            # Enable/disable optimization of string formatting.
+            string-format: false
+
+    disable:
+        # Checks for long functions.
+        - funlen
+        # Checks function and package cyclomatic complexity.
+        - cyclop
+        # Reports deeply nested if statements.
+        - nestif
+        # Go linter that checks if package imports are in a list of acceptable packages.
+        - depguard
+        # Check that struct tags are well aligned.
+        - tagalign
+        # Enforce field tags in (un)marshaled structs.
+        - musttag
+        # Checks that no init functions are present in Go code.
+        - gochecknoinits
+        # Check that no global variables exist.
+        - gochecknoglobals
+        # Linter that makes you use a separate _test package.
+        - testpackage
+        # Detects usage of FIXME, TODO and other keywords inside comments.
+        - godox
+        # Computes and checks the cognitive complexity of functions.
+        - gocognit
+        # Check exhaustiveness of enum switch statements.
+        - exhaustive
+        # Checks if all structure fields are initialized.
+        - exhaustruct
+        # Computes and checks the cyclomatic complexity of functions.
+        - gocyclo
+        # Checks the struct tags.
+        - tagliatelle
+        # Thelper detects tests helpers which do not start with the t.Helper() method.
+        - thelper
+        # Detects missing usage of t.Parallel() method in your Go test.
+        - paralleltest
+        # Manage the use of 'replace', 'retract', and 'excludes' directives in go.mod.
+        - gomoddirectives
+        # Checks usage of github.com/stretchr/testify.
+        - testifylint
+        # New major version. Use wsl_v5 instead.
+        - wsl
+        # Add or remove empty lines.
+        - wsl_v5
+        # Checks that the length of a variable's name matches its scope.
+        - varnamelen
+        # An analyzer to detect magic numbers.
+        - mnd
+        # Maintidx measures the maintainability index of each function.
+        - maintidx
+        # Reports direct reads from proto message fields when getters should be used.
+        - protogetter
+        # Reports all named returns.
+        - nonamedreturns
+        # Accept Interfaces, Return Concrete Types.
+        - ireturn
+        # Checks the order of functions, methods, and constructors.
+        - funcorder
+        # Disallows inline error handling.
+        - noinlineerr
+        # Checks that there is no simultaneous return of nil error and an invalid value.
+        - nilnil
+        # Intrange is a linter to find places where for loops could make use of an integer range.
+        - intrange
+        # Checks for a new line before return and branch statements to increase code clarity.
+        - nlreturn
+        # Check if comments end in a period.
+        - godot
+        # Checks Golang's documentation practice (godoc).
+        - godoclint
+        # Detects duplicate fragments of code.
+        - dupl
+        # Checks that errors returned from external packages are wrapped.
+        - wrapcheck
+        # Checks that functions with naked returns are not longer than a maximum size (can be zero).
+        - nakedret
+        # Finds repeated strings that could be replaced by a constant.
+        - goconst
+        # Check errors handling expressions.
+        - err113
+        # Reports long lines.
+        - lll
+
+issues:
+    max-issues-per-linter: 0
+    max-same-issues: 0
