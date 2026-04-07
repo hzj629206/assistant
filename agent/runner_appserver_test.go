@@ -670,8 +670,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 				"cwd":            cwd,
 				"approvalPolicy": "never",
 				"config": map[string]any{
-					"sandbox_workspace_write.network_access": true,
-					"web_search":                             "live",
+					"web_search": "live",
 				},
 				"sandbox": "read-only",
 				"dynamicTools": []map[string]any{

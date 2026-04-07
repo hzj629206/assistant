@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -199,16 +200,17 @@ func newRunner(ctx context.Context, cfg config.CodexConfig) (agent.Runner, error
 			},
 			TurnOptions: codexapp.TurnOptions{
 				Model:         cfg.Model,
-				SandboxPolicy: appServerSandboxPolicy(cfg.Sandbox),
+				SandboxPolicy: appServerTurnSandboxPolicy(cfg.Sandbox, cfg.AdditionalWritableRoots),
 				Effort:        appServerReasoningEffort(cfg.ReasoningEffort),
 			},
 		})
 	case "exec":
 		return agent.NewCodexRunner(agent.CodexRunnerOptions{
 			ThreadOptions: codexcli.ThreadOptions{
-				Model:                cfg.Model,
-				SandboxMode:          codexSandboxMode(cfg.Sandbox),
-				ModelReasoningEffort: codexReasoningEffort(cfg.ReasoningEffort),
+				Model:                 cfg.Model,
+				SandboxMode:           codexSandboxMode(cfg.Sandbox),
+				ModelReasoningEffort:  codexReasoningEffort(cfg.ReasoningEffort),
+				AdditionalDirectories: codexAdditionalDirectories(cfg.AdditionalWritableRoots),
 			},
 		}), nil
 	case "noop":
@@ -258,6 +260,18 @@ func appServerSandboxPolicy(value string) any {
 	}
 }
 
+func appServerTurnSandboxPolicy(value string, writableRoots []string) any {
+	if value != "workspace-write" {
+		return appServerSandboxPolicy(value)
+	}
+
+	policy := agent.SandboxPolicy{"type": "workspaceWrite"}
+	if len(writableRoots) != 0 {
+		policy["writableRoots"] = append([]string(nil), writableRoots...)
+	}
+	return policy
+}
+
 func codexReasoningEffort(value string) codexcli.ModelReasoningEffort {
 	switch value {
 	case "minimal":
@@ -282,6 +296,32 @@ func codexSandboxMode(value string) codexcli.SandboxMode {
 	default:
 		return codexcli.SandboxReadOnly
 	}
+}
+
+func codexAdditionalDirectories(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	directories := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		directory := path
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() {
+			directory = filepath.Dir(path)
+		}
+		directory = filepath.Clean(directory)
+		if _, ok := seen[directory]; ok {
+			continue
+		}
+		seen[directory] = struct{}{}
+		directories = append(directories, directory)
+	}
+	if len(directories) == 0 {
+		return nil
+	}
+	return directories
 }
 
 func tryRemoteListen(cfg config.Config) (net.Listener, error) {

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
@@ -21,11 +22,10 @@ import (
 
 type seaTalkSendFileTool struct{}
 
-type seaTalkSendInteractiveMessageTool struct{}
-
-type seaTalkUpdateInteractiveMessageTool struct{}
+type seaTalkPushInteractiveMessageTool struct{}
 
 type interactiveToolPayload struct {
+	Mode      string                    `json:"mode,omitempty"`
 	MessageID string                    `json:"message_id,omitempty"`
 	Elements  []interactiveElementInput `json:"elements"`
 }
@@ -58,13 +58,24 @@ type interactiveButtonInput struct {
 
 type interactiveImageInput struct {
 	Base64Content string `json:"base64_content"`
-	LocalFilePath string `json:"local_file_path,omitempty"`
 }
 
 const (
 	interactiveCallbackValueMaxLength = 200
 	interactiveCallbackValueRefPrefix = "stcb:"
 	interactiveCallbackValueTTL       = 30 * 24 * time.Hour
+	interactivePushModeSend           = "send"
+	interactivePushModeUpdate         = "update"
+	interactiveTitleMaxCount          = 3
+	interactiveDescriptionMaxCount    = 5
+	interactiveButtonMaxCount         = 5
+	interactiveButtonGroupMaxCount    = 3
+	interactiveImageMaxCount          = 3
+	interactiveTitleMaxLength         = 120
+	interactiveDescriptionSchemaMax   = 800
+	interactiveDescriptionMaxLength   = 1000
+	interactiveButtonTextMaxLength    = 50
+	seaTalkFileBase64MaxBytes         = 5 * 1024 * 1024
 )
 
 func (seaTalkSendFileTool) Name() string {
@@ -74,7 +85,6 @@ func (seaTalkSendFileTool) Name() string {
 func (seaTalkSendFileTool) Description() string {
 	return strings.TrimSpace(`
 Send a local file from the current machine into the current SeaTalk conversation.
-Use this when you generated or updated a data artifact such as a CSV, JSON, log bundle, or report file and the user should receive the file itself.
 `)
 }
 
@@ -82,8 +92,12 @@ func (seaTalkSendFileTool) InputSchema() any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"local_file_path": map[string]any{"type": "string"},
-			"filename":        map[string]any{"type": "string"},
+			"local_file_path": map[string]any{
+				"type": "string",
+			},
+			"filename": map[string]any{
+				"type": "string",
+			},
 		},
 		"required":             []any{"local_file_path"},
 		"additionalProperties": false,
@@ -127,6 +141,14 @@ func (seaTalkSendFileTool) Call(ctx context.Context, input json.RawMessage) (any
 	}
 	if len(content) == 0 {
 		return nil, errors.New("seatalk send file tool failed: local file is empty")
+	}
+	base64Size := base64.StdEncoding.EncodedLen(len(content))
+	if base64Size > seaTalkFileBase64MaxBytes {
+		return nil, fmt.Errorf(
+			"seatalk send file tool failed: base64-encoded file content exceeds 5M limit: got %d bytes, max %d bytes",
+			base64Size,
+			seaTalkFileBase64MaxBytes,
+		)
 	}
 
 	filename := strings.TrimSpace(payload.Filename)
@@ -173,15 +195,20 @@ func (seaTalkSendFileTool) Call(ctx context.Context, input json.RawMessage) (any
 	}, nil
 }
 
-func (seaTalkSendInteractiveMessageTool) Name() string {
-	return "seatalk_send_interactive_message"
+func (seaTalkPushInteractiveMessageTool) Name() string {
+	return "seatalk_push_interactive_message"
 }
 
-func (seaTalkSendInteractiveMessageTool) Description() string {
+func (seaTalkPushInteractiveMessageTool) Description() string {
 	return strings.TrimSpace(`
-Send a SeaTalk interactive message card into the current conversation, including rich content cards without any action buttons.
-Use this when the user needs explicit choices, confirmation, approval, or clear status updates for important events and progress.
-Description elements support SeaTalk Markdown. Use description.format=1 for Markdown or omit it to use Markdown by default. Use description.format=2 for plain text.
+Send or update a SeaTalk interactive message card in the current conversation.
+Set "mode" to control whether this call sends a new card or updates an existing card.
+- mode="send": always send a new interactive card and ignore "message_id".
+- mode="update": update "message_id" if provided, otherwise update the current interactive card in context. Fail if neither target is available.
+Elements are rendered top-to-bottom in array order. Mix title, description, button, button_group, and image elements freely to build the card.
+Limits per card: title <= 3, description <= 5, standalone button <= 5, button_group <= 3, image <= 3.
+Before sending or updating a card, you must self-check element counts and ensure every per-card limit is satisfied.
+Description elements use SeaTalk Markdown format. Each description element supports up to 800 characters, so use separate description elements only when they add meaningful structure.
 For callback buttons, set "value" to a JSON-encoded callback action payload serialized into a string.
 Supported callback action payloads:
 - Tool call: {"action":"tool_call","tool_name":"...","tool_input_json":"{...}"}
@@ -190,74 +217,25 @@ Keep callback values compact when possible. Oversized valid callback payloads ar
 `)
 }
 
-func (seaTalkSendInteractiveMessageTool) InputSchema() any {
-	return interactiveToolInputSchema(false)
+func (seaTalkPushInteractiveMessageTool) InputSchema() any {
+	return interactiveToolInputSchema()
 }
 
-func (seaTalkSendInteractiveMessageTool) OutputSchema() any {
+func (seaTalkPushInteractiveMessageTool) OutputSchema() any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"message_id": map[string]any{"type": "string"},
+			"message_id": map[string]any{
+				"type":        "string",
+				"description": "The SeaTalk message ID that was sent or updated.",
+			},
 		},
 		"required":             []any{"message_id"},
 		"additionalProperties": false,
 	}
 }
 
-func (seaTalkSendInteractiveMessageTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
-	responder, _, err := seaTalkResponderFromToolContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	payload, err := decodeInteractiveToolPayload(input)
-	if err != nil {
-		return nil, fmt.Errorf("seatalk send interactive message tool failed: %w", err)
-	}
-
-	message, err := payload.buildMessage(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("seatalk send interactive message tool failed: %w", err)
-	}
-
-	result, err := responder.SendInteractive(ctx, message)
-	if err != nil {
-		return nil, fmt.Errorf("seatalk send interactive message tool failed: %w", err)
-	}
-
-	return map[string]any{"message_id": result.MessageID}, nil
-}
-
-func (seaTalkUpdateInteractiveMessageTool) Name() string {
-	return "seatalk_update_interactive_message"
-}
-
-func (seaTalkUpdateInteractiveMessageTool) Description() string {
-	return strings.TrimSpace(`
-Update a SeaTalk interactive message card that was previously sent by the bot in the current conversation.
-Use this after an action with side effects has already been executed and the card should be updated to reflect the result, status, or next state without repeating that action.
-If "message_id" is omitted during an interactive button callback turn, the clicked interactive message is updated by default.
-`)
-}
-
-func (seaTalkUpdateInteractiveMessageTool) InputSchema() any {
-	return interactiveToolInputSchema(true)
-}
-
-func (seaTalkUpdateInteractiveMessageTool) OutputSchema() any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"message_id": map[string]any{"type": "string"},
-			"updated":    map[string]any{"type": "boolean"},
-		},
-		"required":             []any{"message_id", "updated"},
-		"additionalProperties": false,
-	}
-}
-
-func (seaTalkUpdateInteractiveMessageTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
+func (seaTalkPushInteractiveMessageTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
 	responder, turnReq, err := seaTalkResponderFromToolContext(ctx)
 	if err != nil {
 		return nil, err
@@ -265,41 +243,126 @@ func (seaTalkUpdateInteractiveMessageTool) Call(ctx context.Context, input json.
 
 	payload, err := decodeInteractiveToolPayload(input)
 	if err != nil {
-		return nil, fmt.Errorf("seatalk update interactive message tool failed: %w", err)
+		return nil, fmt.Errorf("seatalk push interactive message tool failed: %w", err)
+	}
+	if err = validateInteractiveInputElementCounts(payload.Elements); err != nil {
+		return nil, fmt.Errorf("seatalk push interactive message tool failed: %w", err)
 	}
 
+	mode := strings.TrimSpace(payload.Mode)
+	if mode == "" {
+		return nil, errors.New(`seatalk push interactive message tool failed: mode is required and must be "send" or "update"`)
+	}
 	messageID := strings.TrimSpace(payload.MessageID)
 	if messageID == "" {
 		messageID = responder.CurrentInteractiveMessageID()
 	}
-	if messageID == "" {
-		return nil, errors.New("seatalk update interactive message tool failed: message_id is empty")
+	switch mode {
+	case interactivePushModeSend, interactivePushModeUpdate:
+	default:
+		return nil, fmt.Errorf("seatalk push interactive message tool failed: invalid mode %q", mode)
+	}
+	if mode == interactivePushModeSend {
+		messageID = ""
+	}
+	if mode == interactivePushModeUpdate && messageID == "" {
+		return nil, errors.New("seatalk push interactive message tool failed: update mode requires message_id or current interactive message context")
 	}
 
 	message, err := payload.buildMessage(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("seatalk update interactive message tool failed: %w", err)
+		return nil, fmt.Errorf("seatalk push interactive message tool failed: %w", err)
+	}
+
+	if messageID == "" {
+		log.Printf(
+			"seatalk tool push_interactive_message: conversation=%q target=%q mode=send element_count=%d",
+			turnReq.Conversation.Key,
+			responder.target.logValue(),
+			len(message.Elements),
+		)
+		result, err := responder.SendInteractive(ctx, message)
+		if err != nil {
+			return nil, fmt.Errorf("seatalk push interactive message tool failed: %w", err)
+		}
+
+		return map[string]any{
+			"message_id": result.MessageID,
+		}, nil
 	}
 
 	log.Printf(
-		"seatalk tool update_interactive_message: conversation=%s target=%s message_id=%s element_count=%d",
+		"seatalk tool push_interactive_message: conversation=%q target=%q mode=update message_id=%q element_count=%d",
 		turnReq.Conversation.Key,
 		responder.target.logValue(),
 		messageID,
 		len(message.Elements),
 	)
 	if err := responder.UpdateInteractive(ctx, messageID, message); err != nil {
-		return nil, fmt.Errorf("seatalk update interactive message tool failed: %w", err)
+		return nil, fmt.Errorf("seatalk push interactive message tool failed: %w", err)
 	}
 
 	return map[string]any{
 		"message_id": messageID,
-		"updated":    true,
 	}, nil
 }
 
-func interactiveToolInputSchema(includeMessageID bool) map[string]any {
+func validateInteractiveInputElementCounts(elements []interactiveElementInput) error {
+	titleCount := 0
+	descriptionCount := 0
+	buttonCount := 0
+	buttonGroupCount := 0
+	imageCount := 0
+
+	var element interactiveElementInput
+	for _, element = range elements {
+		switch strings.TrimSpace(element.ElementType) {
+		case "title":
+			titleCount++
+		case "description":
+			descriptionCount++
+		case "button":
+			buttonCount++
+		case "button_group":
+			buttonGroupCount++
+		case "image":
+			imageCount++
+		}
+	}
+
+	violations := make([]string, 0, 5)
+	if titleCount > interactiveTitleMaxCount {
+		violations = append(violations, fmt.Sprintf("title=%d (max %d)", titleCount, interactiveTitleMaxCount))
+	}
+	if descriptionCount > interactiveDescriptionMaxCount {
+		violations = append(violations, fmt.Sprintf("description=%d (max %d)", descriptionCount, interactiveDescriptionMaxCount))
+	}
+	if buttonCount > interactiveButtonMaxCount {
+		violations = append(violations, fmt.Sprintf("standalone_button=%d (max %d)", buttonCount, interactiveButtonMaxCount))
+	}
+	if buttonGroupCount > interactiveButtonGroupMaxCount {
+		violations = append(violations, fmt.Sprintf("button_group=%d (max %d)", buttonGroupCount, interactiveButtonGroupMaxCount))
+	}
+	if imageCount > interactiveImageMaxCount {
+		violations = append(violations, fmt.Sprintf("image=%d (max %d)", imageCount, interactiveImageMaxCount))
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("interactive card element count exceeds per-card limits: %s", strings.Join(violations, ", "))
+	}
+
+	return nil
+}
+
+func interactiveToolInputSchema() map[string]any {
 	properties := map[string]any{
+		"mode": map[string]any{
+			"type": "string",
+			"enum": []any{interactivePushModeSend, interactivePushModeUpdate},
+		},
+		"message_id": map[string]any{
+			"type":        "string",
+			"description": `Optional target interactive message ID. Ignored when mode="send".`,
+		},
 		"elements": map[string]any{
 			"type":     "array",
 			"minItems": 1,
@@ -313,7 +376,10 @@ func interactiveToolInputSchema(includeMessageID bool) map[string]any {
 					"title": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"text": map[string]any{"type": "string"},
+							"text": map[string]any{
+								"type":      "string",
+								"maxLength": interactiveTitleMaxLength,
+							},
 						},
 						"required":             []any{"text"},
 						"additionalProperties": false,
@@ -321,12 +387,9 @@ func interactiveToolInputSchema(includeMessageID bool) map[string]any {
 					"description": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"text":   map[string]any{"type": "string"},
-							"format": map[string]any{
-								"type":        "integer",
-								"enum":        []any{seatalk.TextFormatMarkdown, seatalk.TextFormatPlain},
-								"default":     seatalk.TextFormatMarkdown,
-								"description": "1 for Markdown (default), 2 for plain text.",
+							"text": map[string]any{
+								"type":      "string",
+								"maxLength": interactiveDescriptionSchemaMax,
 							},
 						},
 						"required":             []any{"text"},
@@ -342,9 +405,11 @@ func interactiveToolInputSchema(includeMessageID bool) map[string]any {
 					"image": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"base64_content":  map[string]any{"type": "string"},
-							"local_file_path": map[string]any{"type": "string"},
+							"base64_content": map[string]any{
+								"type": "string",
+							},
 						},
+						"required":             []any{"base64_content"},
 						"additionalProperties": false,
 					},
 				},
@@ -354,15 +419,10 @@ func interactiveToolInputSchema(includeMessageID bool) map[string]any {
 		},
 	}
 
-	required := []any{"elements"}
-	if includeMessageID {
-		properties["message_id"] = map[string]any{"type": "string"}
-	}
-
 	return map[string]any{
 		"type":                 "object",
 		"properties":           properties,
-		"required":             required,
+		"required":             []any{"mode", "elements"},
 		"additionalProperties": false,
 	}
 }
@@ -372,32 +432,53 @@ func interactiveButtonSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"button_type": map[string]any{
-				"type": "string",
-				"enum": []any{seatalk.InteractiveButtonTypeCallback, seatalk.InteractiveButtonTypeRedirect},
+				"type":        "string",
+				"enum":        []any{seatalk.InteractiveButtonTypeCallback, seatalk.InteractiveButtonTypeRedirect},
+				"description": `Button behavior: "redirect" opens an external link, "callback" executes the action payload.`,
 			},
-			"text":  map[string]any{"type": "string"},
-			"value": map[string]any{"type": "string"},
+			"text": map[string]any{
+				"type":      "string",
+				"maxLength": interactiveButtonTextMaxLength,
+			},
+			"value": map[string]any{
+				"type":        "string",
+				"description": `Callback action payload when button_type="callback".`,
+			},
 			"mobile_link": map[string]any{
-				"type": "object",
+				"type":        "object",
+				"description": `Redirect destination used on SeaTalk mobile clients when button_type="redirect".`,
 				"properties": map[string]any{
 					"type": map[string]any{
-						"type": "string",
-						"enum": []any{seatalk.InteractiveLinkTypeRN, seatalk.InteractiveLinkTypeWeb},
+						"type":        "string",
+						"enum":        []any{seatalk.InteractiveLinkTypeRN, seatalk.InteractiveLinkTypeWeb},
+						"description": `"rn" opens an in-app RN page; "web" opens a web URL.`,
 					},
-					"path":   map[string]any{"type": "string"},
-					"params": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+					"path": map[string]any{
+						"type":        "string",
+						"description": `RN path starting with "/" or a full web/external URL for mobile redirect.`,
+					},
+					"params": map[string]any{
+						"type":                 "object",
+						"description":          `Optional query parameters passed with an "rn" mobile link.`,
+						"additionalProperties": map[string]any{"type": "string"},
+					},
 				},
 				"required":             []any{"type", "path"},
 				"additionalProperties": false,
 			},
 			"desktop_link": map[string]any{
-				"type": "object",
+				"type":        "object",
+				"description": `Redirect destination used on SeaTalk desktop clients when button_type="redirect".`,
 				"properties": map[string]any{
 					"type": map[string]any{
-						"type": "string",
-						"enum": []any{seatalk.InteractiveLinkTypeWeb},
+						"type":        "string",
+						"enum":        []any{seatalk.InteractiveLinkTypeWeb},
+						"description": `Desktop redirect type. SeaTalk currently supports only "web".`,
 					},
-					"path": map[string]any{"type": "string"},
+					"path": map[string]any{
+						"type":        "string",
+						"description": `Full web app or external website URL opened on desktop.`,
+					},
 				},
 				"required":             []any{"type", "path"},
 				"additionalProperties": false,
@@ -432,8 +513,52 @@ func (p interactiveToolPayload) buildMessage(ctx context.Context) (seatalk.Inter
 	if len(elements) == 0 {
 		return seatalk.InteractiveMessage{}, errors.New("elements are empty after processing")
 	}
+	if err := validateInteractiveCardElementCounts(elements); err != nil {
+		return seatalk.InteractiveMessage{}, err
+	}
 
 	return seatalk.InteractiveMessage{Elements: elements}, nil
+}
+
+func validateInteractiveCardElementCounts(elements []seatalk.InteractiveElement) error {
+	titleCount := 0
+	descriptionCount := 0
+	buttonCount := 0
+	buttonGroupCount := 0
+	imageCount := 0
+
+	for _, element := range elements {
+		switch element.(type) {
+		case seatalk.InteractiveTitleElement:
+			titleCount++
+		case seatalk.InteractiveDescriptionElement:
+			descriptionCount++
+		case seatalk.InteractiveButtonElement:
+			buttonCount++
+		case seatalk.InteractiveButtonGroupElement:
+			buttonGroupCount++
+		case seatalk.InteractiveImageElement:
+			imageCount++
+		}
+	}
+
+	if titleCount > interactiveTitleMaxCount {
+		return fmt.Errorf("title element count exceeds limit: got %d, max %d", titleCount, interactiveTitleMaxCount)
+	}
+	if descriptionCount > interactiveDescriptionMaxCount {
+		return fmt.Errorf("description element count exceeds limit: got %d, max %d", descriptionCount, interactiveDescriptionMaxCount)
+	}
+	if buttonCount > interactiveButtonMaxCount {
+		return fmt.Errorf("standalone button element count exceeds limit: got %d, max %d", buttonCount, interactiveButtonMaxCount)
+	}
+	if buttonGroupCount > interactiveButtonGroupMaxCount {
+		return fmt.Errorf("button_group element count exceeds limit: got %d, max %d", buttonGroupCount, interactiveButtonGroupMaxCount)
+	}
+	if imageCount > interactiveImageMaxCount {
+		return fmt.Errorf("image element count exceeds limit: got %d, max %d", imageCount, interactiveImageMaxCount)
+	}
+
+	return nil
 }
 
 func (e interactiveElementInput) build(ctx context.Context) ([]seatalk.InteractiveElement, error) {
@@ -443,22 +568,19 @@ func (e interactiveElementInput) build(ctx context.Context) ([]seatalk.Interacti
 			return nil, errors.New("title.text is empty")
 		}
 		return []seatalk.InteractiveElement{
-			seatalk.InteractiveTitleElement{Text: strings.TrimSpace(e.Title.Text)},
+			seatalk.InteractiveTitleElement{Text: truncateRunes(strings.TrimSpace(e.Title.Text), interactiveTitleMaxLength)},
 		}, nil
 	case "description":
 		if e.Description == nil || strings.TrimSpace(e.Description.Text) == "" {
 			return nil, errors.New("description.text is empty")
 		}
-		format := e.Description.Format
-		if format == 0 {
-			format = seatalk.TextFormatMarkdown
-		}
-		if format != seatalk.TextFormatMarkdown && format != seatalk.TextFormatPlain {
-			return nil, fmt.Errorf("unsupported description.format %d", format)
+		descriptionText, err := normalizeInteractiveDescriptionText(strings.TrimSpace(e.Description.Text))
+		if err != nil {
+			return nil, err
 		}
 		return []seatalk.InteractiveElement{seatalk.InteractiveDescriptionElement{
-			Text:   strings.TrimSpace(e.Description.Text),
-			Format: format,
+			Text:   descriptionText,
+			Format: seatalk.TextFormatMarkdown,
 		}}, nil
 	case "button":
 		if e.Button == nil {
@@ -509,26 +631,21 @@ func (i interactiveImageInput) build() (seatalk.InteractiveElement, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode image.base64_content: %w", err)
 		}
+		base64Size := base64.StdEncoding.EncodedLen(len(decoded))
+		if base64Size > seaTalkFileBase64MaxBytes {
+			return nil, fmt.Errorf(
+				"base64-encoded image content exceeds 5M limit: got %d bytes, max %d bytes",
+				base64Size,
+				seaTalkFileBase64MaxBytes,
+			)
+		}
 		if err := validateInteractiveImageContent(decoded); err != nil {
 			return nil, fmt.Errorf("validate image.base64_content: %w", err)
 		}
 		return seatalk.InteractiveImageElement{Content: decoded}, nil
 	}
 
-	if path := filepath.Clean(strings.TrimSpace(i.LocalFilePath)); path != "" && path != "." {
-		content, err := os.ReadFile(path)
-		if err != nil {
-			log.Printf("seatalk interactive image local file load failed: path=%s err=%v", path, err)
-			return nil, nil
-		}
-		if err := validateInteractiveImageContent(content); err != nil {
-			log.Printf("seatalk interactive image local file validation failed: path=%s err=%v", path, err)
-			return nil, nil
-		}
-		return seatalk.InteractiveImageElement{Content: content}, nil
-	}
-
-	return nil, errors.New("image source is empty")
+	return nil, errors.New("image.base64_content is empty")
 }
 
 func validateInteractiveImageContent(content []byte) error {
@@ -552,7 +669,7 @@ func (b interactiveButtonInput) build(ctx context.Context) (seatalk.InteractiveB
 	}
 	button := seatalk.InteractiveButton{
 		Type:        buttonType,
-		Text:        strings.TrimSpace(b.Text),
+		Text:        truncateRunes(strings.TrimSpace(b.Text), interactiveButtonTextMaxLength),
 		Value:       b.Value,
 		MobileLink:  b.MobileLink,
 		DesktopLink: b.DesktopLink,
@@ -667,6 +784,32 @@ func newInteractiveCallbackValueToken() (string, error) {
 
 func interactiveCallbackValueCacheKey(token string) string {
 	return "seatalk:interactive_callback_value:" + token
+}
+
+func truncateRunes(value string, maxLength int) string {
+	if maxLength <= 0 {
+		return ""
+	}
+
+	runes := []rune(value)
+	if len(runes) <= maxLength {
+		return value
+	}
+
+	return string(runes[:maxLength])
+}
+
+func normalizeInteractiveDescriptionText(value string) (string, error) {
+	normalized := normalizeSeaTalkMarkdown(value)
+	if utf8.RuneCountInString(normalized) > interactiveDescriptionMaxLength {
+		return "", fmt.Errorf(
+			"description.text exceeds SeaTalk hard limit: got %d characters; keep description.text within %d characters",
+			utf8.RuneCountInString(value),
+			interactiveDescriptionSchemaMax,
+		)
+	}
+
+	return normalized, nil
 }
 
 func validateInteractiveCallbackPayload(raw string) error {

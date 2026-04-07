@@ -76,6 +76,9 @@ If you want to extend Codex capabilities for this project, configure the local `
 
 Those extensions are picked up through the local `Codex CLI` used by the service.
 
+Codex also discovers and loads applicable `AGENTS.md` files from the directory context where it is started.
+You can use `AGENTS.md` to inject project-specific context, coding conventions, and workflow instructions when Codex is launched inside the relevant workspace.
+
 If MCP tool outputs are truncated in the local `Codex CLI`, increase `tool_output_token_limit` in the `Codex CLI` configuration.
 This setting is managed by the local `Codex CLI`, not by this repository.
 
@@ -124,8 +127,7 @@ After installation, run the service with `codexd`.
 
 Security note: the service runs with `read-only` sandbox mode and `never` approval by default, while `WebSearch` and `NetworkAccess` are enabled by default for the local `codex` CLI backend.
 Do not store sensitive data in the working directory because the bot is able to read files from that directory, search the web, and access network resources.
-Grant the bot only the minimum permissions it needs so you reduce the blast radius of abuse, prompt misuse, and malicious attacks.
-
+Restrict the bot's access scope to the minimum necessary to reduce the risk of misuse, abuse, and attacks by others.
 ### 1. Use The Default Config File
 
 The service primarily relies on a YAML config file. If `$HOME/.assistant/config.yml` exists, it is loaded automatically.
@@ -139,7 +141,7 @@ remote_ssh_user: ubuntu
 ssh_key_path: /path/to/id_rsa
 codex:
   backend: appserver
-  model: gpt-5.4-mini
+  model: gpt-5.4
   reasoning_effort: low
   sandbox: read-only
 seatalk:

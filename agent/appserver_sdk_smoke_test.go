@@ -139,8 +139,7 @@ func TestNewAppServerRunnerDefaultsReasoningToMedium(t *testing.T) {
 		t.Fatalf("unexpected default reasoning effort: %v", runner.turnOptions.Effort)
 	}
 	expectedConfig := map[string]any{
-		appServerConfigNetworkAccessKey: true,
-		appServerConfigWebSearchKey:     "live",
+		appServerConfigWebSearchKey: "live",
 	}
 	if !reflect.DeepEqual(runner.startOptions.Config, expectedConfig) {
 		t.Fatalf("unexpected default start config: %#v", runner.startOptions.Config)
@@ -247,15 +246,16 @@ func TestNewAppServerRunnerPreservesExplicitConfigOverrides(t *testing.T) {
 	runner, err := NewAppServerRunner(context.Background(), AppServerRunnerOptions{
 		Client: &appcodex.Codex{},
 		StartOptions: appcodex.ThreadStartOptions{
+			SandboxPolicy: appcodex.SandboxModeWorkspaceWrite,
 			Config: map[string]any{
 				appServerConfigWebSearchKey: "disabled",
 				"custom_key":                "start",
 			},
 		},
 		ResumeOptions: appcodex.ThreadResumeOptions{
+			Sandbox: appcodex.SandboxModeWorkspaceWrite,
 			Config: map[string]any{
-				appServerConfigNetworkAccessKey: false,
-				"custom_key":                    "resume",
+				"custom_key": "resume",
 			},
 		},
 	})
@@ -264,21 +264,25 @@ func TestNewAppServerRunnerPreservesExplicitConfigOverrides(t *testing.T) {
 	}
 
 	expectedStartConfig := map[string]any{
-		appServerConfigNetworkAccessKey: true,
-		appServerConfigWebSearchKey:     "disabled",
-		"custom_key":                    "start",
+		appServerConfigWebSearchKey: "disabled",
+		"custom_key":                "start",
 	}
 	if !reflect.DeepEqual(runner.startOptions.Config, expectedStartConfig) {
 		t.Fatalf("unexpected start config: %#v", runner.startOptions.Config)
 	}
 
 	expectedResumeConfig := map[string]any{
-		appServerConfigNetworkAccessKey: false,
-		appServerConfigWebSearchKey:     "live",
-		"custom_key":                    "resume",
+		appServerConfigWebSearchKey: "live",
+		"custom_key":                "resume",
 	}
 	if !reflect.DeepEqual(runner.resumeOptions.Config, expectedResumeConfig) {
 		t.Fatalf("unexpected resume config: %#v", runner.resumeOptions.Config)
+	}
+	if runner.startOptions.SandboxPolicy != SandboxPolicyWorkspaceWrite.String() {
+		t.Fatalf("unexpected start sandbox policy: %#v", runner.startOptions.SandboxPolicy)
+	}
+	if runner.resumeOptions.Sandbox != SandboxPolicyWorkspaceWrite.String() {
+		t.Fatalf("unexpected resume sandbox policy: %#v", runner.resumeOptions.Sandbox)
 	}
 }
 
@@ -441,6 +445,13 @@ func buildAppServerSDKOptions(startOptions appcodex.ThreadStartOptions, resumeOp
 	startOptions.SandboxPolicy = normalizeAppServerSandboxPolicy(startOptions.SandboxPolicy)
 	resumeOptions.Sandbox = normalizeAppServerSandboxPolicy(resumeOptions.Sandbox)
 	turnOptions.SandboxPolicy = normalizeAppServerSandboxPolicy(turnOptions.SandboxPolicy)
+	if sandboxPolicy, ok := startOptions.SandboxPolicy.(SandboxPolicy); ok {
+		startOptions.SandboxPolicy = sandboxPolicy.String()
+	}
+	if sandboxPolicy, ok := resumeOptions.Sandbox.(SandboxPolicy); ok {
+		resumeOptions.Sandbox = sandboxPolicy.String()
+	}
+	turnOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(turnOptions.SandboxPolicy)
 	if startOptions.ApprovalPolicy == nil {
 		startOptions.ApprovalPolicy = appcodex.ApprovalPolicyNever
 	}

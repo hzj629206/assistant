@@ -27,10 +27,11 @@ type Config struct {
 
 // CodexConfig contains runner selection and model options.
 type CodexConfig struct {
-	Backend         string `json:"backend" yaml:"backend"`
-	Model           string `json:"model" yaml:"model"`
-	ReasoningEffort string `json:"reasoning_effort" yaml:"reasoning_effort"`
-	Sandbox         string `json:"sandbox" yaml:"sandbox"`
+	Backend                 string   `json:"backend" yaml:"backend"`
+	Model                   string   `json:"model" yaml:"model"`
+	ReasoningEffort         string   `json:"reasoning_effort" yaml:"reasoning_effort"`
+	Sandbox                 string   `json:"sandbox" yaml:"sandbox"`
+	AdditionalWritableRoots []string `json:"additional_writable_roots" yaml:"additional_writable_roots"`
 }
 
 type flagOverlay struct {
@@ -197,6 +198,7 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	cfg.Model = strings.TrimSpace(cfg.Model)
 	cfg.ReasoningEffort = strings.TrimSpace(strings.ToLower(cfg.ReasoningEffort))
 	cfg.Sandbox = strings.TrimSpace(strings.ToLower(cfg.Sandbox))
+	cfg.AdditionalWritableRoots = normalizeCodexAdditionalWritableRoots(cfg.AdditionalWritableRoots)
 
 	if cfg.Backend == "" {
 		cfg.Backend = "appserver"
@@ -230,6 +232,35 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	}
 
 	return nil
+}
+
+func normalizeCodexAdditionalWritableRoots(roots []string) []string {
+	if len(roots) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+
+		if absoluteRoot, err := filepath.Abs(root); err == nil {
+			root = absoluteRoot
+		}
+		root = filepath.Clean(root)
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		normalized = append(normalized, root)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }
 
 func validateSeaTalkConfig(cfg *seatalk.Config) error {

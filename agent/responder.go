@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	defaultTypingInitialDelay    = time.Second
-	defaultTypingRefreshCooldown = 3 * time.Second
+	defaultTypingInitialDelay    = 3 * time.Second
+	defaultTypingRefreshCooldown = 10 * time.Second
 )
 
 // Responder handles side effects for one inbound conversation turn.

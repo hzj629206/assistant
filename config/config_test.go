@@ -3,17 +3,21 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
 func TestNormalizeCodexConfig(t *testing.T) {
 	t.Parallel()
 
+	rootOne := t.TempDir()
+	rootTwo := filepath.Join(rootOne, "..", filepath.Base(rootOne))
 	cfg := CodexConfig{
-		Backend:         " AppServer ",
-		Model:           " gpt-5.4-mini ",
-		ReasoningEffort: " LOW ",
-		Sandbox:         " READ-ONLY ",
+		Backend:                 " AppServer ",
+		Model:                   " gpt-5.4-mini ",
+		ReasoningEffort:         " LOW ",
+		Sandbox:                 " READ-ONLY ",
+		AdditionalWritableRoots: []string{" ", rootOne, rootTwo},
 	}
 	if err := normalizeCodexConfig(&cfg); err != nil {
 		t.Fatalf("normalizeCodexConfig failed: %v", err)
@@ -29,6 +33,9 @@ func TestNormalizeCodexConfig(t *testing.T) {
 	}
 	if cfg.Sandbox != "read-only" {
 		t.Fatalf("unexpected sandbox: %s", cfg.Sandbox)
+	}
+	if len(cfg.AdditionalWritableRoots) != 1 || cfg.AdditionalWritableRoots[0] != filepath.Clean(rootOne) {
+		t.Fatalf("unexpected additional writable roots: %#v", cfg.AdditionalWritableRoots)
 	}
 }
 
@@ -244,6 +251,9 @@ codex:
   model: gpt-5.4
   reasoning_effort: medium
   sandbox: workspace-write
+  additional_writable_roots:
+    - /tmp/status.json
+    - /var/tmp/assistant-state
 seatalk:
   app_id: app-id
   app_secret: app-secret
@@ -266,6 +276,9 @@ seatalk:
 	}
 	if cfg.Codex.Backend != "exec" || cfg.Codex.Model != "gpt-5.4" || cfg.Codex.ReasoningEffort != "medium" || cfg.Codex.Sandbox != "workspace-write" {
 		t.Fatalf("unexpected codex config: %+v", cfg.Codex)
+	}
+	if !reflect.DeepEqual(cfg.Codex.AdditionalWritableRoots, []string{"/tmp/status.json", "/var/tmp/assistant-state"}) {
+		t.Fatalf("unexpected additional writable roots: %#v", cfg.Codex.AdditionalWritableRoots)
 	}
 	if cfg.SeaTalk.AppID != "app-id" {
 		t.Fatalf("unexpected seatalk app id: %s", cfg.SeaTalk.AppID)

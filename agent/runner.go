@@ -51,8 +51,6 @@ type NoopRunner struct {
 	tools         []Tool
 }
 
-const noopRunnerDebugReplyMaxChars = 3072
-
 var orderedListPrefixPattern = regexp.MustCompile(`^(\s*)(\d+)\. `)
 var noopRunnerDebugCategories = []string{"conversation", "message", "history", "merged", "prompts", "tools", "full"}
 
@@ -364,7 +362,6 @@ func escapeSeaTalkMarkdownLine(line string) string {
 }
 
 func formatSeaTalkMarkdownCodeBlock(text string) string {
-	text = truncateNoopDebugReply(text, noopRunnerDebugReplyMaxChars)
 	safe := strings.ReplaceAll(text, "```", "``\\`")
 	return "```\n" + safe + "\n```"
 }
@@ -388,26 +385,6 @@ func renderNoopDebugSummary(payload noopRunnerDebugPayload) string {
 
 func renderNoopDebugUnknownCategory(category string) string {
 	return "Unknown debug category: " + category + "\nAvailable categories: " + strings.Join(noopRunnerDebugCategories, ", ")
-}
-
-func truncateNoopDebugReply(text string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-
-	runes := []rune(text)
-	if len(runes) <= limit {
-		return text
-	}
-
-	const suffix = "\n\n[debug output truncated]"
-	suffixRunes := []rune(suffix)
-	if len(suffixRunes) >= limit {
-		return string(suffixRunes[:limit])
-	}
-
-	truncated := strings.TrimRight(string(runes[:limit-len(suffixRunes)]), "\n")
-	return truncated + suffix
 }
 
 func (r *NoopRunner) globalContext() ([]string, []Tool) {

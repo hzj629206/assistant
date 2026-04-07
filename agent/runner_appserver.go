@@ -68,8 +68,8 @@ var (
 )
 
 const (
-	appServerConfigWebSearchKey     = "web_search"
-	appServerConfigNetworkAccessKey = "sandbox_workspace_write.network_access"
+	appServerConfigWebSearchKey      = "web_search"
+	appServerSandboxNetworkAccessKey = "networkAccess"
 )
 
 func (p SandboxPolicy) String() string {
@@ -147,6 +147,7 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	if sandboxPolicy, ok := resumeOptions.Sandbox.(SandboxPolicy); ok {
 		resumeOptions.Sandbox = sandboxPolicy.String()
 	}
+	turnOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(turnOptions.SandboxPolicy)
 
 	if turnOptions.Effort == nil || turnOptions.Effort == appcodex.ReasoningEffortMinimal {
 		// `gpt-5.4` doesn't support `minimal`.
@@ -194,16 +195,13 @@ func defaultAppServerSandboxPolicy() SandboxPolicy {
 
 func defaultAppServerConfig(config map[string]any) map[string]any {
 	if config == nil {
-		config = make(map[string]any, 2)
+		config = make(map[string]any, 1)
 	} else {
-		cloned := make(map[string]any, len(config)+2)
+		cloned := make(map[string]any, len(config)+1)
 		maps.Copy(cloned, config)
 		config = cloned
 	}
 
-	if _, ok := config[appServerConfigNetworkAccessKey]; !ok {
-		config[appServerConfigNetworkAccessKey] = true
-	}
 	if _, ok := config[appServerConfigWebSearchKey]; !ok {
 		config[appServerConfigWebSearchKey] = "live"
 	}
@@ -217,6 +215,8 @@ func normalizeAppServerSandboxPolicy(policy any) any {
 		return nil
 	case SandboxPolicy:
 		return value
+	case map[string]any:
+		return SandboxPolicy(value)
 	case appcodex.SandboxMode:
 		return normalizeAppServerSandboxMode(string(value))
 	case string:
@@ -237,6 +237,24 @@ func normalizeAppServerSandboxMode(mode string) any {
 	default:
 		return mode
 	}
+}
+
+func applyWorkspaceWriteNetworkAccess(policy any) any {
+	sandboxPolicy, ok := policy.(SandboxPolicy)
+	if !ok {
+		return policy
+	}
+	if sandboxPolicy["type"] != "workspaceWrite" {
+		return sandboxPolicy
+	}
+
+	cloned := make(SandboxPolicy, len(sandboxPolicy)+1)
+	maps.Copy(cloned, sandboxPolicy)
+	if _, ok = cloned[appServerSandboxNetworkAccessKey]; ok {
+		return cloned
+	}
+	cloned[appServerSandboxNetworkAccessKey] = true
+	return cloned
 }
 
 func describeAppServerSandboxPolicy(policy any) string {
@@ -1349,9 +1367,39 @@ func (r *AppServerRunner) ItemToolCall(ctx context.Context, params appproto.Dyna
 	}
 
 	toolCtx := ContextWithTurnRequest(ctx, req)
+	log.Printf(
+		"app-server runner calling dynamic tool: conversation=%s thread_id=%s tool=%s input_bytes=%d",
+		req.Conversation.Key,
+		decoded.ThreadID,
+		tool.Name(),
+		len(input),
+	)
 	result, callErr := tool.Call(toolCtx, input)
+	if callErr != nil {
+		log.Printf(
+			"app-server runner dynamic tool failed: conversation=%s thread_id=%s tool=%s err=%v",
+			req.Conversation.Key,
+			decoded.ThreadID,
+			tool.Name(),
+			callErr,
+		)
+	} else {
+		log.Printf(
+			"app-server runner dynamic tool completed: conversation=%s thread_id=%s tool=%s",
+			req.Conversation.Key,
+			decoded.ThreadID,
+			tool.Name(),
+		)
+	}
 	contentItems, buildErr := buildDynamicToolContentItems(result, callErr)
 	if buildErr != nil {
+		log.Printf(
+			"app-server runner dynamic tool result encoding failed: conversation=%s thread_id=%s tool=%s err=%v",
+			req.Conversation.Key,
+			decoded.ThreadID,
+			tool.Name(),
+			buildErr,
+		)
 		return nil, buildErr
 	}
 

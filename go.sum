@@ -1,7 +1,9 @@
 github.com/godeps/codex-sdk-go v0.1.1 h1:AfAIzUleTDS1PZA4QnwFPqxMeaC0dk9L8xaQBzbeEE4=
 github.com/godeps/codex-sdk-go v0.1.1/go.mod h1:MHgtgq/RdWL8mFnCh03Mhn+2Ze59a4w3tOZ+ji+e1+4=
-github.com/pmenglund/codex-sdk-go v0.0.0-20260330192325-7a0a281247dd h1:y/I0iV8tzrp655sZOa2RqmDRwmEv5uPOOovzbNvMEv8=
-github.com/pmenglund/codex-sdk-go v0.0.0-20260330192325-7a0a281247dd/go.mod h1:CCeCbibaIzsdmyONL6tcIvVYieia0TGRnKThsLvazt0=
+github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d h1:S4w0cD/wA2T+6JgU0WyOVmZ6WWuIaza/XUqX8W6iGBM=
+github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d/go.mod h1:CCeCbibaIzsdmyONL6tcIvVYieia0TGRnKThsLvazt0=
+github.com/yuin/goldmark v1.8.2 h1:kEGpgqJXdgbkhcOgBxkC0X0PmoPG1ZyoZ117rDVp4zE=
+github.com/yuin/goldmark v1.8.2/go.mod h1:ip/1k0VRfGynBgxOz0yCqHrbZXhcjxyuS66Brc7iBKg=
 golang.org/x/crypto v0.49.0 h1:+Ng2ULVvLHnJ/ZFEq4KdcDd/cfjrrjjNSXNzxg0Y4U4=
 golang.org/x/crypto v0.49.0/go.mod h1:ErX4dUh2UM+CFYiXZRTcMpEcN8b/1gxEuv3nODoYtCA=
 golang.org/x/sys v0.42.0 h1:omrd2nAlyT5ESRdCLYdm3+fMfNFE/+Rf4bDIQImRJeo=
