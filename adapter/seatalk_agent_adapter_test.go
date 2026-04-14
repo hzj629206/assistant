@@ -142,16 +142,16 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 		!strings.Contains(prompt, "You must never access any path outside the current working directory and the system-shared directories explicitly provided by the runtime environment.") {
 		t.Fatalf("system prompt missing security guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown only supports bold, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings and italic are not supported.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown only supports bold, italic, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings, tables, and quotes are not supported.") {
 		t.Fatalf("system prompt missing SeaTalk markdown guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
 		!strings.Contains(prompt, "Replies must be no longer than 4K characters.") ||
 		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") ||
-		!strings.Contains(prompt, "When top-level sections have heading numbers, must use a backslash (\\) to escape the period like '1\\.'.") {
+		!strings.Contains(prompt, "Must not use italic for East Asian text.") {
 		t.Fatalf("system prompt missing Markdown preference guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines. Nested lists must be indented with tabs only; two-space indentation is forbidden.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines.") {
 		t.Fatalf("system prompt missing list item line break guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Working context:") {
@@ -2082,6 +2082,30 @@ func TestNormalizeSeaTalkMarkdownPreservesParagraphAndCodeFenceBlankLines(t *tes
 	got := normalizeSeaTalkMarkdown(text)
 
 	want := "intro\n\n- item 1\n\n\tcontinued paragraph\n- item 2\n\n```\n- code 1\n\n- code 2\n```\noutro"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownEscapesTopLevelOrderedSectionNumbers(t *testing.T) {
+	t.Parallel()
+
+	text := "1. Overview\n10. Details\n\n  20. Keep as-is\n```md\n12. code sample\n```\n200. Summary"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "1\\. Overview\n10\\. Details\n\n  20. Keep as-is\n```\n12. code sample\n```\n200\\. Summary"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownConvertsNestedListTwoSpaceIndentationToFourSpaces(t *testing.T) {
+	t.Parallel()
+
+	text := "- item 1\n  - item 1a\n  - item 1b\n- item 2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- item 1\n    - item 1a\n    - item 1b\n- item 2"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
 	}

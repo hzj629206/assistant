@@ -76,11 +76,11 @@ Working context:
 Output restrictions:
 - Replies must be no longer than 4K characters.
 - Must use SeaTalk Markdown format and satisfy the restrictions.
-- When top-level sections have heading numbers, must use a backslash (\) to escape the period like '1\.'.
+- Must not use italic for East Asian text.
 
 SeaTalk Markdown restrictions:
-- SeaTalk Markdown only supports bold, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings and italic are not supported.
-- SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines. Nested lists must be indented with tabs only; two-space indentation is forbidden.
+- SeaTalk Markdown only supports bold, italic, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings, tables, and quotes are not supported.
+- SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines.
 
 User interactions:
 - When you need the user to choose between explicit actions, confirm a risky operation, or provide approval in SeaTalk, prefer sending an interactive message instead of a plain text question.
@@ -1268,14 +1268,47 @@ func normalizeSeaTalkMarkdown(value string) string {
 		return value
 	}
 
-	source := []byte(value)
+	escaped := escapeSeaTalkMarkdownOrderedSectionNumbers(value)
+	source := []byte(escaped)
 	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
 	edits := collectSeaTalkMarkdownEdits(document, source)
 	if len(edits) == 0 {
-		return value
+		return escaped
 	}
 
 	return applySeaTalkMarkdownEdits(source, edits)
+}
+
+func escapeSeaTalkMarkdownOrderedSectionNumbers(value string) string {
+	lines := strings.SplitAfter(value, "\n")
+	if len(lines) == 0 {
+		return value
+	}
+
+	var output strings.Builder
+	output.Grow(len(value) + len(lines))
+
+	inFence := false
+	for _, line := range lines {
+		numberEnd := 0
+		for numberEnd < len(line) && line[numberEnd] >= '0' && line[numberEnd] <= '9' {
+			numberEnd++
+		}
+
+		if !inFence && numberEnd > 0 && len(line) >= numberEnd+2 && line[numberEnd] == '.' && line[numberEnd+1] == ' ' {
+			output.WriteString(line[:numberEnd])
+			output.WriteString(`\.`)
+			output.WriteString(line[numberEnd+1:])
+		} else {
+			output.WriteString(line)
+		}
+
+		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
+			inFence = !inFence
+		}
+	}
+
+	return output.String()
 }
 
 type seaTalkMarkdownEdit struct {
@@ -1302,6 +1335,9 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 
 		list, ok := node.(*goldmarkast.List)
 		if ok {
+			if seaTalkMarkdownListIsNested(list) {
+				edits = append(edits, seaTalkMarkdownNestedListIndentationEdits(list, source)...)
+			}
 			if list.IsTight {
 				return goldmarkast.WalkContinue, nil
 			}
@@ -1312,6 +1348,15 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 	})
 
 	return edits
+}
+
+func seaTalkMarkdownListIsNested(list *goldmarkast.List) bool {
+	if list == nil {
+		return false
+	}
+
+	_, ok := list.Parent().(*goldmarkast.ListItem)
+	return ok
 }
 
 func seaTalkMarkdownCodeFenceEdit(node *goldmarkast.FencedCodeBlock, source []byte) (seaTalkMarkdownEdit, bool) {
@@ -1358,6 +1403,39 @@ func seaTalkMarkdownListSpacingEdits(list *goldmarkast.List, source []byte) []se
 		if ok {
 			edits = append(edits, edit)
 		}
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownNestedListIndentationEdits(list *goldmarkast.List, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if list == nil {
+		return edits
+	}
+
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		listItem, ok := item.(*goldmarkast.ListItem)
+		if !ok {
+			continue
+		}
+
+		lineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
+		if lineStart+2 > len(source) {
+			continue
+		}
+		if source[lineStart] != ' ' || source[lineStart+1] != ' ' {
+			continue
+		}
+		if lineStart+3 < len(source) && source[lineStart+2] == ' ' && source[lineStart+3] == ' ' {
+			continue
+		}
+
+		edits = append(edits, seaTalkMarkdownEdit{
+			start:       lineStart,
+			stop:        lineStart + 2,
+			replacement: "    ",
+		})
 	}
 
 	return edits
