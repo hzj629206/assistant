@@ -78,11 +78,12 @@ func main() {
 }
 
 type process struct {
-	cfg         config.Config
-	errCh       chan error
-	dispatcher  *agent.Dispatcher
-	runner      agent.Runner
-	httpService *httpService
+	cfg             config.Config
+	errCh           chan error
+	dispatcher      *agent.Dispatcher
+	runner          agent.Runner
+	httpService     *httpService
+	remoteForwarder *remoteForwarder
 }
 
 func newProcess(cfg config.Config) *process {
@@ -147,12 +148,12 @@ func (p *process) start(ctx context.Context) error {
 	}
 	p.httpService.serve(localListener, "local")
 
-	remoteListener, err := tryRemoteListen(p.cfg)
+	p.remoteForwarder, err = newRemoteForwarder(p.cfg, p.httpService.server)
 	if err != nil {
-		return fmt.Errorf("remote listen failed: %w", err)
+		return fmt.Errorf("create remote forwarder failed: %w", err)
 	}
-	if remoteListener != nil {
-		p.httpService.serve(remoteListener, "remote")
+	if p.remoteForwarder != nil {
+		p.remoteForwarder.start(ctx)
 	}
 
 	return nil
@@ -160,6 +161,12 @@ func (p *process) start(ctx context.Context) error {
 
 func (p *process) shutdown(ctx context.Context) error {
 	var shutdownErr error
+
+	if p.remoteForwarder != nil {
+		if err := p.remoteForwarder.shutdown(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("remote forwarder shutdown failed: %w", err))
+		}
+	}
 
 	if p.httpService != nil {
 		if err := p.httpService.shutdown(ctx); err != nil {
@@ -213,8 +220,6 @@ func newRunner(ctx context.Context, cfg config.CodexConfig) (agent.Runner, error
 				AdditionalDirectories: codexAdditionalDirectories(cfg.AdditionalWritableRoots),
 			},
 		}), nil
-	case "noop":
-		return &agent.NoopRunner{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported codex backend %q", cfg.Backend)
 	}
@@ -324,7 +329,7 @@ func codexAdditionalDirectories(paths []string) []string {
 	return directories
 }
 
-func tryRemoteListen(cfg config.Config) (net.Listener, error) {
+func newRemoteForwarder(cfg config.Config, server *http.Server) (*remoteForwarder, error) {
 	if cfg.RemoteSSHAddr == "" {
 		return nil, nil
 	}
@@ -339,31 +344,14 @@ func tryRemoteListen(cfg config.Config) (net.Listener, error) {
 		return nil, err
 	}
 
-	sshConfig := &ssh.ClientConfig{
-		User: cfg.RemoteSSHUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // Personal project: host key verification is intentionally skipped.
-	}
-
-	client, err := ssh.Dial("tcp", config.NormalizeRemoteSSHAddr(cfg.RemoteSSHAddr), sshConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check sshd config: AllowTcpForwarding=yes, GatewayPorts=clientspecified.
-	ln, err := client.Listen("tcp", remoteListenAddr)
-	if err != nil {
-		_ = client.Close()
-		return nil, err
-	}
-
-	log.Printf("remote ssh listener ready: %s over %s", remoteListenAddr, cfg.RemoteSSHAddr)
-
-	return &sshRemoteListener{
-		Listener: ln,
-		client:   client,
+	return &remoteForwarder{
+		server:           server,
+		remoteSSHAddr:    config.NormalizeRemoteSSHAddr(cfg.RemoteSSHAddr),
+		remoteSSHUser:    cfg.RemoteSSHUser,
+		remoteListenAddr: remoteListenAddr,
+		signer:           signer,
+		retryDelay:       3 * time.Second,
+		maxRetryDelay:    30 * time.Second,
 	}, nil
 }
 
@@ -392,6 +380,179 @@ func (l *sshRemoteListener) Close() error {
 	})
 
 	return l.err
+}
+
+type remoteForwarder struct {
+	server           *http.Server
+	remoteSSHAddr    string
+	remoteSSHUser    string
+	remoteListenAddr string
+	signer           ssh.Signer
+	retryDelay       time.Duration
+	maxRetryDelay    time.Duration
+
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu       sync.Mutex
+	listener net.Listener
+}
+
+//nolint:contextcheck // Remote forwarding must outlive the startup timeout context passed by the caller.
+func (f *remoteForwarder) start(_ context.Context) {
+	if f == nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	f.cancel = cancel
+	f.done = make(chan struct{})
+
+	go func() {
+		defer close(f.done)
+		f.run(ctx)
+	}()
+}
+
+func (f *remoteForwarder) shutdown(ctx context.Context) error {
+	if f == nil {
+		return nil
+	}
+
+	if f.cancel != nil {
+		f.cancel()
+	}
+
+	if err := f.closeCurrentListener(); err != nil {
+		return err
+	}
+
+	if f.done == nil {
+		return nil
+	}
+
+	select {
+	case <-f.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *remoteForwarder) run(ctx context.Context) {
+	baseDelay := f.retryDelay
+	if baseDelay <= 0 {
+		baseDelay = 3 * time.Second
+	}
+	delay := baseDelay
+
+	maxDelay := max(f.maxRetryDelay, delay)
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		listener, err := f.openListener()
+		if err != nil {
+			log.Printf("remote ssh listener unavailable: %v", err)
+			if !waitWithContext(ctx, delay) {
+				return
+			}
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			continue
+		}
+
+		delay = baseDelay
+		log.Printf("remote ssh listener ready: %s over %s", f.remoteListenAddr, f.remoteSSHAddr)
+
+		err = serveHTTP(f.server, listener, "remote")
+		if closeErr := ignoreNetClosed(listener.Close()); closeErr != nil {
+			log.Printf("close remote ssh listener failed: %v", closeErr)
+		}
+		f.clearCurrentListener(listener)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("remote ssh listener stopped: %v", err)
+		} else {
+			log.Printf("remote ssh listener stopped, reconnecting")
+		}
+		if !waitWithContext(ctx, delay) {
+			return
+		}
+	}
+}
+
+func (f *remoteForwarder) openListener() (net.Listener, error) {
+	sshConfig := &ssh.ClientConfig{
+		User: f.remoteSSHUser,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(f.signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // Personal project: host key verification is intentionally skipped.
+	}
+
+	client, err := ssh.Dial("tcp", f.remoteSSHAddr, sshConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check sshd config: AllowTcpForwarding=yes, GatewayPorts=clientspecified.
+	ln, err := client.Listen("tcp", f.remoteListenAddr)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+
+	listener := &sshRemoteListener{
+		Listener: ln,
+		client:   client,
+	}
+
+	f.mu.Lock()
+	f.listener = listener
+	f.mu.Unlock()
+
+	return listener, nil
+}
+
+func (f *remoteForwarder) closeCurrentListener() error {
+	f.mu.Lock()
+	listener := f.listener
+	f.listener = nil
+	f.mu.Unlock()
+
+	if listener == nil {
+		return nil
+	}
+
+	return ignoreNetClosed(listener.Close())
+}
+
+func (f *remoteForwarder) clearCurrentListener(listener net.Listener) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.listener == listener {
+		f.listener = nil
+	}
+}
+
+func waitWithContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 type httpService struct {

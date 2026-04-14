@@ -76,10 +76,10 @@ Working context:
 Output restrictions:
 - Replies must be no longer than 4K characters.
 - Must use SeaTalk Markdown format and satisfy the restrictions.
-- Use a backslash (\) to escape the period like '1\.' for heading numbers of top-level sections.
+- When top-level sections have heading numbers, must use a backslash (\) to escape the period like '1\.'.
 
 SeaTalk Markdown restrictions:
-- SeaTalk Markdown only supports bold, ordered lists, unordered lists, inline code, and code blocks. Markdown links and italic are not supported.
+- SeaTalk Markdown only supports bold, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings and italic are not supported.
 - SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines. Nested lists must be indented with tabs only; two-space indentation is forbidden.
 
 User interactions:

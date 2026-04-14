@@ -18,6 +18,7 @@ const defaultShutdownTurnTimeout = 15 * time.Second
 
 // ErrDispatcherClosed indicates the dispatcher is no longer accepting new work.
 var ErrDispatcherClosed = errors.New("dispatcher is closed")
+var errRunnerNotConfigured = errors.New("runner is not configured")
 
 // DispatcherOptions configures the asynchronous callback dispatcher.
 type DispatcherOptions struct {
@@ -85,7 +86,7 @@ func NewDispatcher(options DispatcherOptions) *Dispatcher {
 
 	runner := options.Runner
 	if runner == nil {
-		runner = &NoopRunner{}
+		runner = missingRunner{}
 	}
 
 	mergeWindow := options.NonTextMergeWindow
@@ -109,6 +110,16 @@ func NewDispatcher(options DispatcherOptions) *Dispatcher {
 		activeTurns:         make(map[uint64]context.CancelFunc),
 	}
 }
+
+type missingRunner struct{}
+
+func (missingRunner) RunTurn(context.Context, TurnRequest) (TurnResult, error) {
+	return TurnResult{}, errRunnerNotConfigured
+}
+
+func (missingRunner) RegisterSystemPrompt(string) {}
+
+func (missingRunner) RegisterTools(...Tool) {}
 
 // Start launches background workers.
 func (d *Dispatcher) Start() error {

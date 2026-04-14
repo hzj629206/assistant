@@ -1,17 +1,22 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"maps"
 	"os"
+	"os/exec"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	appcodex "github.com/pmenglund/codex-sdk-go"
 	appproto "github.com/pmenglund/codex-sdk-go/protocol"
@@ -70,16 +75,18 @@ var (
 const (
 	appServerConfigWebSearchKey      = "web_search"
 	appServerSandboxNetworkAccessKey = "networkAccess"
+	appServerStdioCloseTimeout       = 2 * time.Second
+	appServerStdioTerminateTimeout   = 2 * time.Second
 )
 
 func (p SandboxPolicy) String() string {
 	switch p["type"] {
 	case "readOnly":
-		return "read-only"
+		return string(appproto.SandboxModeReadOnly)
 	case "workspaceWrite":
-		return "workspace-write"
+		return string(appproto.SandboxModeWorkspaceWrite)
 	case "dangerFullAccess":
-		return "danger-full-access"
+		return string(appproto.SandboxModeDangerFullAccess)
 	default:
 		return ""
 	}
@@ -203,7 +210,7 @@ func defaultAppServerConfig(config map[string]any) map[string]any {
 	}
 
 	if _, ok := config[appServerConfigWebSearchKey]; !ok {
-		config[appServerConfigWebSearchKey] = "live"
+		config[appServerConfigWebSearchKey] = string(appproto.WebSearchModeLive)
 	}
 
 	return config
@@ -1061,7 +1068,7 @@ func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existi
 			spawn.Stderr = apprpc.DefaultStderr()
 		}
 		var err error
-		transport, err = apprpc.SpawnStdio(context.WithoutCancel(ctx), spawn.CodexPath, args, spawn.Stderr)
+		transport, err = spawnAppServerStdio(context.WithoutCancel(ctx), spawn.CodexPath, args, spawn.Stderr)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -1097,6 +1104,153 @@ func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existi
 	}
 
 	return rpcClient, rpcClient.Close, true, nil
+}
+
+type appServerStdioTransport struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+	mu     sync.Mutex
+}
+
+func spawnAppServerStdio(ctx context.Context, binary string, args []string, stderr io.Writer) (*appServerStdioTransport, error) {
+	if binary == "" {
+		return nil, errors.New("codex binary path is empty")
+	}
+
+	//nolint:gosec // The binary path and args come from trusted local runner configuration.
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Stderr = stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	return &appServerStdioTransport{
+		cmd:    cmd,
+		stdin:  stdin,
+		stdout: bufio.NewReader(stdout),
+	}, nil
+}
+
+func (t *appServerStdioTransport) ReadLine() (string, error) {
+	line, err := t.stdout.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) && line != "" {
+			return strings.TrimRight(line, "\n"), nil
+		}
+		return "", err
+	}
+	return strings.TrimRight(line, "\n"), nil
+}
+
+func (t *appServerStdioTransport) WriteLine(line string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+
+	_, err := io.WriteString(t.stdin, line)
+	return err
+}
+
+func (t *appServerStdioTransport) Close() error {
+	var shutdownErr error
+
+	if t.stdin != nil {
+		if err := t.stdin.Close(); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close stdin: %w", err))
+		}
+	}
+	if t.cmd == nil {
+		return shutdownErr
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- t.cmd.Wait()
+	}()
+
+	err, exited := waitProcess(waitCh, appServerStdioCloseTimeout)
+	if exited {
+		return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
+	}
+
+	if terminateErr := signalAppServerProcessGroup(t.cmd, syscall.SIGTERM); terminateErr != nil {
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("terminate process group: %w", terminateErr))
+	}
+
+	err, exited = waitProcess(waitCh, appServerStdioTerminateTimeout)
+	if exited {
+		return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
+	}
+
+	if killErr := signalAppServerProcessGroup(t.cmd, syscall.SIGKILL); killErr != nil {
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("kill process group: %w", killErr))
+	}
+
+	err = <-waitCh
+	return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
+}
+
+func waitProcess(waitCh <-chan error, timeout time.Duration) (error, bool) {
+	select {
+	case err := <-waitCh:
+		return err, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+func signalAppServerProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+
+	err := syscall.Kill(-cmd.Process.Pid, signal)
+	if err == nil || errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+func ignoreExpectedAppServerExit(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return fmt.Errorf("wait for process: %w", err)
+	}
+
+	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		return fmt.Errorf("wait for process: %w", err)
+	}
+	if !waitStatus.Signaled() {
+		return fmt.Errorf("wait for process: %w", err)
+	}
+
+	switch waitStatus.Signal() {
+	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
+		return nil
+	default:
+		return fmt.Errorf("wait for process: %w", err)
+	}
 }
 
 func resolveAppServerLogger(logger *slog.Logger) *slog.Logger {
@@ -1403,10 +1557,10 @@ func (r *AppServerRunner) ItemToolCall(ctx context.Context, params appproto.Dyna
 		return nil, buildErr
 	}
 
-	response := appproto.DynamicToolCallResponse(appproto.SanitizedDynamicToolCallResponse{
+	response := appproto.SanitizedDynamicToolCallResponse{
 		ContentItems: contentItems,
 		Success:      callErr == nil,
-	})
+	}
 	return &response, nil
 }
 

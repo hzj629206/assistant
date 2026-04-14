@@ -142,13 +142,13 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 		!strings.Contains(prompt, "You must never access any path outside the current working directory and the system-shared directories explicitly provided by the runtime environment.") {
 		t.Fatalf("system prompt missing security guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown only supports bold, ordered lists, unordered lists, inline code, and code blocks. Markdown links and italic are not supported.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown only supports bold, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings and italic are not supported.") {
 		t.Fatalf("system prompt missing SeaTalk markdown guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
 		!strings.Contains(prompt, "Replies must be no longer than 4K characters.") ||
 		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") ||
-		!strings.Contains(prompt, "Use a backslash (\\) to escape the period like '1\\.' for heading numbers of top-level sections.") {
+		!strings.Contains(prompt, "When top-level sections have heading numbers, must use a backslash (\\) to escape the period like '1\\.'.") {
 		t.Fatalf("system prompt missing Markdown preference guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines. Nested lists must be indented with tabs only; two-space indentation is forbidden.") {
@@ -2017,7 +2017,7 @@ func TestSeaTalkResponderSendTextRemovesBlankLinesBetweenListItems(t *testing.T)
 	}
 }
 
-func TestSeaTalkResponderSendTextRemovesLineBreaksInsideSingleListItem(t *testing.T) {
+func TestSeaTalkResponderSendTextPreservesLineBreaksInsideSingleListItem(t *testing.T) {
 	t.Parallel()
 
 	client := seatalk.NewClient(
@@ -2045,7 +2045,7 @@ func TestSeaTalkResponderSendTextRemovesLineBreaksInsideSingleListItem(t *testin
 				t.Fatalf("unexpected group message format: %d", body.Message.Text.Format)
 			}
 
-			expected := "- item 1↩︎continued line\n- item 2"
+			expected := "- item 1\n  continued line\n- item 2"
 			if body.Message.Text.Content != expected {
 				t.Fatalf("unexpected group message content: %q", body.Message.Text.Content)
 			}

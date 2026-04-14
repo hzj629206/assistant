@@ -214,7 +214,7 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	}
 
 	switch cfg.Backend {
-	case "appserver", "exec", "noop":
+	case "appserver", "exec":
 	default:
 		return fmt.Errorf("unsupported codex backend %q", cfg.Backend)
 	}
