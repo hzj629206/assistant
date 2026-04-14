@@ -546,7 +546,33 @@ func (r *AppServerRunner) collectStreamedTurn(ctx context.Context, req TurnReque
 				len(result.FinalResponse),
 			)
 			return result, nil
-		case "turn/failed", "error":
+		case "turn/failed":
+			if turnErr := parseAppServerTurnError(note); turnErr != nil {
+				log.Printf(
+					"app-server runner turn notification failed: conversation=%s turn_id=%s method=%s err=%v",
+					req.Conversation.Key,
+					result.TurnID,
+					note.Method,
+					turnErr,
+				)
+				return nil, turnErr
+			}
+			log.Printf(
+				"app-server runner turn notification failed without detail: conversation=%s turn_id=%s method=%s",
+				req.Conversation.Key,
+				result.TurnID,
+				note.Method,
+			)
+			return nil, errors.New("app-server turn failed")
+		case "error":
+			if shouldRetryAppServerTurn(note) {
+				log.Printf(
+					"app-server runner turn notification requested retry: conversation=%s turn_id=%s",
+					req.Conversation.Key,
+					result.TurnID,
+				)
+				continue
+			}
 			if turnErr := parseAppServerTurnError(note); turnErr != nil {
 				log.Printf(
 					"app-server runner turn notification failed: conversation=%s turn_id=%s method=%s err=%v",
@@ -757,10 +783,11 @@ func buildToolResultInputForAppServer(toolName string, toolInput json.RawMessage
 }
 
 type appServerTurnNotification struct {
-	ThreadID string              `json:"threadId,omitempty"`
-	Turn     *appServerTurnState `json:"turn,omitempty"`
-	Item     json.RawMessage     `json:"item,omitempty"`
-	Error    *appServerTurnError `json:"error,omitempty"`
+	WillRetry *bool               `json:"willRetry,omitempty"`
+	ThreadID  string              `json:"threadId,omitempty"`
+	Turn      *appServerTurnState `json:"turn,omitempty"`
+	Item      json.RawMessage     `json:"item,omitempty"`
+	Error     *appServerTurnError `json:"error,omitempty"`
 }
 
 type appServerTurnState struct {
@@ -798,6 +825,15 @@ func parseAppServerTurnError(note apprpc.Notification) error {
 	}
 
 	return nil
+}
+
+func shouldRetryAppServerTurn(note apprpc.Notification) bool {
+	payload, err := parseAppServerTurnNotification(note)
+	if err != nil || payload.WillRetry == nil {
+		return false
+	}
+
+	return *payload.WillRetry
 }
 
 func parseAppServerItem(note apprpc.Notification) (json.RawMessage, string) {

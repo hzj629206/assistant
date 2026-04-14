@@ -19,6 +19,11 @@ type fakeAppServerThread struct {
 	id string
 }
 
+type fakeAppServerTurnStream struct {
+	notifications []apprpc.Notification
+	index         int
+}
+
 func (t *fakeAppServerThread) ID() string {
 	return t.id
 }
@@ -26,6 +31,18 @@ func (t *fakeAppServerThread) ID() string {
 func (t *fakeAppServerThread) RunStreamed(context.Context, []appcodex.Input, *appcodex.TurnOptions) (appServerTurnStream, error) {
 	return nil, errors.New("unexpected streamed turn")
 }
+
+func (s *fakeAppServerTurnStream) Next(context.Context) (apprpc.Notification, error) {
+	if s.index >= len(s.notifications) {
+		return apprpc.Notification{}, errors.New("stream exhausted")
+	}
+
+	note := s.notifications[s.index]
+	s.index++
+	return note, nil
+}
+
+func (s *fakeAppServerTurnStream) Close() {}
 
 func TestBuildTurnInputsUsesLocalImagePath(t *testing.T) {
 	t.Parallel()
@@ -620,6 +637,89 @@ func TestParseAppServerItemExtractsNestedText(t *testing.T) {
 	}
 	if text != "nested text" {
 		t.Fatalf("unexpected text: %q", text)
+	}
+}
+
+func TestParseAppServerTurnErrorIgnoresRetryableErrorNotification(t *testing.T) {
+	t.Parallel()
+
+	note := appcodexNotification(t, map[string]any{
+		"willRetry": true,
+		"error": map[string]any{
+			"message": "Reconnecting... 2/5",
+		},
+	})
+
+	if !shouldRetryAppServerTurn(note) {
+		t.Fatal("expected retryable app-server turn notification")
+	}
+	if err := parseAppServerTurnError(note); err == nil || err.Error() != "Reconnecting... 2/5" {
+		t.Fatalf("unexpected parsed error: %v", err)
+	}
+}
+
+func TestCollectStreamedTurnContinuesAfterRetryableErrorNotification(t *testing.T) {
+	t.Parallel()
+
+	runner := &AppServerRunner{}
+	stream := &fakeAppServerTurnStream{
+		notifications: []apprpc.Notification{
+			{
+				Method: "turn/started",
+				Raw: appServerMustRaw(t, map[string]any{
+					"turn": map[string]any{
+						"id":     "turn-1",
+						"status": "inProgress",
+					},
+				}),
+			},
+			{
+				Method: "error",
+				Raw: appServerMustRaw(t, map[string]any{
+					"willRetry": true,
+					"error": map[string]any{
+						"message": "Reconnecting... 2/5",
+					},
+				}),
+			},
+			{
+				Method: "item/completed",
+				Raw: appServerMustRaw(t, map[string]any{
+					"item": map[string]any{
+						"assistant_message": map[string]any{
+							"text": "Recovered response",
+						},
+					},
+				}),
+			},
+			{
+				Method: "turn/completed",
+				Raw: appServerMustRaw(t, map[string]any{
+					"turn": map[string]any{
+						"id":     "turn-1",
+						"status": "completed",
+					},
+				}),
+			},
+		},
+	}
+
+	result, err := runner.collectStreamedTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key: "conv-1",
+		},
+	}, stream)
+	if err != nil {
+		t.Fatalf("collect streamed turn failed: %v", err)
+	}
+	if result.TurnID != "turn-1" {
+		t.Fatalf("unexpected turn id: %s", result.TurnID)
+	}
+	if result.FinalResponse != "Recovered response" {
+		t.Fatalf("unexpected final response: %q", result.FinalResponse)
+	}
+	if len(result.Items) != 1 {
+		t.Fatalf("unexpected items count: %d", len(result.Items))
 	}
 }
 
