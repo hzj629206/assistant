@@ -70,9 +70,10 @@ func NewCodexRunner(options CodexRunnerOptions) *CodexRunner {
 		threadOptions.WebSearchMode = codex.WebSearchLive
 	}
 
-	threadOptions.Model = defaultModel
-	if threadOptions.ModelReasoningEffort == "" || threadOptions.ModelReasoningEffort == codex.ReasoningMinimal {
-		// `gpt-5.4` doesn't support `minimal`.
+	if threadOptions.Model == "" {
+		threadOptions.Model = defaultModel
+	}
+	if threadOptions.ModelReasoningEffort == "" || (threadOptions.Model == defaultModel && threadOptions.ModelReasoningEffort == codex.ReasoningMinimal) {
 		threadOptions.ModelReasoningEffort = codex.ReasoningMedium
 	}
 

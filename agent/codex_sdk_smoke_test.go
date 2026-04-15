@@ -249,12 +249,12 @@ func TestNewCodexRunnerDefaultsReasoningToMedium(t *testing.T) {
 	}
 }
 
-func TestNewCodexRunnerNormalizesUnsupportedMinimalReasoning(t *testing.T) {
+func TestNewCodexRunnerNormalizesUnsupportedMinimalReasoningForDefaultModel(t *testing.T) {
 	t.Parallel()
 
 	runner := NewCodexRunner(CodexRunnerOptions{
 		ThreadOptions: codex.ThreadOptions{
-			Model:                "gpt-5.1",
+			Model:                defaultModel,
 			SandboxMode:          codex.SandboxWorkspaceWrite,
 			WorkingDirectory:     "/tmp/assistant-custom",
 			SkipGitRepoCheck:     true,
@@ -279,6 +279,39 @@ func TestNewCodexRunnerNormalizesUnsupportedMinimalReasoning(t *testing.T) {
 	}
 	if runner.threadOptions.ModelReasoningEffort != codex.ReasoningMedium {
 		t.Fatalf("unexpected normalized reasoning effort: %q", runner.threadOptions.ModelReasoningEffort)
+	}
+}
+
+func TestNewCodexRunnerPreservesExplicitModelAndMinimalReasoning(t *testing.T) {
+	t.Parallel()
+
+	runner := NewCodexRunner(CodexRunnerOptions{
+		ThreadOptions: codex.ThreadOptions{
+			Model:                "gpt-5.1",
+			SandboxMode:          codex.SandboxWorkspaceWrite,
+			WorkingDirectory:     "/tmp/assistant-minimal",
+			SkipGitRepoCheck:     true,
+			ApprovalPolicy:       codex.ApprovalOnRequest,
+			ModelReasoningEffort: codex.ReasoningMinimal,
+		},
+	})
+	if runner.threadOptions.Model != "gpt-5.1" {
+		t.Fatalf("unexpected explicit model: %q", runner.threadOptions.Model)
+	}
+	if runner.threadOptions.SandboxMode != codex.SandboxWorkspaceWrite {
+		t.Fatalf("unexpected sandbox mode: %q", runner.threadOptions.SandboxMode)
+	}
+	if runner.threadOptions.WorkingDirectory != "/tmp/assistant-minimal" {
+		t.Fatalf("unexpected working directory: %q", runner.threadOptions.WorkingDirectory)
+	}
+	if !runner.threadOptions.SkipGitRepoCheck {
+		t.Fatal("expected explicit skip git repo check to be preserved")
+	}
+	if runner.threadOptions.ApprovalPolicy != codex.ApprovalOnRequest {
+		t.Fatalf("unexpected approval policy: %q", runner.threadOptions.ApprovalPolicy)
+	}
+	if runner.threadOptions.ModelReasoningEffort != codex.ReasoningMinimal {
+		t.Fatalf("unexpected minimal reasoning effort: %q", runner.threadOptions.ModelReasoningEffort)
 	}
 }
 

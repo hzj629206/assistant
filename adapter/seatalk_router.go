@@ -208,7 +208,7 @@ func routeThreadMessage(req seatalk.EventRequest, event *seatalk.NewMessageRecei
 	}
 
 	textContent := event.Message.Text.PlainText
-	if event.Message.Tag == string(agent.MessageKindText) {
+	if event.Message.Tag == "text" {
 		mentioned := make([]seatalk.MentionedEntity, 0, len(event.Message.Text.MentionedList))
 		for _, entry := range event.Message.Text.MentionedList {
 			mentioned = append(mentioned, seatalk.MentionedEntity{
@@ -276,13 +276,13 @@ func normalizeMessageContent(
 	interactiveMessage *seatalk.ThreadInteractiveMessage,
 ) (agent.MessageKind, string, []string, bool) {
 	switch tag {
-	case string(agent.MessageKindText):
+	case "text":
 		text := strings.TrimSpace(textContent)
 		if text == "" {
 			return "", "", nil, false
 		}
 		return agent.MessageKindText, text, nil, true
-	case string(agent.MessageKindImage):
+	case "image":
 		imageURL = strings.TrimSpace(imageURL)
 		if imageURL == "" {
 			return "", "", nil, false

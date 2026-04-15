@@ -179,25 +179,25 @@ func TestNewAppServerRunnerNormalizesLegacySandboxModes(t *testing.T) {
 	}
 }
 
-func TestNewAppServerRunnerNormalizesUnsupportedMinimalReasoning(t *testing.T) {
+func TestNewAppServerRunnerNormalizesUnsupportedMinimalReasoningForDefaultModel(t *testing.T) {
 	t.Parallel()
 
 	runner, err := NewAppServerRunner(context.Background(), AppServerRunnerOptions{
 		Client: &appcodex.Codex{},
 		StartOptions: appcodex.ThreadStartOptions{
-			Model:          "gpt-5.4-mini",
+			Model:          defaultModel,
 			Cwd:            "/tmp/assistant-appserver-custom",
 			SandboxPolicy:  appcodex.SandboxModeWorkspaceWrite,
 			ApprovalPolicy: appcodex.ApprovalPolicyOnRequest,
 		},
 		ResumeOptions: appcodex.ThreadResumeOptions{
-			Model:          "gpt-5.4-mini",
+			Model:          defaultModel,
 			Cwd:            "/tmp/assistant-appserver-custom",
 			Sandbox:        appcodex.SandboxModeWorkspaceWrite,
 			ApprovalPolicy: appcodex.ApprovalPolicyOnRequest,
 		},
 		TurnOptions: appcodex.TurnOptions{
-			Model:          "gpt-5.4-mini",
+			Model:          defaultModel,
 			Cwd:            "/tmp/assistant-appserver-custom",
 			SandboxPolicy:  appcodex.SandboxModeWorkspaceWrite,
 			ApprovalPolicy: appcodex.ApprovalPolicyOnRequest,
@@ -208,13 +208,13 @@ func TestNewAppServerRunnerNormalizesUnsupportedMinimalReasoning(t *testing.T) {
 		t.Fatalf("create app-server runner failed: %v", err)
 	}
 
-	if runner.startOptions.Model != "gpt-5.4-mini" {
+	if runner.startOptions.Model != defaultModel {
 		t.Fatalf("unexpected start model: %q", runner.startOptions.Model)
 	}
-	if runner.resumeOptions.Model != "gpt-5.4-mini" {
+	if runner.resumeOptions.Model != defaultModel {
 		t.Fatalf("unexpected resume model: %q", runner.resumeOptions.Model)
 	}
-	if runner.turnOptions.Model != "gpt-5.4-mini" {
+	if runner.turnOptions.Model != defaultModel {
 		t.Fatalf("unexpected turn model: %q", runner.turnOptions.Model)
 	}
 	if runner.startOptions.Cwd != "/tmp/assistant-appserver-custom" {
@@ -237,6 +237,67 @@ func TestNewAppServerRunnerNormalizesUnsupportedMinimalReasoning(t *testing.T) {
 	}
 	if runner.turnOptions.Effort != appcodex.ReasoningEffortMedium {
 		t.Fatalf("unexpected normalized reasoning effort: %v", runner.turnOptions.Effort)
+	}
+}
+
+func TestNewAppServerRunnerPreservesExplicitModelAndMinimalReasoning(t *testing.T) {
+	t.Parallel()
+
+	runner, err := NewAppServerRunner(context.Background(), AppServerRunnerOptions{
+		Client: &appcodex.Codex{},
+		StartOptions: appcodex.ThreadStartOptions{
+			Model:          "gpt-5.4-mini",
+			Cwd:            "/tmp/assistant-appserver-minimal",
+			SandboxPolicy:  appcodex.SandboxModeWorkspaceWrite,
+			ApprovalPolicy: appcodex.ApprovalPolicyOnRequest,
+		},
+		ResumeOptions: appcodex.ThreadResumeOptions{
+			Model:          "gpt-5.4-mini",
+			Cwd:            "/tmp/assistant-appserver-minimal",
+			Sandbox:        appcodex.SandboxModeWorkspaceWrite,
+			ApprovalPolicy: appcodex.ApprovalPolicyOnRequest,
+		},
+		TurnOptions: appcodex.TurnOptions{
+			Model:          "gpt-5.4-mini",
+			Cwd:            "/tmp/assistant-appserver-minimal",
+			SandboxPolicy:  appcodex.SandboxModeWorkspaceWrite,
+			ApprovalPolicy: appcodex.ApprovalPolicyOnRequest,
+			Effort:         appcodex.ReasoningEffortMinimal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create app-server runner failed: %v", err)
+	}
+
+	if runner.startOptions.Model != "gpt-5.4-mini" {
+		t.Fatalf("unexpected start model: %q", runner.startOptions.Model)
+	}
+	if runner.resumeOptions.Model != "gpt-5.4-mini" {
+		t.Fatalf("unexpected resume model: %q", runner.resumeOptions.Model)
+	}
+	if runner.turnOptions.Model != "gpt-5.4-mini" {
+		t.Fatalf("unexpected turn model: %q", runner.turnOptions.Model)
+	}
+	if runner.startOptions.Cwd != "/tmp/assistant-appserver-minimal" {
+		t.Fatalf("unexpected start working directory: %q", runner.startOptions.Cwd)
+	}
+	if runner.resumeOptions.Cwd != "/tmp/assistant-appserver-minimal" {
+		t.Fatalf("unexpected resume working directory: %q", runner.resumeOptions.Cwd)
+	}
+	if runner.turnOptions.Cwd != "/tmp/assistant-appserver-minimal" {
+		t.Fatalf("unexpected turn working directory: %q", runner.turnOptions.Cwd)
+	}
+	if runner.startOptions.ApprovalPolicy != appcodex.ApprovalPolicyOnRequest {
+		t.Fatalf("unexpected start approval policy: %v", runner.startOptions.ApprovalPolicy)
+	}
+	if runner.resumeOptions.ApprovalPolicy != appcodex.ApprovalPolicyOnRequest {
+		t.Fatalf("unexpected resume approval policy: %v", runner.resumeOptions.ApprovalPolicy)
+	}
+	if runner.turnOptions.ApprovalPolicy != appcodex.ApprovalPolicyOnRequest {
+		t.Fatalf("unexpected turn approval policy: %v", runner.turnOptions.ApprovalPolicy)
+	}
+	if runner.turnOptions.Effort != appcodex.ReasoningEffortMinimal {
+		t.Fatalf("unexpected minimal reasoning effort: %v", runner.turnOptions.Effort)
 	}
 }
 

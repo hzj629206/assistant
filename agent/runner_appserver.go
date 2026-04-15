@@ -156,7 +156,7 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	}
 	turnOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(turnOptions.SandboxPolicy)
 
-	if turnOptions.Effort == nil || turnOptions.Effort == appcodex.ReasoningEffortMinimal {
+	if turnOptions.Effort == nil || (turnOptions.Model == defaultModel && turnOptions.Effort == appcodex.ReasoningEffortMinimal) {
 		// `gpt-5.4` doesn't support `minimal`.
 		turnOptions.Effort = appcodex.ReasoningEffortMedium
 	}
