@@ -22,7 +22,6 @@ import (
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/config"
-	"github.com/hzj629206/assistant/seatalk"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -131,7 +130,7 @@ func (p *process) start(ctx context.Context) error {
 	seaTalkAdapter := adapter.NewSeaTalkAgentAdapter(p.dispatcher, p.cfg.SeaTalk)
 	runner.RegisterSystemPrompt(seaTalkAdapter.SystemPrompt())
 	runner.RegisterTools(seaTalkAdapter.Tools()...)
-	callbackHandler := seatalk.NewCallbackHandler(p.cfg.SeaTalk, seaTalkAdapter)
+	callbackHandler := seaTalkAdapter.NewCallbackHandler()
 
 	p.httpService = newHTTPService(newHTTPServer(callbackHandler), p.errCh)
 	defer func() {

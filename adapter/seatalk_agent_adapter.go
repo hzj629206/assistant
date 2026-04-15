@@ -37,6 +37,7 @@ const (
 
 // SeaTalkAgentAdapter bridges the agent core with the SeaTalk platform.
 type SeaTalkAgentAdapter struct {
+	cfg                    seatalk.Config
 	dispatcher             *agent.Dispatcher
 	client                 *seatalk.Client
 	router                 seaTalkRouter
@@ -45,7 +46,9 @@ type SeaTalkAgentAdapter struct {
 
 // NewSeaTalkAgentAdapter builds a SeaTalk-backed agent adapter.
 func NewSeaTalkAgentAdapter(dispatcher *agent.Dispatcher, cfg seatalk.Config) *SeaTalkAgentAdapter {
-	return newSeaTalkAgentAdapterWithClient(dispatcher, seatalk.NewClient(cfg))
+	adapter := newSeaTalkAgentAdapterWithClient(dispatcher, seatalk.NewClient(cfg))
+	adapter.cfg = cfg
+	return adapter
 }
 
 func newSeaTalkAgentAdapterWithClient(dispatcher *agent.Dispatcher, client *seatalk.Client) *SeaTalkAgentAdapter {
@@ -54,6 +57,15 @@ func newSeaTalkAgentAdapterWithClient(dispatcher *agent.Dispatcher, client *seat
 		client:                 client,
 		interactiveActionStore: cache.NewMemoryStorage(),
 	}
+}
+
+// NewCallbackHandler builds the HTTP handler for SeaTalk callback requests.
+func (a *SeaTalkAgentAdapter) NewCallbackHandler() http.Handler {
+	if a == nil {
+		return seatalk.NewCallbackHandler(seatalk.Config{}, nil)
+	}
+
+	return seatalk.NewCallbackHandler(a.cfg, a)
 }
 
 // SystemPrompt returns SeaTalk-specific operating guidance for the model.

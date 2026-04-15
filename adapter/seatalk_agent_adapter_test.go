@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -180,6 +181,30 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	}
 	if strings.Contains(prompt, "Recognize yourself in conversation using the following form:") {
 		t.Fatalf("system prompt should not inject bot identity guidance: %q", prompt)
+	}
+}
+
+func TestSeaTalkAgentAdapterNewCallbackHandlerUsesAdapterConfig(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"event_id":"evt-1","event_type":"event_verification","timestamp":1,"app_id":"app-1","event":{"seatalk_challenge":"challenge-1"}}`)
+	adapter := NewSeaTalkAgentAdapter(nil, seatalk.Config{
+		AppID:         "app-1",
+		SigningSecret: "signing-secret",
+	})
+	handler := adapter.NewCallbackHandler()
+
+	req := httptest.NewRequest(http.MethodPost, "/callback", bytes.NewReader(body))
+	req.Header.Set("Signature", seatalk.CalculateSignature(body, "signing-secret"))
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: %d", recorder.Code)
+	}
+	if got := recorder.Body.String(); got != "{\"seatalk_challenge\":\"challenge-1\"}\n" {
+		t.Fatalf("unexpected response body: %q", got)
 	}
 }
 
