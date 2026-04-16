@@ -2,238 +2,52 @@ package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
-	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"sync"
-	"syscall"
-	"time"
 
 	codexcli "github.com/godeps/codex-sdk-go"
 	codexapp "github.com/pmenglund/codex-sdk-go"
 
-	"github.com/hzj629206/assistant/adapter"
 	"github.com/hzj629206/assistant/agent"
-	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/config"
-
-	"golang.org/x/crypto/ssh"
+	"github.com/hzj629206/assistant/internal/daemon"
 )
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-}
-
 func main() {
-	cfg, err := config.ParseConfig(os.Args[1:])
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return
-		}
-		log.Fatalf("parse config failed: %v", err)
-	}
-
-	proc := newProcess(cfg)
-
-	startCtx, cancelStart := context.WithTimeout(context.Background(), 30*time.Second)
-	if err = proc.start(startCtx); err != nil {
-		cancelStart()
-		log.Fatalf("start process failed: %v", err)
-	}
-	cancelStart()
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-
-	var runErr error
-	var ok bool
-	select {
-	case <-ctx.Done():
-		log.Printf("shutdown signal received: %v", ctx.Err())
-	case runErr, ok = <-proc.errors():
-		if !ok {
-			log.Printf("process error channel closed")
-		} else {
-			log.Printf("service stopped unexpectedly: %v", runErr)
-		}
-	}
-	stop()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err = proc.shutdown(shutdownCtx); err != nil {
-		log.Printf("process shutdown failed: %v", err)
-	}
-	cancel()
-
-	log.Printf("service stopped")
-	if runErr != nil {
-		os.Exit(1)
-	}
+	daemon.Run(newCodexRunner)
 }
 
-type process struct {
-	cfg             config.Config
-	errCh           chan error
-	dispatcher      *agent.Dispatcher
-	runner          agent.Runner
-	httpService     *httpService
-	remoteForwarder *remoteForwarder
-}
-
-func newProcess(cfg config.Config) *process {
-	return &process{
-		cfg:   cfg,
-		errCh: make(chan error, 3),
-	}
-}
-
-func (p *process) start(ctx context.Context) error {
-	// Startup rollback intentionally reuses the startup context. If startup has already timed out,
-	// failing fast is preferable to extending startup with a separate cleanup budget.
-
-	cache.SetGlobal(cache.NewMemoryStorage())
-
-	runner, err := newRunner(ctx, p.cfg.Codex)
-	if err != nil {
-		return fmt.Errorf("create runner failed: %w", err)
-	}
-	p.runner = runner
-	defer func() {
-		if err != nil && runner != nil {
-			if closeErr := closeRunner(runner); closeErr != nil {
-				log.Printf("runner rollback failed: %v", closeErr)
-			}
-		}
-	}()
-
-	p.dispatcher = agent.NewDispatcher(agent.DispatcherOptions{
-		Store:      agent.NewConversationStore(cache.Global()),
-		Runner:     runner,
-		FatalErrCh: p.errCh,
-	})
-	if err = p.dispatcher.Start(); err != nil { //nolint:contextcheck
-		return fmt.Errorf("start dispatcher failed: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			if shutdownErr := p.dispatcher.Shutdown(ctx); shutdownErr != nil {
-				log.Printf("dispatcher rollback failed: %v", shutdownErr)
-			}
-		}
-	}()
-
-	seaTalkAdapter := adapter.NewSeaTalkAgentAdapter(p.dispatcher, p.cfg.SeaTalk)
-	runner.RegisterSystemPrompt(seaTalkAdapter.SystemPrompt())
-	runner.RegisterTools(seaTalkAdapter.Tools()...)
-	callbackHandler := seaTalkAdapter.NewCallbackHandler()
-
-	p.httpService = newHTTPService(newHTTPServer(callbackHandler), p.errCh)
-	defer func() {
-		if err != nil {
-			if shutdownErr := p.httpService.shutdown(ctx); shutdownErr != nil {
-				log.Printf("http service rollback failed: %v", shutdownErr)
-			}
-		}
-	}()
-
-	localListener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", p.cfg.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("listen on %s failed: %w", p.cfg.ListenAddr, err)
-	}
-	p.httpService.serve(localListener, "local")
-
-	p.remoteForwarder, err = newRemoteForwarder(p.cfg, p.httpService.server)
-	if err != nil {
-		return fmt.Errorf("create remote forwarder failed: %w", err)
-	}
-	if p.remoteForwarder != nil {
-		p.remoteForwarder.start(ctx)
-	}
-
-	return nil
-}
-
-func (p *process) shutdown(ctx context.Context) error {
-	var shutdownErr error
-
-	if p.remoteForwarder != nil {
-		if err := p.remoteForwarder.shutdown(ctx); err != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("remote forwarder shutdown failed: %w", err))
-		}
-	}
-
-	if p.httpService != nil {
-		if err := p.httpService.shutdown(ctx); err != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("http service shutdown failed: %w", err))
-		}
-	}
-
-	if p.dispatcher != nil {
-		if err := p.dispatcher.Shutdown(ctx); err != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("dispatcher shutdown failed: %w", err))
-		}
-	}
-
-	if p.runner != nil {
-		if err := closeRunner(p.runner); err != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("runner shutdown failed: %w", err))
-		}
-	}
-
-	return shutdownErr
-}
-
-func (p *process) errors() <-chan error {
-	return p.errCh
-}
-
-func newRunner(ctx context.Context, cfg config.CodexConfig) (agent.Runner, error) {
-	switch cfg.Backend {
+func newCodexRunner(ctx context.Context, cfg config.Config) (agent.Runner, error) {
+	switch cfg.Codex.Backend {
 	case "appserver":
 		return agent.NewAppServerRunner(ctx, agent.AppServerRunnerOptions{
 			StartOptions: codexapp.ThreadStartOptions{
-				Model:         cfg.Model,
-				SandboxPolicy: appServerSandboxPolicy(cfg.Sandbox),
+				Model:         cfg.Codex.Model,
+				SandboxPolicy: appServerSandboxPolicy(cfg.Codex.Sandbox),
 			},
 			ResumeOptions: codexapp.ThreadResumeOptions{
-				Model:   cfg.Model,
-				Sandbox: appServerSandboxPolicy(cfg.Sandbox),
+				Model:   cfg.Codex.Model,
+				Sandbox: appServerSandboxPolicy(cfg.Codex.Sandbox),
 			},
 			TurnOptions: codexapp.TurnOptions{
-				Model:         cfg.Model,
-				SandboxPolicy: appServerTurnSandboxPolicy(cfg.Sandbox, cfg.AdditionalWritableRoots),
-				Effort:        appServerReasoningEffort(cfg.ReasoningEffort),
+				Model:         cfg.Codex.Model,
+				SandboxPolicy: appServerTurnSandboxPolicy(cfg.Codex.Sandbox, cfg.Codex.AdditionalWritableRoots),
+				Effort:        appServerReasoningEffort(cfg.Codex.ReasoningEffort),
 			},
 		})
 	case "exec":
 		return agent.NewCodexRunner(agent.CodexRunnerOptions{
 			ThreadOptions: codexcli.ThreadOptions{
-				Model:                 cfg.Model,
-				SandboxMode:           codexSandboxMode(cfg.Sandbox),
-				ModelReasoningEffort:  codexReasoningEffort(cfg.ReasoningEffort),
-				AdditionalDirectories: codexAdditionalDirectories(cfg.AdditionalWritableRoots),
+				Model:                 cfg.Codex.Model,
+				SandboxMode:           codexSandboxMode(cfg.Codex.Sandbox),
+				ModelReasoningEffort:  codexReasoningEffort(cfg.Codex.ReasoningEffort),
+				AdditionalDirectories: codexAdditionalDirectories(cfg.Codex.AdditionalWritableRoots),
 			},
 		}), nil
 	default:
-		return nil, fmt.Errorf("unsupported codex backend %q", cfg.Backend)
+		return nil, fmt.Errorf("unsupported codex backend %q", cfg.Codex.Backend)
 	}
-}
-
-func closeRunner(runner agent.Runner) error {
-	type closer interface {
-		Close() error
-	}
-
-	typed, ok := runner.(closer)
-	if !ok {
-		return nil
-	}
-	return typed.Close()
 }
 
 func appServerReasoningEffort(value string) any {
@@ -326,312 +140,4 @@ func codexAdditionalDirectories(paths []string) []string {
 		return nil
 	}
 	return directories
-}
-
-func newRemoteForwarder(cfg config.Config, server *http.Server) (*remoteForwarder, error) {
-	if cfg.RemoteSSHAddr == "" {
-		return nil, nil
-	}
-
-	remoteListenAddr, err := config.DeriveRemoteListenAddr(cfg.ListenAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := loadPrivateKey(cfg.SSHKeyPath)
-	if err != nil {
-		return nil, err
-	}
-
-	return &remoteForwarder{
-		server:           server,
-		remoteSSHAddr:    config.NormalizeRemoteSSHAddr(cfg.RemoteSSHAddr),
-		remoteSSHUser:    cfg.RemoteSSHUser,
-		remoteListenAddr: remoteListenAddr,
-		signer:           signer,
-		retryDelay:       3 * time.Second,
-		maxRetryDelay:    30 * time.Second,
-	}, nil
-}
-
-func ignoreNetClosed(err error) error {
-	if err == nil || errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-
-	return err
-}
-
-type sshRemoteListener struct {
-	net.Listener
-
-	client *ssh.Client
-	once   sync.Once
-	err    error
-}
-
-func (l *sshRemoteListener) Close() error {
-	l.once.Do(func() {
-		l.err = errors.Join(
-			ignoreNetClosed(l.Listener.Close()),
-			ignoreNetClosed(l.client.Close()),
-		)
-	})
-
-	return l.err
-}
-
-type remoteForwarder struct {
-	server           *http.Server
-	remoteSSHAddr    string
-	remoteSSHUser    string
-	remoteListenAddr string
-	signer           ssh.Signer
-	retryDelay       time.Duration
-	maxRetryDelay    time.Duration
-
-	cancel context.CancelFunc
-	done   chan struct{}
-
-	mu       sync.Mutex
-	listener net.Listener
-}
-
-//nolint:contextcheck // Remote forwarding must outlive the startup timeout context passed by the caller.
-func (f *remoteForwarder) start(_ context.Context) {
-	if f == nil {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	f.cancel = cancel
-	f.done = make(chan struct{})
-
-	go func() {
-		defer close(f.done)
-		f.run(ctx)
-	}()
-}
-
-func (f *remoteForwarder) shutdown(ctx context.Context) error {
-	if f == nil {
-		return nil
-	}
-
-	if f.cancel != nil {
-		f.cancel()
-	}
-
-	if err := f.closeCurrentListener(); err != nil {
-		return err
-	}
-
-	if f.done == nil {
-		return nil
-	}
-
-	select {
-	case <-f.done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (f *remoteForwarder) run(ctx context.Context) {
-	baseDelay := f.retryDelay
-	if baseDelay <= 0 {
-		baseDelay = 3 * time.Second
-	}
-	delay := baseDelay
-
-	maxDelay := max(f.maxRetryDelay, delay)
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		listener, err := f.openListener()
-		if err != nil {
-			log.Printf("remote ssh listener unavailable: %v", err)
-			if !waitWithContext(ctx, delay) {
-				return
-			}
-			delay *= 2
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-			continue
-		}
-
-		delay = baseDelay
-		log.Printf("remote ssh listener ready: %s over %s", f.remoteListenAddr, f.remoteSSHAddr)
-
-		err = serveHTTP(f.server, listener, "remote")
-		if closeErr := ignoreNetClosed(listener.Close()); closeErr != nil {
-			log.Printf("close remote ssh listener failed: %v", closeErr)
-		}
-		f.clearCurrentListener(listener)
-		if ctx.Err() != nil {
-			return
-		}
-		if err != nil {
-			log.Printf("remote ssh listener stopped: %v", err)
-		} else {
-			log.Printf("remote ssh listener stopped, reconnecting")
-		}
-		if !waitWithContext(ctx, delay) {
-			return
-		}
-	}
-}
-
-func (f *remoteForwarder) openListener() (net.Listener, error) {
-	sshConfig := &ssh.ClientConfig{
-		User: f.remoteSSHUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(f.signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // Personal project: host key verification is intentionally skipped.
-	}
-
-	client, err := ssh.Dial("tcp", f.remoteSSHAddr, sshConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check sshd config: AllowTcpForwarding=yes, GatewayPorts=clientspecified.
-	ln, err := client.Listen("tcp", f.remoteListenAddr)
-	if err != nil {
-		_ = client.Close()
-		return nil, err
-	}
-
-	listener := &sshRemoteListener{
-		Listener: ln,
-		client:   client,
-	}
-
-	f.mu.Lock()
-	f.listener = listener
-	f.mu.Unlock()
-
-	return listener, nil
-}
-
-func (f *remoteForwarder) closeCurrentListener() error {
-	f.mu.Lock()
-	listener := f.listener
-	f.listener = nil
-	f.mu.Unlock()
-
-	if listener == nil {
-		return nil
-	}
-
-	return ignoreNetClosed(listener.Close())
-}
-
-func (f *remoteForwarder) clearCurrentListener(listener net.Listener) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.listener == listener {
-		f.listener = nil
-	}
-}
-
-func waitWithContext(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-type httpService struct {
-	server    *http.Server
-	errCh     chan<- error
-	mu        sync.Mutex
-	listeners []net.Listener
-}
-
-func newHTTPService(server *http.Server, errCh chan<- error) *httpService {
-	return &httpService{
-		server: server,
-		errCh:  errCh,
-	}
-}
-
-func (s *httpService) serve(listener net.Listener, name string) {
-	s.mu.Lock()
-	s.listeners = append(s.listeners, listener)
-	s.mu.Unlock()
-
-	go func() {
-		// Treat any listener failure as a process-level failure. Local and remote listeners
-		// are two entry points for the same callback service, not independent availability domains.
-		if serveErr := serveHTTP(s.server, listener, name); serveErr != nil {
-			s.errCh <- serveErr
-		}
-	}()
-}
-
-func (s *httpService) shutdown(ctx context.Context) error {
-	if s == nil {
-		return nil
-	}
-
-	var shutdownErr error
-	if err := s.server.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		shutdownErr = errors.Join(shutdownErr, err)
-	}
-
-	s.mu.Lock()
-	listeners := s.listeners
-	s.listeners = nil
-	s.mu.Unlock()
-
-	for _, listener := range listeners {
-		if listener == nil {
-			continue
-		}
-		shutdownErr = errors.Join(shutdownErr, ignoreNetClosed(listener.Close()))
-	}
-
-	return shutdownErr
-}
-
-func newHTTPServer(callbackHandler http.Handler) *http.Server {
-	mux := http.NewServeMux()
-	mux.Handle("/callback", callbackHandler)
-
-	return &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-}
-
-func serveHTTP(server *http.Server, listener net.Listener, name string) error {
-	log.Printf("http server listening on %s (%s)", listener.Addr(), name)
-	err := server.Serve(listener)
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-
-	return nil
-}
-
-func loadPrivateKey(path string) (ssh.Signer, error) {
-	//nolint:gosec // SSH private key path comes from trusted local configuration.
-	key, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.ParsePrivateKey(key)
 }

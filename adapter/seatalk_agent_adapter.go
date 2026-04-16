@@ -88,11 +88,11 @@ Working context:
 Output restrictions:
 - Replies must be no longer than 4K characters.
 - Must use SeaTalk Markdown format and satisfy the restrictions.
-- Must not use italic for East Asian text.
 
 SeaTalk Markdown restrictions:
 - SeaTalk Markdown only supports bold, italic, ordered lists, unordered lists, inline code, and code blocks. Markdown links, headings, tables, and quotes are not supported.
 - SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines.
+- Must not use italic for East Asian text.
 
 User interactions:
 - When you need the user to choose between explicit actions, confirm a risky operation, or provide approval in SeaTalk, prefer sending an interactive message instead of a plain text question.

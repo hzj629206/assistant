@@ -25,20 +25,18 @@ import (
 
 // AppServerRunner bridges dispatcher turns to the Codex app-server through pmenglund/codex-sdk-go.
 type AppServerRunner struct {
-	closeFn           func() error
-	rpcClient         *apprpc.Client
-	startThread       func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error)
-	resumeThread      func(context.Context, appcodex.ThreadResumeOptions) (appServerThread, error)
-	runThreadTurnFn   func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error)
-	startOptions      appcodex.ThreadStartOptions
-	resumeOptions     appcodex.ThreadResumeOptions
-	turnOptions       appcodex.TurnOptions
-	nativeToolCalls   bool
-	maxToolIterations int
-	mu                sync.RWMutex
-	systemPrompts     []string
-	tools             []Tool
-	activeTurns       map[string]TurnRequest
+	closeFn         func() error
+	rpcClient       *apprpc.Client
+	startThread     func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error)
+	resumeThread    func(context.Context, appcodex.ThreadResumeOptions) (appServerThread, error)
+	runThreadTurnFn func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error)
+	startOptions    appcodex.ThreadStartOptions
+	resumeOptions   appcodex.ThreadResumeOptions
+	turnOptions     appcodex.TurnOptions
+	mu              sync.RWMutex
+	systemPrompts   []string
+	tools           []Tool
+	activeTurns     map[string]TurnRequest
 }
 
 // AppServerRunnerOptions configures an AppServerRunner.
@@ -161,26 +159,19 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 		turnOptions.Effort = appcodex.ReasoningEffortMedium
 	}
 
-	maxToolIterations := options.MaxToolIterations
-	if maxToolIterations <= 0 {
-		maxToolIterations = defaultMaxToolIterations
-	}
-
 	runner := &AppServerRunner{
-		startOptions:      startOptions,
-		resumeOptions:     resumeOptions,
-		turnOptions:       turnOptions,
-		maxToolIterations: maxToolIterations,
-		activeTurns:       make(map[string]TurnRequest),
+		startOptions:  startOptions,
+		resumeOptions: resumeOptions,
+		turnOptions:   turnOptions,
+		activeTurns:   make(map[string]TurnRequest),
 	}
 
-	rpcClient, closeFn, nativeToolCalls, err := newAppServerRPCClient(ctx, options.CodexOptions, options.Client, runner)
+	rpcClient, closeFn, _, err := newAppServerRPCClient(ctx, options.CodexOptions, options.Client, runner)
 	if err != nil {
 		return nil, fmt.Errorf("create codex app-server client failed: %w", err)
 	}
 	runner.rpcClient = rpcClient
 	runner.closeFn = closeFn
-	runner.nativeToolCalls = nativeToolCalls
 	if runner.rpcClient != nil {
 		runner.startThread = func(ctx context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
 			return runner.startRPCThread(ctx, options)
@@ -338,15 +329,15 @@ func (r *AppServerRunner) RegisterTools(tools ...Tool) {
 	r.mu.Unlock()
 }
 
-func (r *AppServerRunner) globalContext() ([]string, []Tool) {
+func (r *AppServerRunner) globalTools() []Tool {
 	if r == nil {
-		return nil, nil
+		return nil
 	}
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return append([]string(nil), r.systemPrompts...), append([]Tool(nil), r.tools...)
+	return append([]Tool(nil), r.tools...)
 }
 
 // RunTurn runs one Codex turn and returns the updated thread mapping and final reply text.
@@ -360,10 +351,10 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 		err          error
 		threadAction = "start"
 	)
-	if req.Conversation.CodexThreadID != "" {
+	if req.Conversation.RunnerThreadID != "" {
 		threadAction = "resume"
 		options := r.resumeOptions
-		options.ThreadID = req.Conversation.CodexThreadID
+		options.ThreadID = req.Conversation.RunnerThreadID
 		thread, err = r.resumeThread(ctx, options)
 		if err != nil {
 			log.Printf(
@@ -378,7 +369,9 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 			)
 		}
 	} else {
-		thread, err = r.startThread(ctx, r.startOptions)
+		options := r.startOptions
+		options.DeveloperInstructions = r.joinDeveloperInstructions(options.DeveloperInstructions)
+		thread, err = r.startThread(ctx, options)
 		if err != nil {
 			log.Printf(
 				"app-server runner start thread failed: conversation=%s model=%s cwd=%s sandbox=%s approval=%s err=%v",
@@ -401,14 +394,11 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 		"app-server runner thread ready: conversation=%s action=%s requested_thread=%s actual_thread=%s",
 		req.Conversation.Key,
 		threadAction,
-		req.Conversation.CodexThreadID,
+		req.Conversation.RunnerThreadID,
 		thread.ID(),
 	)
 
-	inputs, err := r.buildTurnInputs(req)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
-	}
+	inputs := r.buildTurnInputs(req)
 
 	typing := newTypingStatusController(
 		req.Message.Responder,
@@ -418,34 +408,37 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 	typing.Start(ctx)
 	defer typing.Stop()
 
-	var replyText string
-	_, tools := r.globalContext()
-	if len(tools) == 0 || r.nativeToolCalls {
-		log.Printf("app-server runner executing turn: conversation=%s mode=direct", req.Conversation.Key)
-		r.setActiveTurn(thread.ID(), req)
-		defer r.clearActiveTurn(thread.ID())
-		turn, runErr := r.runThreadTurn(ctx, req, thread, inputs, &r.turnOptions)
-		if runErr != nil {
-			return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", runErr)
-		}
-		replyText = turn.FinalResponse
-	} else {
-		log.Printf("app-server runner executing turn: conversation=%s mode=tool_loop tool_count=%d", req.Conversation.Key, len(tools))
-		replyText, err = r.runToolLoop(ctx, req, thread, inputs)
-		if err != nil {
-			return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
-		}
+	log.Printf("app-server runner executing turn: conversation=%s mode=direct", req.Conversation.Key)
+	r.setActiveTurn(thread.ID(), req)
+	defer r.clearActiveTurn(thread.ID())
+
+	turn, runErr := r.runThreadTurn(ctx, req, thread, inputs, &r.turnOptions)
+	if runErr != nil {
+		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", runErr)
 	}
+	replyText := turn.FinalResponse
 
 	threadID := thread.ID()
 	if threadID == "" {
-		threadID = req.Conversation.CodexThreadID
+		threadID = req.Conversation.RunnerThreadID
 	}
 
 	return TurnResult{
-		CodexThreadID: threadID,
-		ReplyText:     replyText,
+		RunnerThreadID: threadID,
+		ReplyText:      replyText,
 	}, nil
+}
+
+func (r *AppServerRunner) joinDeveloperInstructions(base string) string {
+	if r == nil {
+		return strings.TrimSpace(base)
+	}
+
+	r.mu.RLock()
+	prompts := append([]string(nil), r.systemPrompts...)
+	r.mu.RUnlock()
+
+	return strings.TrimSpace(joinPromptBlocks(base, joinPromptBlocks(prompts...)))
 }
 
 func (r *AppServerRunner) runThreadTurn(ctx context.Context, req TurnRequest, thread appServerThread, inputs []appcodex.Input, options *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
@@ -594,93 +587,8 @@ func (r *AppServerRunner) collectStreamedTurn(ctx context.Context, req TurnReque
 	}
 }
 
-func (r *AppServerRunner) runToolLoop(ctx context.Context, req TurnRequest, thread appServerThread, inputs []appcodex.Input) (string, error) {
-	currentInputs := append([]appcodex.Input(nil), inputs...)
-	toolCtx := ContextWithTurnRequest(ctx, req)
-
-	for iteration := 0; iteration < r.maxToolIterations; iteration++ {
-		log.Printf(
-			"app-server runner tool loop iteration: conversation=%s thread_id=%s iteration=%d",
-			req.Conversation.Key,
-			thread.ID(),
-			iteration+1,
-		)
-
-		turnOptions := r.turnOptions
-		turnOptions.OutputSchema = toolLoopResponseSchema()
-
-		turn, runErr := r.runThreadTurn(ctx, req, thread, currentInputs, &turnOptions)
-		if runErr != nil {
-			return "", runErr
-		}
-
-		decision, parseErr := parseToolLoopResponse(turn.FinalResponse)
-		if parseErr != nil {
-			return "", parseErr
-		}
-		log.Printf(
-			"app-server runner tool loop decision: conversation=%s iteration=%d action=%s tool=%s message_len=%d",
-			req.Conversation.Key,
-			iteration+1,
-			decision.Action,
-			decision.ToolName,
-			len(decision.Message),
-		)
-
-		switch decision.Action {
-		case "respond":
-			if strings.TrimSpace(decision.Message) == "" {
-				return "", errors.New("tool loop returned an empty assistant message")
-			}
-			return decision.Message, nil
-		case "call_tool":
-			tool, ok := r.findTool(decision.ToolName)
-			if !ok {
-				return "", fmt.Errorf("tool loop requested unknown tool %q", decision.ToolName)
-			}
-
-			log.Printf(
-				"app-server runner calling tool: conversation=%s iteration=%d tool=%s input_bytes=%d",
-				req.Conversation.Key,
-				iteration+1,
-				tool.Name(),
-				len(decision.ToolInput),
-			)
-			result, callErr := tool.Call(toolCtx, decision.ToolInput)
-			if callErr != nil {
-				log.Printf(
-					"app-server runner tool failed: conversation=%s iteration=%d tool=%s err=%v",
-					req.Conversation.Key,
-					iteration+1,
-					tool.Name(),
-					callErr,
-				)
-			} else {
-				log.Printf(
-					"app-server runner tool completed: conversation=%s iteration=%d tool=%s",
-					req.Conversation.Key,
-					iteration+1,
-					tool.Name(),
-				)
-			}
-
-			nextInput, runErr := buildToolResultInputForAppServer(tool.Name(), decision.ToolInput, result, callErr)
-			if runErr != nil {
-				return "", runErr
-			}
-			currentInputs = []appcodex.Input{nextInput}
-		case "silent":
-			return "", nil
-		default:
-			return "", fmt.Errorf("tool loop returned unsupported action %q", decision.Action)
-		}
-	}
-
-	return "", fmt.Errorf("tool loop exceeded %d iterations", r.maxToolIterations)
-}
-
 func (r *AppServerRunner) findTool(name string) (Tool, bool) {
-	_, tools := r.globalContext()
+	tools := r.globalTools()
 	for _, tool := range tools {
 		if tool.Name() == name {
 			return tool, true
@@ -690,7 +598,7 @@ func (r *AppServerRunner) findTool(name string) (Tool, bool) {
 	return nil, false
 }
 
-func (r *AppServerRunner) buildTurnInputs(req TurnRequest) ([]appcodex.Input, error) {
+func (r *AppServerRunner) buildTurnInputs(req TurnRequest) []appcodex.Input {
 	prompt, imagePaths := buildTurnPrompt(req.Message)
 	inputs := make([]appcodex.Input, 0, 1+len(imagePaths))
 
@@ -704,19 +612,7 @@ func (r *AppServerRunner) buildTurnInputs(req TurnRequest) ([]appcodex.Input, er
 		inputs = append(inputs, appcodex.TextInput(""))
 	}
 
-	return r.injectInitialTurnContext(req, inputs)
-}
-
-func (r *AppServerRunner) injectInitialTurnContext(req TurnRequest, inputs []appcodex.Input) ([]appcodex.Input, error) {
-	if req.Conversation.CodexThreadID != "" {
-		return inputs, nil
-	}
-
-	prompts, tools := r.globalContext()
-	if r.nativeToolCalls {
-		tools = nil
-	}
-	return injectInitialPromptIntoInputs(inputs, prompts, tools)
+	return inputs
 }
 
 func (r *AppServerRunner) setActiveTurn(threadID string, req TurnRequest) {
@@ -751,35 +647,6 @@ func (r *AppServerRunner) activeTurn(threadID string) (TurnRequest, bool) {
 	req, ok := r.activeTurns[threadID]
 	r.mu.RUnlock()
 	return req, ok
-}
-
-func injectInitialPromptIntoInputs(inputs []appcodex.Input, prompts []string, tools []Tool) ([]appcodex.Input, error) {
-	instruction, err := buildInitialInstruction(prompts, tools)
-	if err != nil {
-		return nil, err
-	}
-	if instruction == "" {
-		return inputs, nil
-	}
-
-	cloned := append([]appcodex.Input(nil), inputs...)
-	for index := range cloned {
-		if cloned[index].Type == appcodex.InputTypeText {
-			cloned[index].Text = joinPromptBlocks(instruction, cloned[index].Text)
-			return cloned, nil
-		}
-	}
-
-	return append([]appcodex.Input{appcodex.TextInput(instruction)}, cloned...), nil
-}
-
-func buildToolResultInputForAppServer(toolName string, toolInput json.RawMessage, result any, err error) (appcodex.Input, error) {
-	input, buildErr := buildToolResultInput(toolName, toolInput, result, err)
-	if buildErr != nil {
-		return appcodex.Input{}, buildErr
-	}
-
-	return appcodex.TextInput(input.Text), nil
 }
 
 type appServerTurnNotification struct {
@@ -942,7 +809,7 @@ type appServerDynamicTool struct {
 	InputSchema any    `json:"inputSchema"`
 }
 
-func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools []Tool, nativeToolCalls bool) (appServerThreadStartParams, error) {
+func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools []Tool) (appServerThreadStartParams, error) {
 	params := appServerThreadStartParams{}
 	if options.Model != "" {
 		params.Model = stringPtr(options.Model)
@@ -970,7 +837,7 @@ func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools 
 	if options.DeveloperInstructions != "" {
 		params.DeveloperInstructions = stringPtr(options.DeveloperInstructions)
 	}
-	if nativeToolCalls && len(tools) != 0 {
+	if len(tools) != 0 {
 		params.DynamicTools = make([]appServerDynamicTool, 0, len(tools))
 		for _, tool := range tools {
 			params.DynamicTools = append(params.DynamicTools, appServerDynamicTool{
@@ -1308,8 +1175,8 @@ func (r *AppServerRunner) startRPCThread(ctx context.Context, options appcodex.T
 		return nil, errors.New("rpc client is not initialized")
 	}
 
-	_, tools := r.globalContext()
-	params, err := buildAppServerThreadStartParams(options, tools, r.nativeToolCalls)
+	tools := r.globalTools()
+	params, err := buildAppServerThreadStartParams(options, tools)
 	if err != nil {
 		return nil, err
 	}

@@ -17,12 +17,19 @@ import (
 
 // Config contains the process-wide runtime configuration.
 type Config struct {
-	ListenAddr    string         `json:"listen_addr" yaml:"listen_addr"`
-	RemoteSSHAddr string         `json:"remote_ssh_addr" yaml:"remote_ssh_addr"`
-	RemoteSSHUser string         `json:"remote_ssh_user" yaml:"remote_ssh_user"`
-	SSHKeyPath    string         `json:"ssh_key_path" yaml:"ssh_key_path"`
-	Codex         CodexConfig    `json:"codex" yaml:"codex"`
-	SeaTalk       seatalk.Config `json:"seatalk" yaml:"seatalk"`
+	ListenAddr string         `json:"listen_addr" yaml:"listen_addr"`
+	Tunnel     TunnelConfig   `json:"tunnel" yaml:"tunnel"`
+	Codex      CodexConfig    `json:"codex" yaml:"codex"`
+	Claude     ClaudeConfig   `json:"claude" yaml:"claude"`
+	SeaTalk    seatalk.Config `json:"seatalk" yaml:"seatalk"`
+}
+
+// TunnelConfig contains optional public tunnel settings.
+type TunnelConfig struct {
+	SSHAddr          string `json:"ssh_addr" yaml:"ssh_addr"`
+	SSHUser          string `json:"ssh_user" yaml:"ssh_user"`
+	SSHKey           string `json:"ssh_key" yaml:"ssh_key"`
+	CloudflaredToken string `json:"cloudflared_token" yaml:"cloudflared_token"`
 }
 
 // CodexConfig contains runner selection and model options.
@@ -34,16 +41,32 @@ type CodexConfig struct {
 	AdditionalWritableRoots []string `json:"additional_writable_roots" yaml:"additional_writable_roots"`
 }
 
+// ClaudeConfig contains the minimal Claude Code CLI daemon configuration.
+// All other Claude Code capabilities should be configured directly in the CLI environment.
+type ClaudeConfig struct {
+	Model                 string   `json:"model" yaml:"model"`
+	Permission            string   `json:"permission" yaml:"permission"`
+	Effort                string   `json:"effort" yaml:"effort"`
+	AdditionalDirectories []string `json:"additional_directories" yaml:"additional_directories"`
+}
+
 type flagOverlay struct {
 	listenAddr           string
 	codexBackend         string
 	codexModel           string
 	codexReasoningEffort string
 	codexSandbox         string
+	claudeModel          string
+	claudePermission     string
+	claudeEffort         string
 }
 
 // ParseConfig loads defaults, then an optional config file, then a limited set of command-line overrides.
-func ParseConfig(args []string) (Config, error) {
+func ParseConfig(programName string, args []string) (Config, error) {
+	if strings.TrimSpace(programName) == "" {
+		return Config{}, errors.New("program name is required")
+	}
+
 	cfg, err := defaultConfig()
 	if err != nil {
 		return Config{}, err
@@ -55,10 +78,13 @@ func ParseConfig(args []string) (Config, error) {
 		codexModel:           cfg.Codex.Model,
 		codexReasoningEffort: cfg.Codex.ReasoningEffort,
 		codexSandbox:         cfg.Codex.Sandbox,
+		claudeModel:          cfg.Claude.Model,
+		claudePermission:     cfg.Claude.Permission,
+		claudeEffort:         cfg.Claude.Effort,
 	}
 
 	var configPath string
-	fs := newFlagSet(&overlay, &configPath)
+	fs := newFlagSet(programName, &overlay, &configPath)
 	if err = fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -75,12 +101,14 @@ func ParseConfig(args []string) (Config, error) {
 	if err = normalizeCodexConfig(&cfg.Codex); err != nil {
 		return Config{}, err
 	}
+	normalizeClaudeConfig(&cfg.Claude)
 	fs.Visit(func(f *flag.Flag) {
 		applyFlagOverride(&cfg, overlay, f.Name)
 	})
 	if err = normalizeCodexConfig(&cfg.Codex); err != nil {
 		return Config{}, err
 	}
+	normalizeClaudeConfig(&cfg.Claude)
 	if err = validateSeaTalkConfig(&cfg.SeaTalk); err != nil {
 		return Config{}, err
 	}
@@ -95,16 +123,20 @@ func defaultConfig() (Config, error) {
 	}
 
 	return Config{
-		ListenAddr:    ":8421",
-		RemoteSSHAddr: "",
-		RemoteSSHUser: "",
-		SSHKeyPath:    filepath.Join(homeDir, ".ssh", "id_rsa"),
+		ListenAddr: ":8421",
+		Tunnel: TunnelConfig{
+			SSHAddr:          "",
+			SSHUser:          "",
+			SSHKey:           filepath.Join(homeDir, ".ssh", "id_rsa"),
+			CloudflaredToken: "",
+		},
 		Codex: CodexConfig{
 			Backend:         "appserver",
 			Model:           "gpt-5.4",
 			ReasoningEffort: "low",
 			Sandbox:         "read-only",
 		},
+		Claude: ClaudeConfig{},
 		SeaTalk: seatalk.Config{
 			AppID:               "",
 			AppSecret:           "",
@@ -114,13 +146,16 @@ func defaultConfig() (Config, error) {
 	}, nil
 }
 
-func newFlagSet(overlay *flagOverlay, configPath *string) *flag.FlagSet {
-	fs := flag.NewFlagSet("assistant", flag.ContinueOnError)
+func newFlagSet(programName string, overlay *flagOverlay, configPath *string) *flag.FlagSet {
+	fs := flag.NewFlagSet(programName, flag.ContinueOnError)
 	fs.StringVar(&overlay.listenAddr, "listen-addr", overlay.listenAddr, "HTTP server listen address override")
 	fs.StringVar(&overlay.codexBackend, "codex-backend", overlay.codexBackend, "Codex backend override")
 	fs.StringVar(&overlay.codexModel, "codex-model", overlay.codexModel, "Codex model name override")
 	fs.StringVar(&overlay.codexReasoningEffort, "codex-reasoning-effort", overlay.codexReasoningEffort, "Codex reasoning effort override")
 	fs.StringVar(&overlay.codexSandbox, "codex-sandbox", overlay.codexSandbox, "Codex sandbox override")
+	fs.StringVar(&overlay.claudeModel, "claude-model", overlay.claudeModel, "Claude model name override")
+	fs.StringVar(&overlay.claudePermission, "claude-permission", overlay.claudePermission, "Claude permission mode override")
+	fs.StringVar(&overlay.claudeEffort, "claude-effort", overlay.claudeEffort, "Claude effort override")
 	fs.StringVar(configPath, "f", *configPath, "path to config file")
 	fs.StringVar(configPath, "config", *configPath, "path to config file")
 	return fs
@@ -138,6 +173,12 @@ func applyFlagOverride(cfg *Config, overlay flagOverlay, name string) {
 		cfg.Codex.ReasoningEffort = overlay.codexReasoningEffort
 	case "codex-sandbox":
 		cfg.Codex.Sandbox = overlay.codexSandbox
+	case "claude-model":
+		cfg.Claude.Model = overlay.claudeModel
+	case "claude-permission":
+		cfg.Claude.Permission = overlay.claudePermission
+	case "claude-effort":
+		cfg.Claude.Effort = overlay.claudeEffort
 	}
 }
 
@@ -234,6 +275,68 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	return nil
 }
 
+func normalizeClaudeConfig(cfg *ClaudeConfig) {
+	if cfg == nil {
+		return
+	}
+
+	cfg.Model = strings.TrimSpace(cfg.Model)
+	cfg.Permission = normalizeClaudePermission(strings.TrimSpace(strings.ToLower(cfg.Permission)))
+	cfg.Effort = strings.TrimSpace(strings.ToLower(cfg.Effort))
+	switch cfg.Effort {
+	case "", "low", "medium", "high", "xhigh", "max":
+	default:
+		log.Printf("ignoring unsupported claude effort %q", cfg.Effort)
+		cfg.Effort = ""
+	}
+	cfg.AdditionalDirectories = normalizeClaudeAdditionalDirectories(cfg.AdditionalDirectories)
+}
+
+func normalizeClaudePermission(value string) string {
+	switch value {
+	case "", "default", "auto", "plan":
+		return value
+	case "accept-edits":
+		return "accept-edits"
+	case "bypass-permissions":
+		return "bypass-permissions"
+	case "dont-ask":
+		return "dont-ask"
+	default:
+		log.Printf("ignoring unsupported claude permission %q", value)
+		return ""
+	}
+}
+
+func normalizeClaudeAdditionalDirectories(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	directories := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		directory := strings.TrimSpace(path)
+		if directory == "" {
+			continue
+		}
+		if absolutePath, err := filepath.Abs(directory); err == nil {
+			directory = absolutePath
+		}
+		directory = filepath.Clean(directory)
+		if _, ok := seen[directory]; ok {
+			continue
+		}
+		seen[directory] = struct{}{}
+		directories = append(directories, directory)
+	}
+	if len(directories) == 0 {
+		return nil
+	}
+
+	return directories
+}
+
 func normalizeCodexAdditionalWritableRoots(roots []string) []string {
 	if len(roots) == 0 {
 		return nil
@@ -303,12 +406,18 @@ func NormalizeRemoteSSHAddr(addr string) string {
 	return net.JoinHostPort(addr, "22")
 }
 
-// DeriveRemoteListenAddr keeps only the listen port for remote forwarding.
-func DeriveRemoteListenAddr(listenAddr string) (string, error) {
-	_, port, err := net.SplitHostPort(listenAddr)
+// DeriveLocalTargetAddr maps the listen address to a loopback TCP target for local tunnel forwarding.
+func DeriveLocalTargetAddr(listenAddr string) (string, error) {
+	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		return "", fmt.Errorf("split listen addr %q failed: %w", listenAddr, err)
 	}
 
-	return ":" + port, nil
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+
+	return net.JoinHostPort(host, port), nil
 }

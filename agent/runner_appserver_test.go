@@ -59,15 +59,12 @@ func TestBuildTurnInputsUsesLocalImagePath(t *testing.T) {
 	}
 
 	runner := &AppServerRunner{}
-	inputs, err := runner.buildTurnInputs(TurnRequest{
+	inputs := runner.buildTurnInputs(TurnRequest{
 		Message: InboundMessage{
 			Kind:      MessageKindImage,
 			ImagePath: file.Name(),
 		},
 	})
-	if err != nil {
-		t.Fatalf("build turn inputs failed: %v", err)
-	}
 
 	if len(inputs) != 2 {
 		t.Fatalf("unexpected input count: %d", len(inputs))
@@ -103,16 +100,13 @@ func TestBuildTurnInputsUsesMixedMessageImagePaths(t *testing.T) {
 	}
 
 	runner := &AppServerRunner{}
-	inputs, err := runner.buildTurnInputs(TurnRequest{
+	inputs := runner.buildTurnInputs(TurnRequest{
 		Message: InboundMessage{
 			Kind:       MessageKindMixed,
 			Text:       "mixed content",
 			ImagePaths: []string{fileOne.Name(), fileTwo.Name()},
 		},
 	})
-	if err != nil {
-		t.Fatalf("build turn inputs failed: %v", err)
-	}
 
 	if len(inputs) != 3 {
 		t.Fatalf("unexpected input count: %d", len(inputs))
@@ -125,31 +119,28 @@ func TestBuildTurnInputsUsesMixedMessageImagePaths(t *testing.T) {
 	}
 }
 
-func TestBuildTurnInputsInjectsInitialSystemPromptAndToolsForNewConversation(t *testing.T) {
+func TestBuildTurnInputsDoesNotInjectToolInstructionsForNewConversation(t *testing.T) {
 	t.Parallel()
 
 	runner := &AppServerRunner{}
 	runner.RegisterSystemPrompt("Global system prompt.")
 	runner.RegisterTools(uppercaseTool{})
 
-	inputs, err := runner.buildTurnInputs(TurnRequest{
+	inputs := runner.buildTurnInputs(TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "hello",
 		},
 	})
-	if err != nil {
-		t.Fatalf("build turn inputs failed: %v", err)
-	}
 
 	if len(inputs) != 1 {
 		t.Fatalf("unexpected input count: %d", len(inputs))
 	}
-	if !strings.Contains(inputs[0].Text, "Global system prompt.") {
-		t.Fatalf("system prompt not injected: %s", inputs[0].Text)
+	if strings.Contains(inputs[0].Text, "Global system prompt.") {
+		t.Fatalf("did not expect system prompt in input: %s", inputs[0].Text)
 	}
-	if !strings.Contains(inputs[0].Text, "structured tool loop") {
-		t.Fatalf("tool instruction not injected: %s", inputs[0].Text)
+	if strings.Contains(inputs[0].Text, "structured tool loop") {
+		t.Fatalf("did not expect tool instruction in input: %s", inputs[0].Text)
 	}
 	if !strings.Contains(inputs[0].Text, "hello") {
 		t.Fatalf("user message not preserved: %s", inputs[0].Text)
@@ -163,18 +154,15 @@ func TestBuildTurnInputsSkipsInitialContextForExistingConversation(t *testing.T)
 	runner.RegisterSystemPrompt("Global system prompt.")
 	runner.RegisterTools(uppercaseTool{})
 
-	inputs, err := runner.buildTurnInputs(TurnRequest{
+	inputs := runner.buildTurnInputs(TurnRequest{
 		Conversation: ConversationState{
-			CodexThreadID: "thread-1",
+			RunnerThreadID: "thread-1",
 		},
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "hello",
 		},
 	})
-	if err != nil {
-		t.Fatalf("build turn inputs failed: %v", err)
-	}
 
 	if len(inputs) != 1 {
 		t.Fatalf("unexpected input count: %d", len(inputs))
@@ -198,9 +186,11 @@ func TestAppServerRunTurnStartsThreadAndReturnsReply(t *testing.T) {
 	t.Parallel()
 
 	thread := &fakeAppServerThread{id: "thread-new"}
+	var startedOptions appcodex.ThreadStartOptions
 	var receivedInputs []appcodex.Input
 	runner := &AppServerRunner{
-		startThread: func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error) {
+		startThread: func(_ context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
+			startedOptions = options
 			return thread, nil
 		},
 		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, inputs []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
@@ -220,14 +210,58 @@ func TestAppServerRunTurnStartsThreadAndReturnsReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run turn failed: %v", err)
 	}
-	if result.CodexThreadID != "thread-new" {
-		t.Fatalf("unexpected thread id: %s", result.CodexThreadID)
+	if result.RunnerThreadID != "thread-new" {
+		t.Fatalf("unexpected thread id: %s", result.RunnerThreadID)
 	}
 	if result.ReplyText != "hello back" {
 		t.Fatalf("unexpected reply: %s", result.ReplyText)
 	}
+	if startedOptions.DeveloperInstructions != "" {
+		t.Fatalf("unexpected developer instructions: %q", startedOptions.DeveloperInstructions)
+	}
 	if len(receivedInputs) != 1 || receivedInputs[0].Text != "Current message context:\n- time: unknown\n- sender: `unknown`\n\nhello" {
 		t.Fatalf("unexpected thread inputs: %+v", receivedInputs)
+	}
+}
+
+func TestAppServerRunTurnPassesSystemPromptAsDeveloperInstructions(t *testing.T) {
+	t.Parallel()
+
+	thread := &fakeAppServerThread{id: "thread-new"}
+	var startedOptions appcodex.ThreadStartOptions
+	var receivedInputs []appcodex.Input
+	runner := &AppServerRunner{
+		startOptions: appcodex.ThreadStartOptions{
+			DeveloperInstructions: "Base developer instruction.",
+		},
+		startThread: func(_ context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
+			startedOptions = options
+			return thread, nil
+		},
+		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, inputs []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
+			receivedInputs = append(receivedInputs, inputs...)
+			return &appcodex.TurnResult{FinalResponse: "hello back"}, nil
+		},
+	}
+	runner.RegisterSystemPrompt("Global system prompt.")
+
+	_, err := runner.RunTurn(context.Background(), TurnRequest{
+		Message: InboundMessage{
+			Kind: MessageKindText,
+			Text: "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("run turn failed: %v", err)
+	}
+	if startedOptions.DeveloperInstructions != "Base developer instruction.\n\nGlobal system prompt." {
+		t.Fatalf("unexpected developer instructions: %q", startedOptions.DeveloperInstructions)
+	}
+	if len(receivedInputs) != 1 {
+		t.Fatalf("unexpected thread inputs: %+v", receivedInputs)
+	}
+	if strings.Contains(receivedInputs[0].Text, "Global system prompt.") {
+		t.Fatalf("did not expect system prompt in turn input: %s", receivedInputs[0].Text)
 	}
 }
 
@@ -250,7 +284,7 @@ func TestAppServerRunTurnResumesExistingThreadAndFallsBackToConversationID(t *te
 
 	result, err := runner.RunTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{
-			CodexThreadID: "thread-existing",
+			RunnerThreadID: "thread-existing",
 		},
 		Message: InboundMessage{
 			Kind: MessageKindText,
@@ -263,11 +297,50 @@ func TestAppServerRunTurnResumesExistingThreadAndFallsBackToConversationID(t *te
 	if resumedThreadID != "thread-existing" {
 		t.Fatalf("unexpected resumed thread id: %s", resumedThreadID)
 	}
-	if result.CodexThreadID != "thread-existing" {
-		t.Fatalf("unexpected result thread id: %s", result.CodexThreadID)
+	if result.RunnerThreadID != "thread-existing" {
+		t.Fatalf("unexpected result thread id: %s", result.RunnerThreadID)
 	}
 	if result.ReplyText != "welcome back" {
 		t.Fatalf("unexpected reply: %s", result.ReplyText)
+	}
+}
+
+func TestAppServerRunTurnDoesNotPassSystemPromptAsDeveloperInstructionsOnResume(t *testing.T) {
+	t.Parallel()
+
+	thread := &fakeAppServerThread{id: "thread-existing"}
+	var resumedOptions appcodex.ThreadResumeOptions
+	runner := &AppServerRunner{
+		resumeOptions: appcodex.ThreadResumeOptions{
+			DeveloperInstructions: "Base resume instruction.",
+		},
+		resumeThread: func(_ context.Context, options appcodex.ThreadResumeOptions) (appServerThread, error) {
+			resumedOptions = options
+			return thread, nil
+		},
+		runThreadTurnFn: func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
+			return &appcodex.TurnResult{FinalResponse: "welcome back"}, nil
+		},
+	}
+	runner.RegisterSystemPrompt("Global system prompt.")
+
+	_, err := runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			RunnerThreadID: "thread-existing",
+		},
+		Message: InboundMessage{
+			Kind: MessageKindText,
+			Text: "hello again",
+		},
+	})
+	if err != nil {
+		t.Fatalf("run turn failed: %v", err)
+	}
+	if resumedOptions.ThreadID != "thread-existing" {
+		t.Fatalf("unexpected resumed thread id: %s", resumedOptions.ThreadID)
+	}
+	if resumedOptions.DeveloperInstructions != "Base resume instruction." {
+		t.Fatalf("unexpected developer instructions: %q", resumedOptions.DeveloperInstructions)
 	}
 }
 
@@ -500,126 +573,6 @@ func TestSandboxPolicyString(t *testing.T) {
 	}
 }
 
-func TestAppServerRunTurnUsesToolLoopWhenToolsRegistered(t *testing.T) {
-	t.Parallel()
-
-	thread := &fakeAppServerThread{id: "thread-tools"}
-	var callCount int
-	var recordedInputs [][]appcodex.Input
-	runner := &AppServerRunner{
-		startThread: func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error) {
-			return thread, nil
-		},
-		maxToolIterations: 3,
-		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, inputs []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
-			copied := append([]appcodex.Input(nil), inputs...)
-			recordedInputs = append(recordedInputs, copied)
-			callCount++
-			switch callCount {
-			case 1:
-				return &appcodex.TurnResult{
-					FinalResponse: `{"action":"call_tool","tool_name":"uppercase","tool_input_json":"{\"text\":\"hello\"}"}`,
-				}, nil
-			case 2:
-				return &appcodex.TurnResult{
-					FinalResponse: `{"action":"respond","message":"HELLO"}`,
-				}, nil
-			default:
-				return nil, errors.New("unexpected turn")
-			}
-		},
-	}
-	runner.RegisterTools(uppercaseTool{})
-
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
-		Message: InboundMessage{
-			Kind: MessageKindText,
-			Text: "uppercase hello",
-		},
-	})
-	if err != nil {
-		t.Fatalf("run turn failed: %v", err)
-	}
-	if result.CodexThreadID != "thread-tools" {
-		t.Fatalf("unexpected thread id: %s", result.CodexThreadID)
-	}
-	if result.ReplyText != "HELLO" {
-		t.Fatalf("unexpected reply: %s", result.ReplyText)
-	}
-	if len(recordedInputs) != 2 {
-		t.Fatalf("unexpected input count: %d", len(recordedInputs))
-	}
-	if got := recordedInputs[0][0].Text; !strings.Contains(got, "structured tool loop") || !strings.Contains(got, "uppercase hello") {
-		t.Fatalf("unexpected first prompt: %s", got)
-	}
-	if got := recordedInputs[1][0].Text; !strings.Contains(got, `{"text":"HELLO"}`) {
-		t.Fatalf("unexpected tool result prompt: %s", got)
-	}
-}
-
-func TestAppServerRunToolLoopReturnsUnknownToolError(t *testing.T) {
-	t.Parallel()
-
-	thread := &fakeAppServerThread{id: "thread-tools"}
-	runner := &AppServerRunner{
-		maxToolIterations: 1,
-		runThreadTurnFn: func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
-			return &appcodex.TurnResult{
-				FinalResponse: `{"action":"call_tool","tool_name":"missing","tool_input_json":"{}"}`,
-			}, nil
-		},
-	}
-	runner.RegisterTools(uppercaseTool{})
-
-	inputs, err := runner.buildTurnInputs(TurnRequest{
-		Message: InboundMessage{
-			Kind: MessageKindText,
-			Text: "test",
-		},
-	})
-	if err != nil {
-		t.Fatalf("build turn inputs failed: %v", err)
-	}
-
-	_, err = runner.runToolLoop(context.Background(), TurnRequest{}, thread, inputs)
-	if err == nil || !strings.Contains(err.Error(), `unknown tool "missing"`) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestAppServerRunToolLoopSupportsSilentCompletion(t *testing.T) {
-	t.Parallel()
-
-	thread := &fakeAppServerThread{id: "thread-silent"}
-	runner := &AppServerRunner{
-		maxToolIterations: 1,
-		runThreadTurnFn: func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
-			return &appcodex.TurnResult{
-				FinalResponse: `{"action":"silent","message":"","tool_name":"","tool_input_json":""}`,
-			}, nil
-		},
-	}
-	runner.RegisterTools(uppercaseTool{})
-
-	inputs, err := runner.buildTurnInputs(TurnRequest{
-		Message: InboundMessage{
-			Kind: MessageKindText,
-			Text: "No reply needed",
-		},
-	})
-	if err != nil {
-		t.Fatalf("build turn inputs failed: %v", err)
-	}
-
-	reply, err := runner.runToolLoop(context.Background(), TurnRequest{}, thread, inputs)
-	if err != nil {
-		t.Fatalf("run tool loop failed: %v", err)
-	}
-	if reply != "" {
-		t.Fatalf("unexpected reply: %q", reply)
-	}
-}
-
 func TestParseAppServerItemExtractsNestedText(t *testing.T) {
 	t.Parallel()
 
@@ -766,9 +719,10 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			ID:     apprpc.NewIntRequestID(2),
 			Method: "thread/start",
 			Params: appServerMustRaw(t, map[string]any{
-				"model":          defaultModel,
-				"cwd":            cwd,
-				"approvalPolicy": "never",
+				"model":                 defaultModel,
+				"cwd":                   cwd,
+				"approvalPolicy":        "never",
+				"developerInstructions": "Global system prompt.",
 				"config": map[string]any{
 					"web_search": "live",
 				},
@@ -893,7 +847,8 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			Cwd:    cwd,
 			Effort: appcodex.ReasoningEffortMedium,
 		},
-		Tools: []Tool{uppercaseTool{}},
+		SystemPrompt: "Global system prompt.",
+		Tools:        []Tool{uppercaseTool{}},
 	})
 	if err != nil {
 		t.Fatalf("create runner failed: %v", err)
@@ -913,14 +868,11 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run turn failed: %v", err)
 	}
-	if result.CodexThreadID != "thr-native" {
-		t.Fatalf("unexpected thread id: %s", result.CodexThreadID)
+	if result.RunnerThreadID != "thr-native" {
+		t.Fatalf("unexpected thread id: %s", result.RunnerThreadID)
 	}
 	if result.ReplyText != "HELLO" {
 		t.Fatalf("unexpected reply text: %q", result.ReplyText)
-	}
-	if !runner.nativeToolCalls {
-		t.Fatal("expected native dynamic tools to be enabled")
 	}
 }
 

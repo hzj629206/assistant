@@ -1,6 +1,6 @@
 # Project Overview
 
-This is a backend-only Golang project for integrating SeaTalk with Codex.
+This is a backend-only Golang project for integrating SeaTalk with Codex CLI/Claude Code.
 
 # Project Guidelines
 
@@ -26,10 +26,12 @@ This is a backend-only Golang project for integrating SeaTalk with Codex.
 - `cmd/<name>` contains application entrypoints and process wiring.
 - `config` contains process-wide configuration parsing and defaults.
 - `adapter` contains bridge code between concrete platform integrations and the agent layer, such as translating SeaTalk callbacks into normalized agent messages and binding agent replies back to SeaTalk operations.
-- `agent` contains the chat-agent layer shared across platform integrations, including normalized inbound message models, conversation state, asynchronous dispatching, responder abstractions, and Codex runner integrations.
+- `agent` contains the chat-agent layer shared across platform integrations, including normalized inbound message models, conversation state, asynchronous dispatching, responder abstractions, and agent runner integrations.
+- `internal` contains non-exported application packages and shared implementation details that should not be imported by external modules.
 - `seatalk` contains the SeaTalk platform integration, including callback handling, event models, and OpenAPI client code.
 - `cache` contains lightweight storage abstractions and implementations used by the application.
 
 ## Dependencies
 - Codex SDK (Golang): `github.com/godeps/codex-sdk-go`. Similar to official SDK `@openai/codex-sdk` (TypeScript).
 - AppServer SDK (Golang): `github.com/pmenglund/codex-sdk-go`.
+- Claude Code SDK (Golang): `github.com/lancekrogers/claude-code-go`.

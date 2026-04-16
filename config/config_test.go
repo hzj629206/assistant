@@ -39,6 +39,54 @@ func TestNormalizeCodexConfig(t *testing.T) {
 	}
 }
 
+func TestNormalizeClaudeConfig(t *testing.T) {
+	t.Parallel()
+
+	rootOne := t.TempDir()
+	rootTwo := filepath.Join(rootOne, "..", filepath.Base(rootOne))
+	cfg := ClaudeConfig{
+		Model:                 " claude-sonnet-4-5 ",
+		Permission:            " ACCEPT-EDITS ",
+		Effort:                " XHIGH ",
+		AdditionalDirectories: []string{" ", rootOne, rootTwo, rootOne},
+	}
+	normalizeClaudeConfig(&cfg)
+
+	if cfg.Model != "claude-sonnet-4-5" {
+		t.Fatalf("unexpected claude model: %s", cfg.Model)
+	}
+	if cfg.Permission != "accept-edits" {
+		t.Fatalf("unexpected claude permission: %s", cfg.Permission)
+	}
+	if cfg.Effort != "xhigh" {
+		t.Fatalf("unexpected claude effort: %s", cfg.Effort)
+	}
+	if len(cfg.AdditionalDirectories) != 1 || cfg.AdditionalDirectories[0] != filepath.Clean(rootOne) {
+		t.Fatalf("unexpected claude additional directories: %#v", cfg.AdditionalDirectories)
+	}
+
+	cfg = ClaudeConfig{}
+	normalizeClaudeConfig(&cfg)
+	if cfg.Model != "" {
+		t.Fatalf("unexpected default claude model: %s", cfg.Model)
+	}
+	if cfg.Permission != "" {
+		t.Fatalf("unexpected default claude permission: %s", cfg.Permission)
+	}
+	if cfg.Effort != "" {
+		t.Fatalf("unexpected default claude effort: %s", cfg.Effort)
+	}
+
+	cfg = ClaudeConfig{Permission: "unsupported", Effort: "unsupported"}
+	normalizeClaudeConfig(&cfg)
+	if cfg.Permission != "" {
+		t.Fatalf("unexpected unsupported claude permission: %s", cfg.Permission)
+	}
+	if cfg.Effort != "" {
+		t.Fatalf("unexpected unsupported claude effort: %s", cfg.Effort)
+	}
+}
+
 func TestNormalizeCodexConfigRejectsUnsupportedValues(t *testing.T) {
 	t.Parallel()
 
@@ -135,7 +183,7 @@ func TestNormalizeRemoteSSHAddr(t *testing.T) {
 	}
 }
 
-func TestDeriveRemoteListenAddr(t *testing.T) {
+func TestDeriveLocalTargetAddr(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -147,22 +195,32 @@ func TestDeriveRemoteListenAddr(t *testing.T) {
 		{
 			name: "empty host",
 			in:   ":8080",
-			want: ":8080",
+			want: "127.0.0.1:8080",
 		},
 		{
-			name: "ipv4 host",
-			in:   "127.0.0.1:9090",
-			want: ":9090",
+			name: "ipv4 any host",
+			in:   "0.0.0.0:9090",
+			want: "127.0.0.1:9090",
+		},
+		{
+			name: "ipv6 any host",
+			in:   "[::]:6000",
+			want: "127.0.0.1:6000",
+		},
+		{
+			name: "ipv4 loopback",
+			in:   "127.0.0.1:7000",
+			want: "127.0.0.1:7000",
 		},
 		{
 			name: "hostname",
-			in:   "localhost:7000",
-			want: ":7000",
+			in:   "localhost:7100",
+			want: "localhost:7100",
 		},
 		{
-			name: "ipv6",
-			in:   "[::1]:6000",
-			want: ":6000",
+			name: "ipv6 loopback",
+			in:   "[::1]:7200",
+			want: "[::1]:7200",
 		},
 		{
 			name:    "missing port",
@@ -175,18 +233,18 @@ func TestDeriveRemoteListenAddr(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := DeriveRemoteListenAddr(tc.in)
+			got, err := DeriveLocalTargetAddr(tc.in)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("DeriveRemoteListenAddr(%q) returned nil error", tc.in)
+					t.Fatalf("DeriveLocalTargetAddr(%q) returned nil error", tc.in)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("DeriveRemoteListenAddr(%q) failed: %v", tc.in, err)
+				t.Fatalf("DeriveLocalTargetAddr(%q) failed: %v", tc.in, err)
 			}
 			if got != tc.want {
-				t.Fatalf("DeriveRemoteListenAddr(%q) = %q, want %q", tc.in, got, tc.want)
+				t.Fatalf("DeriveLocalTargetAddr(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -203,17 +261,23 @@ func TestDefaultConfigUsesBuiltInDefaults(t *testing.T) {
 	if cfg.ListenAddr != ":8421" {
 		t.Fatalf("unexpected listen addr: %s", cfg.ListenAddr)
 	}
-	if cfg.RemoteSSHAddr != "" {
-		t.Fatalf("unexpected remote ssh addr: %s", cfg.RemoteSSHAddr)
+	if cfg.Tunnel.SSHAddr != "" {
+		t.Fatalf("unexpected ssh addr: %s", cfg.Tunnel.SSHAddr)
 	}
-	if cfg.RemoteSSHUser != "" {
-		t.Fatalf("unexpected remote ssh user: %s", cfg.RemoteSSHUser)
+	if cfg.Tunnel.SSHUser != "" {
+		t.Fatalf("unexpected ssh user: %s", cfg.Tunnel.SSHUser)
 	}
-	if cfg.SSHKeyPath == "" {
-		t.Fatal("expected non-empty ssh key path")
+	if cfg.Tunnel.SSHKey == "" {
+		t.Fatal("expected non-empty ssh key")
+	}
+	if cfg.Tunnel.CloudflaredToken != "" {
+		t.Fatalf("unexpected cloudflared token: %s", cfg.Tunnel.CloudflaredToken)
 	}
 	if cfg.Codex.Backend != "appserver" || cfg.Codex.Model != "gpt-5.4" || cfg.Codex.ReasoningEffort != "low" || cfg.Codex.Sandbox != "read-only" {
 		t.Fatalf("unexpected codex defaults: %+v", cfg.Codex)
+	}
+	if cfg.Claude.Model != "" {
+		t.Fatalf("unexpected claude defaults: %+v", cfg.Claude)
 	}
 	if cfg.SeaTalk.AppID != "" || cfg.SeaTalk.AppSecret != "" || cfg.SeaTalk.SigningSecret != "" {
 		t.Fatalf("unexpected seatalk defaults: %+v", cfg.SeaTalk)
@@ -235,6 +299,18 @@ func TestDefaultConfigPathUsesHomeDirectory(t *testing.T) {
 	}
 }
 
+func TestNewFlagSetUsesProgramName(t *testing.T) {
+	t.Parallel()
+
+	overlay := flagOverlay{}
+	var configPath string
+
+	fs := newFlagSet("codexd", &overlay, &configPath)
+	if fs.Name() != "codexd" {
+		t.Fatalf("unexpected flag set name: %s", fs.Name())
+	}
+}
+
 func TestParseConfigLoadsDefaultConfigFile(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -245,7 +321,9 @@ func TestParseConfigLoadsDefaultConfigFile(t *testing.T) {
 
 	path := filepath.Join(configDir, "config.yml")
 	content := []byte(`listen_addr: "127.0.0.1:9090"
-remote_ssh_user: admin
+tunnel:
+  ssh_user: admin
+  cloudflared_token: cloudflare-token
 codex:
   backend: exec
   model: gpt-5.4
@@ -254,6 +332,14 @@ codex:
   additional_writable_roots:
     - /tmp/status.json
     - /var/tmp/assistant-state
+claude:
+  model: claude-sonnet-4-5
+  permission: dont-ask
+  effort: high
+  additional_directories:
+    - /tmp/claude-a
+    - /tmp/claude-a
+    - /tmp/../tmp/claude-a
 seatalk:
   app_id: app-id
   app_secret: app-secret
@@ -263,7 +349,7 @@ seatalk:
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	cfg, err := ParseConfig(nil)
+	cfg, err := ParseConfig("assistant-test", nil)
 	if err != nil {
 		t.Fatalf("ParseConfig failed: %v", err)
 	}
@@ -271,14 +357,29 @@ seatalk:
 	if cfg.ListenAddr != "127.0.0.1:9090" {
 		t.Fatalf("unexpected listen addr: %s", cfg.ListenAddr)
 	}
-	if cfg.RemoteSSHUser != "admin" {
-		t.Fatalf("unexpected remote ssh user: %s", cfg.RemoteSSHUser)
+	if cfg.Tunnel.SSHUser != "admin" {
+		t.Fatalf("unexpected ssh user: %s", cfg.Tunnel.SSHUser)
+	}
+	if cfg.Tunnel.CloudflaredToken != "cloudflare-token" {
+		t.Fatalf("unexpected cloudflared token: %s", cfg.Tunnel.CloudflaredToken)
 	}
 	if cfg.Codex.Backend != "exec" || cfg.Codex.Model != "gpt-5.4" || cfg.Codex.ReasoningEffort != "medium" || cfg.Codex.Sandbox != "workspace-write" {
 		t.Fatalf("unexpected codex config: %+v", cfg.Codex)
 	}
 	if !reflect.DeepEqual(cfg.Codex.AdditionalWritableRoots, []string{"/tmp/status.json", "/var/tmp/assistant-state"}) {
 		t.Fatalf("unexpected additional writable roots: %#v", cfg.Codex.AdditionalWritableRoots)
+	}
+	if cfg.Claude.Model != "claude-sonnet-4-5" {
+		t.Fatalf("unexpected claude config: %+v", cfg.Claude)
+	}
+	if cfg.Claude.Permission != "dont-ask" {
+		t.Fatalf("unexpected claude permission: %s", cfg.Claude.Permission)
+	}
+	if cfg.Claude.Effort != "high" {
+		t.Fatalf("unexpected claude effort: %s", cfg.Claude.Effort)
+	}
+	if !reflect.DeepEqual(cfg.Claude.AdditionalDirectories, []string{"/tmp/claude-a"}) {
+		t.Fatalf("unexpected claude additional directories: %#v", cfg.Claude.AdditionalDirectories)
 	}
 	if cfg.SeaTalk.AppID != "app-id" {
 		t.Fatalf("unexpected seatalk app id: %s", cfg.SeaTalk.AppID)
@@ -301,7 +402,7 @@ seatalk:
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	_, err := ParseConfig(nil)
+	_, err := ParseConfig("assistant-test", nil)
 	if err == nil {
 		t.Fatal("expected missing seatalk app_id error")
 	}
@@ -326,7 +427,7 @@ seatalk:
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	_, err := ParseConfig(nil)
+	_, err := ParseConfig("assistant-test", nil)
 	if err == nil {
 		t.Fatal("expected missing seatalk app_secret error")
 	}
@@ -351,7 +452,7 @@ seatalk:
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	_, err := ParseConfig(nil)
+	_, err := ParseConfig("assistant-test", nil)
 	if err == nil {
 		t.Fatal("expected missing seatalk signing_secret error")
 	}
@@ -378,7 +479,7 @@ func TestParseConfigExplicitFileOverridesDefaultPath(t *testing.T) {
 		t.Fatalf("write explicit config failed: %v", err)
 	}
 
-	cfg, err := ParseConfig([]string{"-f", explicitPath})
+	cfg, err := ParseConfig("assistant-test", []string{"-f", explicitPath})
 	if err != nil {
 		t.Fatalf("ParseConfig failed: %v", err)
 	}
@@ -410,10 +511,13 @@ seatalk:
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	cfg, err := ParseConfig([]string{
+	cfg, err := ParseConfig("assistant-test", []string{
 		"--listen-addr", "127.0.0.1:9090",
 		"--codex-backend", "appserver",
 		"--codex-model", "gpt-5.4",
+		"--claude-model", "claude-sonnet-4-6",
+		"--claude-permission", "plan",
+		"--claude-effort", "max",
 		"--codex-reasoning-effort", "medium",
 		"--codex-sandbox", "workspace-write",
 	})
@@ -427,6 +531,15 @@ seatalk:
 	if cfg.Codex.Model != "gpt-5.4" {
 		t.Fatalf("unexpected codex model: %s", cfg.Codex.Model)
 	}
+	if cfg.Claude.Model != "claude-sonnet-4-6" {
+		t.Fatalf("unexpected claude model: %s", cfg.Claude.Model)
+	}
+	if cfg.Claude.Permission != "plan" {
+		t.Fatalf("unexpected claude permission: %s", cfg.Claude.Permission)
+	}
+	if cfg.Claude.Effort != "max" {
+		t.Fatalf("unexpected claude effort: %s", cfg.Claude.Effort)
+	}
 	if cfg.Codex.ReasoningEffort != "medium" {
 		t.Fatalf("unexpected codex reasoning effort: %s", cfg.Codex.ReasoningEffort)
 	}
@@ -435,5 +548,17 @@ seatalk:
 	}
 	if cfg.Codex.Sandbox != "workspace-write" {
 		t.Fatalf("unexpected codex sandbox: %s", cfg.Codex.Sandbox)
+	}
+}
+
+func TestParseConfigRequiresProgramName(t *testing.T) {
+	t.Parallel()
+
+	_, err := ParseConfig("", nil)
+	if err == nil {
+		t.Fatal("expected missing program name error")
+	}
+	if err.Error() != "program name is required" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

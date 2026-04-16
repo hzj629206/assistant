@@ -148,12 +148,14 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
 		!strings.Contains(prompt, "Replies must be no longer than 4K characters.") ||
-		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") ||
-		!strings.Contains(prompt, "Must not use italic for East Asian text.") {
-		t.Fatalf("system prompt missing Markdown preference guidance: %q", prompt)
+		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") {
+		t.Fatalf("system prompt missing output restriction guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines.") {
 		t.Fatalf("system prompt missing list item line break guidance: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Must not use italic for East Asian text.") {
+		t.Fatalf("system prompt missing East Asian italic guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Working context:") {
 		t.Fatalf("system prompt missing working context section: %q", prompt)
@@ -2971,7 +2973,7 @@ func TestSeaTalkPushInteractiveMessageToolDescriptionMentionsMarkdown(t *testing
 	t.Parallel()
 
 	description := seaTalkPushInteractiveMessageTool{}.Description()
-	if !strings.Contains(description, "Description elements use SeaTalk Markdown format.") {
+	if !strings.Contains(description, "Description elements use SeaTalk Markdown format and must satisfy the restrictions.") {
 		t.Fatalf("expected markdown support in tool description, got %q", description)
 	}
 	if !strings.Contains(description, `mode="send": always send a new interactive card and ignore "message_id".`) {

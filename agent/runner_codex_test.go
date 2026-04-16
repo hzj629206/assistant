@@ -774,7 +774,7 @@ func TestBuildTurnInputSkipsInitialContextForExistingConversation(t *testing.T) 
 
 	input, err := runner.buildTurnInput(TurnRequest{
 		Conversation: ConversationState{
-			CodexThreadID: "thread-1",
+			RunnerThreadID: "thread-1",
 		},
 		Message: InboundMessage{
 			Kind: MessageKindText,
@@ -824,8 +824,8 @@ func TestRunTurnStartsThreadAndReturnsReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run turn failed: %v", err)
 	}
-	if result.CodexThreadID != "thread-new" {
-		t.Fatalf("unexpected thread id: %s", result.CodexThreadID)
+	if result.RunnerThreadID != "thread-new" {
+		t.Fatalf("unexpected thread id: %s", result.RunnerThreadID)
 	}
 	if result.ReplyText != "hello back" {
 		t.Fatalf("unexpected reply: %s", result.ReplyText)
@@ -853,7 +853,7 @@ func TestRunTurnResumesExistingThreadAndFallsBackToConversationID(t *testing.T) 
 
 	result, err := runner.RunTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{
-			CodexThreadID: "thread-existing",
+			RunnerThreadID: "thread-existing",
 		},
 		Message: InboundMessage{
 			Kind: MessageKindText,
@@ -866,8 +866,8 @@ func TestRunTurnResumesExistingThreadAndFallsBackToConversationID(t *testing.T) 
 	if resumedThreadID != "thread-existing" {
 		t.Fatalf("unexpected resumed thread id: %s", resumedThreadID)
 	}
-	if result.CodexThreadID != "thread-existing" {
-		t.Fatalf("unexpected result thread id: %s", result.CodexThreadID)
+	if result.RunnerThreadID != "thread-existing" {
+		t.Fatalf("unexpected result thread id: %s", result.RunnerThreadID)
 	}
 	if result.ReplyText != "welcome back" {
 		t.Fatalf("unexpected reply: %s", result.ReplyText)
@@ -905,8 +905,8 @@ func TestRunTurnUsesToolLoopWhenToolsRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run turn failed: %v", err)
 	}
-	if result.CodexThreadID != "thread-tools" {
-		t.Fatalf("unexpected thread id: %s", result.CodexThreadID)
+	if result.RunnerThreadID != "thread-tools" {
+		t.Fatalf("unexpected thread id: %s", result.RunnerThreadID)
 	}
 	if result.ReplyText != "HELLO" {
 		t.Fatalf("unexpected reply: %s", result.ReplyText)

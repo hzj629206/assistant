@@ -14,8 +14,8 @@ func TestConversationStoreRoundTrip(t *testing.T) {
 	store := NewConversationStore(cache.NewMemoryStorage())
 	ctx := context.Background()
 	state := ConversationState{
-		Key:           "private:e_1:msg-1",
-		CodexThreadID: "codex-1",
+		Key:            "private:e_1:msg-1",
+		RunnerThreadID: "codex-1",
 	}
 
 	if err := store.PutConversation(ctx, state); err != nil {
@@ -26,8 +26,8 @@ func TestConversationStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get conversation failed: %v", err)
 	}
-	if got.CodexThreadID != "codex-1" {
-		t.Fatalf("unexpected codex thread id: %s", got.CodexThreadID)
+	if got.RunnerThreadID != "codex-1" {
+		t.Fatalf("unexpected agent thread id: %s", got.RunnerThreadID)
 	}
 }
 

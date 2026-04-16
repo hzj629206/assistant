@@ -117,10 +117,10 @@ func (m InboundMessage) MergedMessages() []InboundMessage {
 	return result
 }
 
-// ConversationState stores the mapping between a source conversation and a Codex thread.
+// ConversationState stores the mapping between a source conversation and a runner thread.
 type ConversationState struct {
 	Key            string    `json:"key"`
-	CodexThreadID  string    `json:"codex_thread_id,omitempty"`
+	RunnerThreadID string    `json:"runner_thread_id,omitempty"`
 	LastEventID    string    `json:"last_event_id,omitempty"`
 	LastActivityAt time.Time `json:"last_activity_at"`
 }
@@ -131,8 +131,8 @@ type TurnRequest struct {
 	Message      InboundMessage
 }
 
-// TurnResult contains the Codex thread mapping updates and final reply payload.
+// TurnResult contains the runner thread mapping updates and final reply payload.
 type TurnResult struct {
-	CodexThreadID string
-	ReplyText     string
+	RunnerThreadID string
+	ReplyText      string
 }

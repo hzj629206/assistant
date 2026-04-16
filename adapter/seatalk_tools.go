@@ -208,7 +208,7 @@ Set "mode" to control whether this call sends a new card or updates an existing 
 Elements are rendered top-to-bottom in array order. Mix title, description, button, button_group, and image elements freely to build the card.
 Limits per card: title <= 3, description <= 5, standalone button <= 5, button_group <= 3, image <= 3.
 Before sending or updating a card, you must self-check element counts and ensure every per-card limit is satisfied.
-Description elements use SeaTalk Markdown format. Each description element supports up to 800 characters, so use separate description elements only when they add meaningful structure.
+Description elements use SeaTalk Markdown format and must satisfy the restrictions. Each description element supports up to 800 characters, so use separate description elements only when they add meaningful structure.
 For callback buttons, set "value" to a JSON-encoded callback action payload serialized into a string.
 Supported callback action payloads:
 - Tool call: {"action":"tool_call","tool_name":"...","tool_input_json":"{...}"}

@@ -159,12 +159,12 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 
 	var thread codexThread
 	threadAction := "start"
-	if req.Conversation.CodexThreadID != "" {
+	if req.Conversation.RunnerThreadID != "" {
 		threadAction = "resume"
 		if r.resumeThread != nil {
-			thread = r.resumeThread(req.Conversation.CodexThreadID, r.threadOptions)
+			thread = r.resumeThread(req.Conversation.RunnerThreadID, r.threadOptions)
 		} else if r.client != nil {
-			thread = r.client.ResumeThread(req.Conversation.CodexThreadID, r.threadOptions)
+			thread = r.client.ResumeThread(req.Conversation.RunnerThreadID, r.threadOptions)
 		}
 	} else {
 		if r.startThread != nil {
@@ -180,7 +180,7 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 		"codex runner thread ready: conversation=%s action=%s requested_thread=%s actual_thread=%s",
 		req.Conversation.Key,
 		threadAction,
-		req.Conversation.CodexThreadID,
+		req.Conversation.RunnerThreadID,
 		thread.ID(),
 	)
 
@@ -218,12 +218,12 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 
 	threadID := thread.ID()
 	if threadID == "" {
-		threadID = req.Conversation.CodexThreadID
+		threadID = req.Conversation.RunnerThreadID
 	}
 
 	return TurnResult{
-		CodexThreadID: threadID,
-		ReplyText:     replyText,
+		RunnerThreadID: threadID,
+		ReplyText:      replyText,
 	}, nil
 }
 
@@ -606,7 +606,7 @@ func allPaths(primary string, extra []string) []string {
 }
 
 func (r *CodexRunner) injectInitialTurnContext(req TurnRequest, input codex.Input) (codex.Input, error) {
-	if req.Conversation.CodexThreadID != "" {
+	if req.Conversation.RunnerThreadID != "" {
 		return input, nil
 	}
 

@@ -324,7 +324,7 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		)
 	}
 
-	log.Printf("dispatcher running turn: conversation=%s event_id=%s existing_thread=%s", message.ConversationKey, message.ID, state.CodexThreadID)
+	log.Printf("dispatcher running turn: conversation=%s event_id=%s existing_thread=%s", message.ConversationKey, message.ID, state.RunnerThreadID)
 	runCtx, releaseTurn := d.startTurnContext(ctx)
 	defer releaseTurn()
 
@@ -339,20 +339,20 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		"dispatcher completed turn: conversation=%s event_id=%s thread_id=%s reply_len=%d",
 		message.ConversationKey,
 		message.ID,
-		result.CodexThreadID,
+		result.RunnerThreadID,
 		len(result.ReplyText),
 	)
 
 	state.LastEventID = message.ID
 	state.LastActivityAt = time.Now()
-	if result.CodexThreadID != "" {
-		state.CodexThreadID = result.CodexThreadID
+	if result.RunnerThreadID != "" {
+		state.RunnerThreadID = result.RunnerThreadID
 	}
 
 	if err := d.store.PutConversation(ctx, state); err != nil {
 		return err
 	}
-	log.Printf("dispatcher stored conversation state: conversation=%s event_id=%s thread_id=%s", state.Key, message.ID, state.CodexThreadID)
+	log.Printf("dispatcher stored conversation state: conversation=%s event_id=%s thread_id=%s", state.Key, message.ID, state.RunnerThreadID)
 
 	if result.ReplyText == "" {
 		log.Printf("dispatcher finished without reply: conversation=%s event_id=%s", message.ConversationKey, message.ID)

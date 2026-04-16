@@ -1,6 +1,6 @@
 # Assistant
 
-Backend-only Golang project for integrating SeaTalk with Codex.
+Backend-only Golang project for integrating SeaTalk with Codex CLI.
 
 ## How It Works
 
@@ -96,7 +96,7 @@ Before running the service in production or for SeaTalk callback testing, comple
    - Use the built-in reverse SSH forwarding support so the public `Nginx` host can reach the callback endpoint.
    - Or use a third-party tunnel service such as `ngrok` or `Cloudflare Tunnel` to publish the local service through a public HTTPS endpoint.
 
-   When reverse SSH forwarding is enabled with `remote_ssh_addr`, the service reuses only the port from `listen_addr` and requests a remote listen address in the form `:<port>`.
+   When reverse SSH forwarding is enabled with `tunnel.ssh_addr`, the service reuses only the port from `listen_addr` and requests a remote listen address in the form `:<port>`.
 
    For OpenSSH, remote forwarding behavior is still restricted by `sshd_config`:
    - `AllowTcpForwarding yes` must allow remote forwarding.
@@ -136,9 +136,10 @@ Example `$HOME/.assistant/config.yml`:
 
 ```yaml
 listen_addr: :8421
-remote_ssh_addr: example.com
-remote_ssh_user: ubuntu
-ssh_key_path: /path/to/id_rsa
+tunnel:
+  ssh_addr: example.com
+  ssh_user: ubuntu
+  ssh_key: /path/to/id_rsa
 codex:
   backend: appserver
   model: gpt-5.4
