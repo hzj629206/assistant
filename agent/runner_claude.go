@@ -27,7 +27,7 @@ const claudeSDKMCPServerName = "assistant"
 const claudeSDKEntrypoint = "sdk-py"
 const claudeAgentSDKVersion = "go-local"
 const claudeCodeTerminateTimeout = 2 * time.Second
-const defaultClaudeCodeSessionIdleTimeout = 15 * time.Minute
+const defaultClaudeCodeSessionIdleTimeout = 10 * time.Minute
 
 // ClaudeCodeRunner bridges dispatcher turns to the Claude Code CLI through claude-code-go.
 // Claude sessions are reused per conversation while idle and restarted from the stored
@@ -1219,7 +1219,7 @@ func (s *claudePersistentProcessSession) scanStdout(stdout io.Reader) {
 		case "control_request":
 			s.handleControlRequest(envelope)
 		default:
-			s.handleStreamMessage(line)
+			s.handleStreamMessage(envelope, line)
 		}
 	}
 
@@ -1295,25 +1295,148 @@ func (s *claudePersistentProcessSession) handleControlRequest(envelope map[strin
 	}
 }
 
-func (s *claudePersistentProcessSession) handleStreamMessage(line string) {
+func (s *claudePersistentProcessSession) handleStreamMessage(envelope map[string]any, line string) {
 	var msg claudecode.Message
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		s.failCurrentTurn(claudecode.NewClaudeError(claudecode.ErrorValidation, fmt.Sprintf("failed to decode stream message: %v", err)))
 		_ = s.Close()
 		return
 	}
-	if msg.Type != "result" {
+
+	switch msg.Type {
+	case "system":
+		s.handleSystemMessage(&msg)
+	case "assistant":
+		s.handleAssistantMessage(&msg)
+	case "user":
+		s.handleUserMessage(&msg)
+	case "result":
+		s.handleResultMessage(envelope, &msg)
+	case "control_cancel_request":
+		s.handleControlCancelRequest(envelope)
+	default:
+		conversationKey := sanitizeLogValue(s.conversationKey)
+		messageType := sanitizeLogValue(msg.Type)
+		log.Printf(
+			"claude code runner ignoring unsupported stream message: conversation=%s pid=%d type=%s",
+			conversationKey,
+			s.cmd.Process.Pid,
+			messageType,
+		)
+	}
+}
+
+func (s *claudePersistentProcessSession) handleSystemMessage(msg *claudecode.Message) {
+	if msg == nil {
 		return
 	}
 
-	//nolint:gosec // Session metadata is structured process output used only for local diagnostics.
+	sessionID := strings.TrimSpace(msg.SessionID)
+	if sessionID == "" {
+		return
+	}
+
+	s.stateMu.Lock()
+	s.sessionID = sessionID
+	s.stateMu.Unlock()
+
 	log.Printf(
-		"claude code runner received result message: conversation=%s pid=%d session_id=%s result_len=%d is_error=%t",
+		"claude code runner received system message: conversation=%s pid=%d session_id=%s",
 		s.conversationKey,
 		s.cmd.Process.Pid,
-		msg.SessionID,
+		sessionID,
+	)
+}
+
+func (s *claudePersistentProcessSession) handleAssistantMessage(msg *claudecode.Message) {
+	roleMessage, err := decodeClaudeStreamRoleMessage(msg)
+	if err != nil {
+		log.Printf(
+			"claude code runner failed to decode assistant message: conversation=%s pid=%d err=%v",
+			s.conversationKey,
+			s.cmd.Process.Pid,
+			err,
+		)
+		return
+	}
+
+	for _, block := range roleMessage.Content {
+		switch block.Type {
+		case "text":
+			if strings.TrimSpace(block.Text) == "" {
+				continue
+			}
+			log.Printf(
+				"claude code runner received assistant text chunk: conversation=%s pid=%d chars=%d",
+				s.conversationKey,
+				s.cmd.Process.Pid,
+				len(block.Text),
+			)
+		case "thinking":
+			if strings.TrimSpace(block.Thinking) == "" {
+				continue
+			}
+			log.Printf(
+				"claude code runner received assistant thinking chunk: conversation=%s pid=%d chars=%d",
+				s.conversationKey,
+				s.cmd.Process.Pid,
+				len(block.Thinking),
+			)
+		case "tool_use":
+			log.Printf(
+				"claude code runner received assistant tool use: conversation=%s pid=%d tool=%s input=%s",
+				s.conversationKey,
+				s.cmd.Process.Pid,
+				block.Name,
+				summarizeClaudeToolInput(block.Name, block.Input),
+			)
+		}
+	}
+}
+
+func (s *claudePersistentProcessSession) handleUserMessage(msg *claudecode.Message) {
+	roleMessage, err := decodeClaudeStreamRoleMessage(msg)
+	if err != nil {
+		log.Printf(
+			"claude code runner failed to decode user message: conversation=%s pid=%d err=%v",
+			s.conversationKey,
+			s.cmd.Process.Pid,
+			err,
+		)
+		return
+	}
+
+	for _, block := range roleMessage.Content {
+		if block.Type != "tool_result" || !block.IsError {
+			continue
+		}
+		log.Printf(
+			"claude code runner received tool error result: conversation=%s pid=%d detail=%s",
+			s.conversationKey,
+			s.cmd.Process.Pid,
+			summarizeClaudeToolResult(block.Content),
+		)
+	}
+}
+
+func (s *claudePersistentProcessSession) handleResultMessage(envelope map[string]any, msg *claudecode.Message) {
+	if msg == nil {
+		return
+	}
+
+	inputTokens, outputTokens := parseClaudeResultUsage(envelope)
+	conversationKey := sanitizeLogValue(s.conversationKey)
+	sessionID := sanitizeLogValue(msg.SessionID)
+
+	log.Printf(
+		"claude code runner received result message: conversation=%s pid=%d session_id=%s result_len=%d is_error=%t input_tokens=%d output_tokens=%d",
+		conversationKey,
+		s.cmd.Process.Pid,
+		sessionID,
 		len(msg.Result),
 		msg.IsError,
+		inputTokens,
+		outputTokens,
 	)
 	result := &claudecode.ClaudeResult{
 		Type:          msg.Type,
@@ -1335,6 +1458,120 @@ func (s *claudePersistentProcessSession) handleStreamMessage(line string) {
 	s.stateMu.Unlock()
 	if turn != nil {
 		turn.resultCh <- result
+	}
+}
+
+func (s *claudePersistentProcessSession) handleControlCancelRequest(envelope map[string]any) {
+	conversationKey := sanitizeLogValue(s.conversationKey)
+	requestID, _ := envelope["request_id"].(string)
+	requestID = sanitizeLogValue(requestID)
+	log.Printf(
+		"claude code runner received control cancel request: conversation=%s pid=%d request_id=%s",
+		conversationKey,
+		s.cmd.Process.Pid,
+		requestID,
+	)
+}
+
+func sanitizeLogValue(value string) string {
+	if value == "" {
+		return ""
+	}
+
+	replacer := strings.NewReplacer(
+		"\n", "\\n",
+		"\r", "\\r",
+		"\t", "\\t",
+	)
+	return replacer.Replace(value)
+}
+
+type claudeStreamRoleMessage struct {
+	Role    string                     `json:"role"`
+	Content []claudeStreamContentBlock `json:"content"`
+}
+
+type claudeStreamContentBlock struct {
+	Type     string         `json:"type"`
+	Name     string         `json:"name,omitempty"`
+	Text     string         `json:"text,omitempty"`
+	Thinking string         `json:"thinking,omitempty"`
+	Input    map[string]any `json:"input,omitempty"`
+	IsError  bool           `json:"is_error,omitempty"`
+	Content  any            `json:"content,omitempty"`
+}
+
+func decodeClaudeStreamRoleMessage(msg *claudecode.Message) (claudeStreamRoleMessage, error) {
+	if msg == nil || len(msg.Message) == 0 {
+		return claudeStreamRoleMessage{}, nil
+	}
+
+	var roleMessage claudeStreamRoleMessage
+	err := json.Unmarshal(msg.Message, &roleMessage)
+	if err != nil {
+		return claudeStreamRoleMessage{}, err
+	}
+
+	return roleMessage, nil
+}
+
+func summarizeClaudeToolInput(toolName string, input map[string]any) string {
+	_ = toolName
+	if len(input) == 0 {
+		return "{}"
+	}
+
+	data, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Sprintf("%v", input)
+	}
+
+	return string(data)
+}
+
+func summarizeClaudeToolResult(content any) string {
+	switch value := content.(type) {
+	case nil:
+		return "null"
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return `""`
+		}
+		return value
+	default:
+		data, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Sprintf("%v", value)
+		}
+		return string(data)
+	}
+}
+
+func parseClaudeResultUsage(envelope map[string]any) (int, int) {
+	usage, _ := envelope["usage"].(map[string]any)
+	if usage == nil {
+		return 0, 0
+	}
+
+	return parseClaudeUsageInt(usage["input_tokens"]), parseClaudeUsageInt(usage["output_tokens"])
+}
+
+func parseClaudeUsageInt(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case json.Number:
+		number, err := typed.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(number)
+	default:
+		return 0
 	}
 }
 

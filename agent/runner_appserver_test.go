@@ -22,6 +22,7 @@ type fakeAppServerThread struct {
 type fakeAppServerTurnStream struct {
 	notifications []apprpc.Notification
 	index         int
+	turnID        string
 }
 
 func (t *fakeAppServerThread) ID() string {
@@ -40,6 +41,10 @@ func (s *fakeAppServerTurnStream) Next(context.Context) (apprpc.Notification, er
 	note := s.notifications[s.index]
 	s.index++
 	return note, nil
+}
+
+func (s *fakeAppServerTurnStream) TurnID() string {
+	return s.turnID
 }
 
 func (s *fakeAppServerTurnStream) Close() {}
@@ -341,6 +346,36 @@ func TestAppServerRunTurnDoesNotPassSystemPromptAsDeveloperInstructionsOnResume(
 	}
 	if resumedOptions.DeveloperInstructions != "Base resume instruction." {
 		t.Fatalf("unexpected developer instructions: %q", resumedOptions.DeveloperInstructions)
+	}
+}
+
+func TestAppServerRunTurnUsesFrozenPromptSnapshotForNewThread(t *testing.T) {
+	t.Parallel()
+
+	thread := &fakeAppServerThread{id: "thread-new"}
+	var runner *AppServerRunner
+	runner = &AppServerRunner{
+		startThread: func(_ context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
+			if options.DeveloperInstructions != "Prompt A" {
+				t.Fatalf("unexpected developer instructions: %q", options.DeveloperInstructions)
+			}
+			runner.RegisterSystemPrompt("Prompt B")
+			return thread, nil
+		},
+		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, _ []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
+			return &appcodex.TurnResult{FinalResponse: "ok"}, nil
+		},
+	}
+	runner.RegisterSystemPrompt("Prompt A")
+
+	_, err := runner.RunTurn(context.Background(), TurnRequest{
+		Message: InboundMessage{
+			Kind: MessageKindText,
+			Text: "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("run turn failed: %v", err)
 	}
 }
 
@@ -707,6 +742,14 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 				},
 				"capabilities": map[string]any{
 					"experimentalApi": true,
+					"optOutNotificationMethods": []string{
+						"command/exec/outputDelta",
+						"item/agentMessage/delta",
+						"item/fileChange/outputDelta",
+						"item/plan/delta",
+						"item/reasoning/summaryTextDelta",
+						"item/reasoning/textDelta",
+					},
 				},
 			}),
 		}),
@@ -873,6 +916,123 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 	}
 	if result.ReplyText != "HELLO" {
 		t.Fatalf("unexpected reply text: %q", result.ReplyText)
+	}
+}
+
+func TestMatchesAppServerTurnFiltersByThreadAndTurn(t *testing.T) {
+	t.Parallel()
+
+	matching := apprpc.Notification{
+		Method: "item/completed",
+		Raw: appServerMustRaw(t, map[string]any{
+			"threadId": "thread-1",
+			"turnId":   "turn-1",
+			"item": map[string]any{
+				"assistant_message": map[string]any{"text": "ok"},
+			},
+		}),
+	}
+	if !matchesAppServerTurn(matching, "thread-1", "turn-1") {
+		t.Fatal("expected matching turn notification")
+	}
+
+	wrongTurn := apprpc.Notification{
+		Method: "error",
+		Raw: appServerMustRaw(t, map[string]any{
+			"threadId": "thread-1",
+			"turnId":   "turn-2",
+			"error":    map[string]any{"message": "wrong turn"},
+		}),
+	}
+	if matchesAppServerTurn(wrongTurn, "thread-1", "turn-1") {
+		t.Fatal("did not expect notification from another turn")
+	}
+
+	global := apprpc.Notification{
+		Method: "account/rateLimits/updated",
+		Raw: appServerMustRaw(t, map[string]any{
+			"rateLimits": map[string]any{},
+		}),
+	}
+	if matchesAppServerTurn(global, "thread-1", "turn-1") {
+		t.Fatal("did not expect global notification to match a specific turn")
+	}
+}
+
+func TestItemToolCallPrefersExactTurnMatch(t *testing.T) {
+	t.Parallel()
+
+	runner := &AppServerRunner{
+		activeTurns: map[string]appServerActiveTurn{
+			appServerActiveTurnKey("thread-1", ""): {
+				req: TurnRequest{
+					Conversation: ConversationState{Key: "fallback"},
+				},
+				tools: []Tool{snapshotTool{name: "fallback"}},
+			},
+			appServerActiveTurnKey("thread-1", "turn-1"): {
+				req: TurnRequest{
+					Conversation: ConversationState{Key: "exact"},
+				},
+				tools: []Tool{uppercaseTool{}},
+			},
+		},
+	}
+
+	response, err := runner.ItemToolCall(context.Background(), protocol.DynamicToolCallParams{
+		ThreadID: "thread-1",
+		TurnID:   "turn-1",
+		Tool:     "uppercase",
+		Arguments: map[string]any{
+			"text": "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("item tool call failed: %v", err)
+	}
+	if response == nil || !response.Success {
+		t.Fatalf("unexpected tool response: %#v", response)
+	}
+	content := response.ContentItems
+	if len(content) != 1 {
+		t.Fatalf("unexpected content items: %#v", content)
+	}
+	item, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected content item type: %#v", content[0])
+	}
+	if item["text"] != `{"text":"HELLO"}` {
+		t.Fatalf("unexpected content text: %#v", item["text"])
+	}
+}
+
+func TestItemToolCallUsesFrozenToolSnapshot(t *testing.T) {
+	t.Parallel()
+
+	runner := &AppServerRunner{
+		activeTurns: map[string]appServerActiveTurn{
+			appServerActiveTurnKey("thread-1", ""): {
+				req: TurnRequest{
+					Conversation: ConversationState{Key: "snapshot"},
+				},
+				tools: []Tool{uppercaseTool{}},
+			},
+		},
+		tools: []Tool{snapshotTool{name: "late"}},
+	}
+
+	response, err := runner.ItemToolCall(context.Background(), protocol.DynamicToolCallParams{
+		ThreadID: "thread-1",
+		Tool:     "uppercase",
+		Arguments: map[string]any{
+			"text": "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("item tool call failed: %v", err)
+	}
+	if response == nil || !response.Success {
+		t.Fatalf("unexpected tool response: %#v", response)
 	}
 }
 

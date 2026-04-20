@@ -157,6 +157,12 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 		return TurnResult{}, errors.New("run codex turn failed: runner is nil")
 	}
 
+	prompts, tools := r.globalContext()
+	turnContext := codexTurnContext{
+		prompts: prompts,
+		tools:   tools,
+	}
+
 	var thread codexThread
 	threadAction := "start"
 	if req.Conversation.RunnerThreadID != "" {
@@ -184,7 +190,7 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 		thread.ID(),
 	)
 
-	input, err := r.buildTurnInput(req)
+	input, err := r.buildTurnInputWithContext(req, turnContext)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
 	}
@@ -198,7 +204,6 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 	defer typing.Stop()
 
 	var replyText string
-	_, tools := r.globalContext()
 	if len(tools) == 0 {
 		log.Printf("codex runner executing turn: conversation=%s mode=direct", req.Conversation.Key)
 		turn, runErr := r.runThreadTurn(req, thread, input, codex.TurnOptions{
@@ -210,7 +215,7 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 		replyText = turn.FinalResponse
 	} else {
 		log.Printf("codex runner executing turn: conversation=%s mode=tool_loop tool_count=%d", req.Conversation.Key, len(tools))
-		replyText, err = r.runToolLoop(ctx, req, thread, input)
+		replyText, err = r.runToolLoopWithContext(ctx, req, thread, input, turnContext)
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
 		}
@@ -249,8 +254,15 @@ func (r *CodexRunner) collectStreamedTurn(req TurnRequest, streamed *codex.Strea
 
 	for event := range streamed.Events {
 		switch event.Type {
+		case "thread.started":
+			log.Printf(
+				"codex runner thread started: conversation=%s thread_id=%s",
+				req.Conversation.Key,
+				event.ThreadID,
+			)
 		case "item.completed":
 			if event.Item != nil {
+				logCodexCompletedItem(req, event.Item)
 				items = append(items, event.Item)
 				if msg, ok := event.Item.(*codex.AgentMessageItem); ok {
 					finalResponse = msg.Text
@@ -258,8 +270,30 @@ func (r *CodexRunner) collectStreamedTurn(req TurnRequest, streamed *codex.Strea
 			}
 		case "turn.completed":
 			usage = event.Usage
+			if usage != nil {
+				log.Printf(
+					"codex runner turn usage: conversation=%s input_tokens=%d cached_input_tokens=%d output_tokens=%d",
+					req.Conversation.Key,
+					usage.InputTokens,
+					usage.CachedInputTokens,
+					usage.OutputTokens,
+				)
+			}
 		case "turn.failed":
 			turnFailure = event.Error
+			if turnFailure != nil {
+				log.Printf(
+					"codex runner turn failed event: conversation=%s err=%s",
+					req.Conversation.Key,
+					turnFailure.Message,
+				)
+			}
+		case "error":
+			log.Printf(
+				"codex runner stream error event: conversation=%s message=%s",
+				req.Conversation.Key,
+				strings.TrimSpace(event.Message),
+			)
 		}
 	}
 
@@ -283,6 +317,126 @@ func (r *CodexRunner) collectStreamedTurn(req TurnRequest, streamed *codex.Strea
 	}, nil
 }
 
+func logCodexCompletedItem(req TurnRequest, item codex.ThreadItem) {
+	switch current := item.(type) {
+	case *codex.AgentMessageItem:
+		log.Printf(
+			"codex runner item completed: conversation=%s type=%s text_len=%d",
+			req.Conversation.Key,
+			current.Type,
+			len(current.Text),
+		)
+	case *codex.ReasoningItem:
+		log.Printf(
+			"codex runner reasoning completed: conversation=%s text=%q",
+			req.Conversation.Key,
+			abbreviateLogText(current.Text, 200),
+		)
+	case *codex.CommandExecutionItem:
+		exitCode := ""
+		if current.ExitCode != nil {
+			exitCode = strconv.Itoa(*current.ExitCode)
+		}
+		log.Printf(
+			"codex runner command completed: conversation=%s status=%s exit_code=%s command=%q output=%q",
+			req.Conversation.Key,
+			current.Status,
+			exitCode,
+			abbreviateLogText(current.Command, 160),
+			abbreviateLogText(current.AggregatedOutput, 200),
+		)
+	case *codex.FileChangeItem:
+		log.Printf(
+			"codex runner file change completed: conversation=%s status=%s changes=%s",
+			req.Conversation.Key,
+			current.Status,
+			summarizeCodexFileChanges(current.Changes),
+		)
+	case *codex.McpToolCallItem:
+		log.Printf(
+			"codex runner mcp tool completed: conversation=%s server=%s tool=%s status=%s error=%q",
+			req.Conversation.Key,
+			current.Server,
+			current.Tool,
+			current.Status,
+			summarizeCodexMCPError(current.Error),
+		)
+	case *codex.WebSearchItem:
+		log.Printf(
+			"codex runner web search completed: conversation=%s query=%q",
+			req.Conversation.Key,
+			abbreviateLogText(current.Query, 200),
+		)
+	case *codex.TodoListItem:
+		log.Printf(
+			"codex runner todo list completed: conversation=%s items=%d completed=%d",
+			req.Conversation.Key,
+			len(current.Items),
+			countCompletedCodexTodos(current.Items),
+		)
+	case *codex.ErrorItem:
+		log.Printf(
+			"codex runner item error: conversation=%s message=%q",
+			req.Conversation.Key,
+			abbreviateLogText(current.Message, 200),
+		)
+	default:
+		log.Printf(
+			"codex runner item completed: conversation=%s type=%s",
+			req.Conversation.Key,
+			item.ItemType(),
+		)
+	}
+}
+
+func summarizeCodexFileChanges(changes []codex.FileUpdateChange) string {
+	if len(changes) == 0 {
+		return "none"
+	}
+
+	parts := make([]string, 0, len(changes))
+	for _, change := range changes {
+		part := string(change.Kind)
+		if strings.TrimSpace(change.Path) != "" {
+			part += ":" + change.Path
+		}
+		parts = append(parts, part)
+	}
+
+	return abbreviateLogText(strings.Join(parts, ", "), 240)
+}
+
+func summarizeCodexMCPError(err *codex.McpToolCallError) string {
+	if err == nil {
+		return ""
+	}
+
+	return abbreviateLogText(err.Message, 200)
+}
+
+func countCompletedCodexTodos(items []codex.TodoItem) int {
+	count := 0
+	for _, item := range items {
+		if item.Completed {
+			count++
+		}
+	}
+
+	return count
+}
+
+func abbreviateLogText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	if limit <= 3 {
+		return text[:limit]
+	}
+
+	return text[:limit-3] + "..."
+}
+
 type toolLoopResponse struct {
 	Action        string          `json:"action"`
 	Message       string          `json:"message,omitempty"`
@@ -291,7 +445,20 @@ type toolLoopResponse struct {
 	ToolInputJSON string          `json:"tool_input_json,omitempty"`
 }
 
+type codexTurnContext struct {
+	prompts []string
+	tools   []Tool
+}
+
 func (r *CodexRunner) runToolLoop(ctx context.Context, req TurnRequest, thread codexThread, input codex.Input) (string, error) {
+	prompts, tools := r.globalContext()
+	return r.runToolLoopWithContext(ctx, req, thread, input, codexTurnContext{
+		prompts: prompts,
+		tools:   tools,
+	})
+}
+
+func (r *CodexRunner) runToolLoopWithContext(ctx context.Context, req TurnRequest, thread codexThread, input codex.Input, turnContext codexTurnContext) (string, error) {
 	currentInput := input
 	toolCtx := ContextWithTurnRequest(ctx, req)
 	for iteration := 0; iteration < r.maxToolIterations; iteration++ {
@@ -311,7 +478,14 @@ func (r *CodexRunner) runToolLoop(ctx context.Context, req TurnRequest, thread c
 
 		decision, parseErr := parseToolLoopResponse(turn.FinalResponse)
 		if parseErr != nil {
-			return "", parseErr
+			log.Printf(
+				"codex runner tool loop invalid response: conversation=%s iteration=%d err=%v",
+				req.Conversation.Key,
+				iteration+1,
+				parseErr,
+			)
+			currentInput = buildToolLoopErrorInput(parseErr, turn.FinalResponse)
+			continue
 		}
 		log.Printf(
 			"codex runner tool loop decision: conversation=%s iteration=%d action=%s tool=%s message_len=%d",
@@ -325,13 +499,29 @@ func (r *CodexRunner) runToolLoop(ctx context.Context, req TurnRequest, thread c
 		switch decision.Action {
 		case "respond":
 			if strings.TrimSpace(decision.Message) == "" {
-				return "", errors.New("tool loop returned an empty assistant message")
+				decisionErr := errors.New("tool loop returned an empty assistant message")
+				log.Printf(
+					"codex runner tool loop invalid response: conversation=%s iteration=%d err=%v",
+					req.Conversation.Key,
+					iteration+1,
+					decisionErr,
+				)
+				currentInput = buildToolLoopErrorInput(decisionErr, turn.FinalResponse)
+				continue
 			}
 			return decision.Message, nil
 		case "call_tool":
-			tool, ok := r.findTool(decision.ToolName)
+			tool, ok := findToolIn(turnContext.tools, decision.ToolName)
 			if !ok {
-				return "", fmt.Errorf("tool loop requested unknown tool %q", decision.ToolName)
+				decisionErr := fmt.Errorf("tool loop requested unknown tool %q", decision.ToolName)
+				log.Printf(
+					"codex runner tool loop invalid response: conversation=%s iteration=%d err=%v",
+					req.Conversation.Key,
+					iteration+1,
+					decisionErr,
+				)
+				currentInput = buildToolLoopErrorInput(decisionErr, turn.FinalResponse)
+				continue
 			}
 
 			log.Printf(
@@ -365,15 +555,22 @@ func (r *CodexRunner) runToolLoop(ctx context.Context, req TurnRequest, thread c
 		case "silent":
 			return "", nil
 		default:
-			return "", fmt.Errorf("tool loop returned unsupported action %q", decision.Action)
+			decisionErr := fmt.Errorf("tool loop returned unsupported action %q", decision.Action)
+			log.Printf(
+				"codex runner tool loop invalid response: conversation=%s iteration=%d err=%v",
+				req.Conversation.Key,
+				iteration+1,
+				decisionErr,
+			)
+			currentInput = buildToolLoopErrorInput(decisionErr, turn.FinalResponse)
+			continue
 		}
 	}
 
 	return "", fmt.Errorf("tool loop exceeded %d iterations", r.maxToolIterations)
 }
 
-func (r *CodexRunner) findTool(name string) (Tool, bool) {
-	_, tools := r.globalContext()
+func findToolIn(tools []Tool, name string) (Tool, bool) {
 	for _, tool := range tools {
 		if tool.Name() == name {
 			return tool, true
@@ -394,8 +591,35 @@ func parseToolLoopResponse(raw string) (toolLoopResponse, error) {
 	if response.Action == "call_tool" && len(response.ToolInput) == 0 {
 		response.ToolInput = json.RawMessage("{}")
 	}
+	if err := validateToolLoopResponse(response); err != nil {
+		return toolLoopResponse{}, err
+	}
 
 	return response, nil
+}
+
+func validateToolLoopResponse(response toolLoopResponse) error {
+	switch response.Action {
+	case "respond":
+		return nil
+	case "silent":
+		return nil
+	case "call_tool":
+		if strings.TrimSpace(response.ToolName) == "" {
+			return errors.New("tool loop response missing tool_name for call_tool action")
+		}
+		if !json.Valid(response.ToolInput) {
+			return errors.New("tool loop response tool_input_json is not valid JSON")
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(response.ToolInput, &payload); err != nil {
+			return errors.New("tool loop response tool_input_json must decode to a JSON object")
+		}
+		return nil
+	default:
+		return fmt.Errorf("tool loop response has unsupported action %q", response.Action)
+	}
 }
 
 func (r *CodexRunner) injectInitialPrompt(input codex.Input, prompts []string, tools []Tool) (codex.Input, error) {
@@ -547,9 +771,17 @@ func joinPromptBlocks(parts ...string) string {
 }
 
 func (r *CodexRunner) buildTurnInput(req TurnRequest) (codex.Input, error) {
+	prompts, tools := r.globalContext()
+	return r.buildTurnInputWithContext(req, codexTurnContext{
+		prompts: prompts,
+		tools:   tools,
+	})
+}
+
+func (r *CodexRunner) buildTurnInputWithContext(req TurnRequest, turnContext codexTurnContext) (codex.Input, error) {
 	prompt, imagePaths := buildTurnPrompt(req.Message)
 	if len(imagePaths) == 0 {
-		return r.injectInitialTurnContext(req, codex.TextInput(prompt))
+		return r.injectInitialTurnContext(req, codex.TextInput(prompt), turnContext)
 	}
 
 	items := make([]codex.UserInput, 0, 1+len(imagePaths))
@@ -567,7 +799,7 @@ func (r *CodexRunner) buildTurnInput(req TurnRequest) (codex.Input, error) {
 		})
 	}
 
-	return r.injectInitialTurnContext(req, codex.ItemsInput(items...))
+	return r.injectInitialTurnContext(req, codex.ItemsInput(items...), turnContext)
 }
 
 func allImagePaths(primary string, extra []string) []string {
@@ -605,13 +837,26 @@ func allPaths(primary string, extra []string) []string {
 	return paths
 }
 
-func (r *CodexRunner) injectInitialTurnContext(req TurnRequest, input codex.Input) (codex.Input, error) {
+func (r *CodexRunner) injectInitialTurnContext(req TurnRequest, input codex.Input, turnContext codexTurnContext) (codex.Input, error) {
 	if req.Conversation.RunnerThreadID != "" {
 		return input, nil
 	}
 
-	prompts, tools := r.globalContext()
-	return r.injectInitialPrompt(input, prompts, tools)
+	return r.injectInitialPrompt(input, turnContext.prompts, turnContext.tools)
+}
+
+func buildToolLoopErrorInput(err error, rawResponse string) codex.Input {
+	return codex.TextInput(strings.TrimSpace(fmt.Sprintf(`
+The previous JSON response was invalid and could not be executed.
+
+Error:
+%v
+
+Previous response:
+%s
+
+Return a corrected JSON object that matches the schema exactly. Do not add prose outside the JSON object.
+`, err, rawResponse)))
 }
 
 func buildTurnPrompt(message InboundMessage) (string, []string) {
