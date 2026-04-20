@@ -170,7 +170,7 @@ Command-line flags are only intended for a small set of common non-sensitive ove
 codexd \
   -listen-addr :8421 \
   -codex-backend appserver \
-  -codex-model gpt-5.4-mini \
+  -codex-model gpt-5.4 \
   -codex-reasoning-effort low \
   -codex-sandbox read-only
 ```

@@ -45,20 +45,20 @@ type CodexConfig struct {
 // All other Claude Code capabilities should be configured directly in the CLI environment.
 type ClaudeConfig struct {
 	Model                 string   `json:"model" yaml:"model"`
+	ReasoningEffort       string   `json:"reasoning_effort" yaml:"reasoning_effort"`
 	Permission            string   `json:"permission" yaml:"permission"`
-	Effort                string   `json:"effort" yaml:"effort"`
 	AdditionalDirectories []string `json:"additional_directories" yaml:"additional_directories"`
 }
 
 type flagOverlay struct {
-	listenAddr           string
-	codexBackend         string
-	codexModel           string
-	codexReasoningEffort string
-	codexSandbox         string
-	claudeModel          string
-	claudePermission     string
-	claudeEffort         string
+	listenAddr            string
+	codexBackend          string
+	codexModel            string
+	codexReasoningEffort  string
+	codexSandbox          string
+	claudeModel           string
+	claudeReasoningEffort string
+	claudePermission      string
 }
 
 // ParseConfig loads defaults, then an optional config file, then a limited set of command-line overrides.
@@ -73,14 +73,14 @@ func ParseConfig(programName string, args []string) (Config, error) {
 	}
 
 	overlay := flagOverlay{
-		listenAddr:           "",
-		codexBackend:         cfg.Codex.Backend,
-		codexModel:           cfg.Codex.Model,
-		codexReasoningEffort: cfg.Codex.ReasoningEffort,
-		codexSandbox:         cfg.Codex.Sandbox,
-		claudeModel:          cfg.Claude.Model,
-		claudePermission:     cfg.Claude.Permission,
-		claudeEffort:         cfg.Claude.Effort,
+		listenAddr:            "",
+		codexBackend:          cfg.Codex.Backend,
+		codexModel:            cfg.Codex.Model,
+		codexReasoningEffort:  cfg.Codex.ReasoningEffort,
+		codexSandbox:          cfg.Codex.Sandbox,
+		claudeModel:           cfg.Claude.Model,
+		claudeReasoningEffort: cfg.Claude.ReasoningEffort,
+		claudePermission:      cfg.Claude.Permission,
 	}
 
 	var configPath string
@@ -131,10 +131,7 @@ func defaultConfig() (Config, error) {
 			CloudflaredToken: "",
 		},
 		Codex: CodexConfig{
-			Backend:         "appserver",
-			Model:           "gpt-5.4",
-			ReasoningEffort: "low",
-			Sandbox:         "read-only",
+			Backend: "appserver",
 		},
 		Claude: ClaudeConfig{},
 		SeaTalk: seatalk.Config{
@@ -154,8 +151,8 @@ func newFlagSet(programName string, overlay *flagOverlay, configPath *string) *f
 	fs.StringVar(&overlay.codexReasoningEffort, "codex-reasoning-effort", overlay.codexReasoningEffort, "Codex reasoning effort override")
 	fs.StringVar(&overlay.codexSandbox, "codex-sandbox", overlay.codexSandbox, "Codex sandbox override")
 	fs.StringVar(&overlay.claudeModel, "claude-model", overlay.claudeModel, "Claude model name override")
+	fs.StringVar(&overlay.claudeReasoningEffort, "claude-reasoning-effort", overlay.claudeReasoningEffort, "Claude effort override")
 	fs.StringVar(&overlay.claudePermission, "claude-permission", overlay.claudePermission, "Claude permission mode override")
-	fs.StringVar(&overlay.claudeEffort, "claude-effort", overlay.claudeEffort, "Claude effort override")
 	fs.StringVar(configPath, "f", *configPath, "path to config file")
 	fs.StringVar(configPath, "config", *configPath, "path to config file")
 	return fs
@@ -175,10 +172,10 @@ func applyFlagOverride(cfg *Config, overlay flagOverlay, name string) {
 		cfg.Codex.Sandbox = overlay.codexSandbox
 	case "claude-model":
 		cfg.Claude.Model = overlay.claudeModel
+	case "claude-reasoning-effort":
+		cfg.Claude.ReasoningEffort = overlay.claudeReasoningEffort
 	case "claude-permission":
 		cfg.Claude.Permission = overlay.claudePermission
-	case "claude-effort":
-		cfg.Claude.Effort = overlay.claudeEffort
 	}
 }
 
@@ -244,15 +241,6 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	if cfg.Backend == "" {
 		cfg.Backend = "appserver"
 	}
-	if cfg.Model == "" {
-		cfg.Model = "gpt-5.4"
-	}
-	if cfg.ReasoningEffort == "" {
-		cfg.ReasoningEffort = "low"
-	}
-	if cfg.Sandbox == "" {
-		cfg.Sandbox = "read-only"
-	}
 
 	switch cfg.Backend {
 	case "appserver", "exec":
@@ -261,18 +249,47 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	}
 
 	switch cfg.ReasoningEffort {
-	case "none", "minimal", "low", "medium", "high", "xhigh":
+	case "", "none", "minimal", "low", "medium", "high", "xhigh":
 	default:
 		return fmt.Errorf("unsupported codex reasoning effort %q", cfg.ReasoningEffort)
 	}
 
 	switch cfg.Sandbox {
-	case "read-only", "workspace-write", "danger-full-access":
+	case "", "read-only", "workspace-write", "danger-full-access":
 	default:
 		return fmt.Errorf("unsupported codex sandbox %q", cfg.Sandbox)
 	}
 
 	return nil
+}
+
+func normalizeCodexAdditionalWritableRoots(roots []string) []string {
+	if len(roots) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+
+		if absoluteRoot, err := filepath.Abs(root); err == nil {
+			root = absoluteRoot
+		}
+		root = filepath.Clean(root)
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		normalized = append(normalized, root)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }
 
 func normalizeClaudeConfig(cfg *ClaudeConfig) {
@@ -282,12 +299,12 @@ func normalizeClaudeConfig(cfg *ClaudeConfig) {
 
 	cfg.Model = strings.TrimSpace(cfg.Model)
 	cfg.Permission = normalizeClaudePermission(strings.TrimSpace(strings.ToLower(cfg.Permission)))
-	cfg.Effort = strings.TrimSpace(strings.ToLower(cfg.Effort))
-	switch cfg.Effort {
+	cfg.ReasoningEffort = strings.TrimSpace(strings.ToLower(cfg.ReasoningEffort))
+	switch cfg.ReasoningEffort {
 	case "", "low", "medium", "high", "xhigh", "max":
 	default:
-		log.Printf("ignoring unsupported claude effort %q", cfg.Effort)
-		cfg.Effort = ""
+		log.Printf("ignoring unsupported claude effort %q", cfg.ReasoningEffort)
+		cfg.ReasoningEffort = ""
 	}
 	cfg.AdditionalDirectories = normalizeClaudeAdditionalDirectories(cfg.AdditionalDirectories)
 }
@@ -337,35 +354,6 @@ func normalizeClaudeAdditionalDirectories(paths []string) []string {
 	return directories
 }
 
-func normalizeCodexAdditionalWritableRoots(roots []string) []string {
-	if len(roots) == 0 {
-		return nil
-	}
-
-	normalized := make([]string, 0, len(roots))
-	seen := make(map[string]struct{}, len(roots))
-	for _, root := range roots {
-		root = strings.TrimSpace(root)
-		if root == "" {
-			continue
-		}
-
-		if absoluteRoot, err := filepath.Abs(root); err == nil {
-			root = absoluteRoot
-		}
-		root = filepath.Clean(root)
-		if _, ok := seen[root]; ok {
-			continue
-		}
-		seen[root] = struct{}{}
-		normalized = append(normalized, root)
-	}
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
-}
-
 func validateSeaTalkConfig(cfg *seatalk.Config) error {
 	if cfg == nil {
 		return nil
@@ -382,6 +370,7 @@ func validateSeaTalkConfig(cfg *seatalk.Config) error {
 	return nil
 }
 
+// NormalizeRemoteSSHAddr appends the default SSH port when the address omits one.
 func NormalizeRemoteSSHAddr(addr string) string {
 	if addr == "" {
 		return ""

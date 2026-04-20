@@ -14,11 +14,11 @@ import (
 	claudecode "github.com/lancekrogers/claude-code-go/pkg/claude"
 )
 
-func TestNewClaudeCodeRunnerDefaultsPermissionModeToDefault(t *testing.T) {
+func TestNewClaudeCodeRunnerDefaultsPermissionModeToDontAsk(t *testing.T) {
 	t.Parallel()
 
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
-	if runner.runOptions.PermissionMode != claudecode.PermissionModeDefault {
+	if runner.runOptions.PermissionMode != claudecode.PermissionModeDontAsk {
 		t.Fatalf("unexpected permission mode: %s", runner.runOptions.PermissionMode)
 	}
 }
@@ -67,23 +67,27 @@ func TestClaudeCodeRunnerRunTurnStartsConversationAndStoresSessionID(t *testing.
 	t.Parallel()
 
 	var prompts []string
-	var options []*claudecode.RunOptions
+	var options []claudecode.RunOptions
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{
 		RunOptions: claudecode.RunOptions{
 			Model: "claude-sonnet-4-5",
 		},
 	})
-	runner.executeTurn = func(_ context.Context, stdin io.Reader, opts *claudecode.RunOptions, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		prompt, err := readClaudeStreamInput(stdin)
-		if err != nil {
-			return nil, err
-		}
-		prompts = append(prompts, prompt)
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudePersistentTurnSession, error) {
 		options = append(options, opts)
-		return &claudecode.ClaudeResult{
-			Type:      "result",
-			Result:    "assistant reply",
-			SessionID: "session-new",
+		return &fakeClaudePersistentSession{
+			runTurn: func(_ context.Context, stdin io.Reader, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				prompt, err := readClaudeStreamInput(stdin)
+				if err != nil {
+					return nil, err
+				}
+				prompts = append(prompts, prompt)
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "assistant reply",
+					SessionID: "session-new",
+				}, nil
+			},
 		}, nil
 	}
 	runner.RegisterSystemPrompt("Global system prompt.")
@@ -128,10 +132,17 @@ func TestClaudeCodeRunnerRunTurnStartsConversationAndStoresSessionID(t *testing.
 	if options[0].InputFormat != claudecode.StreamJSONInput {
 		t.Fatalf("unexpected input format: %s", options[0].InputFormat)
 	}
-	if !strings.Contains(options[0].AppendPrompt, "Global system prompt.") {
-		t.Fatalf("expected append prompt to include system prompt, got:\n%s", options[0].AppendPrompt)
+	if !strings.Contains(options[0].AppendPrompt, "assistant-claude-append-system-prompt-") {
+		t.Fatalf("expected append prompt file path, got:\n%s", options[0].AppendPrompt)
 	}
-	if options[0].PermissionMode != claudecode.PermissionModeDefault {
+	appendPromptData, err := readTestFile(options[0].AppendPrompt)
+	if err != nil {
+		t.Fatalf("read append prompt file failed: %v", err)
+	}
+	if !strings.Contains(string(appendPromptData), "Global system prompt.") {
+		t.Fatalf("expected append prompt file to include system prompt, got:\n%s", string(appendPromptData))
+	}
+	if options[0].PermissionMode != claudecode.PermissionModeDontAsk {
 		t.Fatalf("unexpected permission mode: %s", options[0].PermissionMode)
 	}
 }
@@ -140,21 +151,24 @@ func TestClaudeCodeRunnerRunTurnResumesExistingSession(t *testing.T) {
 	t.Parallel()
 
 	var prompt string
-	var resumeID string
-	var appendPrompt string
+	var options []claudecode.RunOptions
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
-	runner.executeTurn = func(_ context.Context, stdin io.Reader, opts *claudecode.RunOptions, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		var err error
-		prompt, err = readClaudeStreamInput(stdin)
-		if err != nil {
-			return nil, err
-		}
-		resumeID = opts.ResumeID
-		appendPrompt = opts.AppendPrompt
-		return &claudecode.ClaudeResult{
-			Type:      "result",
-			Result:    "follow-up reply",
-			SessionID: "session-existing",
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		options = append(options, opts)
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-existing",
+			runTurn: func(_ context.Context, stdin io.Reader, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				var err error
+				prompt, err = readClaudeStreamInput(stdin)
+				if err != nil {
+					return nil, err
+				}
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "follow-up reply",
+					SessionID: "session-existing",
+				}, nil
+			},
 		}, nil
 	}
 	runner.RegisterSystemPrompt("Global system prompt.")
@@ -175,11 +189,14 @@ func TestClaudeCodeRunnerRunTurnResumesExistingSession(t *testing.T) {
 		t.Fatalf("RunTurn failed: %v", err)
 	}
 
-	if resumeID != "session-existing" {
-		t.Fatalf("unexpected resume id: %s", resumeID)
+	if len(options) != 1 {
+		t.Fatalf("unexpected options count: %d", len(options))
 	}
-	if appendPrompt != "" {
-		t.Fatalf("expected append prompt to be empty when resuming, got:\n%s", appendPrompt)
+	if options[0].ResumeID != "session-existing" {
+		t.Fatalf("unexpected resume id: %s", options[0].ResumeID)
+	}
+	if options[0].AppendPrompt != "" {
+		t.Fatalf("expected append prompt to be empty when resuming, got:\n%s", options[0].AppendPrompt)
 	}
 	if !strings.Contains(prompt, "follow up") {
 		t.Fatalf("expected user prompt, got:\n%s", prompt)
@@ -198,17 +215,21 @@ func TestClaudeCodeRunnerRunTurnUsesStdioPermissionPromptInDefaultMode(t *testin
 			PermissionMode: claudecode.PermissionModeDefault,
 		},
 	})
-	runner.executeTurn = func(_ context.Context, stdin io.Reader, opts *claudecode.RunOptions, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		_, err := readClaudeStreamInput(stdin)
-		if err != nil {
-			return nil, err
-		}
-		argsSnapshot = buildClaudeSDKArgs(opts)
-		controlSeen = control != nil
-		return &claudecode.ClaudeResult{
-			Type:      "result",
-			Result:    "ok",
-			SessionID: "session-new",
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		argsSnapshot = buildClaudeSDKArgs(&opts)
+		return &fakeClaudePersistentSession{
+			runTurn: func(_ context.Context, stdin io.Reader, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				_, err := readClaudeStreamInput(stdin)
+				if err != nil {
+					return nil, err
+				}
+				controlSeen = control != nil
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "ok",
+					SessionID: "session-new",
+				}, nil
+			},
 		}, nil
 	}
 
@@ -240,70 +261,72 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 	t.Parallel()
 
 	var (
-		resumeID  string
 		prompt    string
 		mcpConfig string
 	)
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
 	runner.RegisterTools(uppercaseTool{})
-	runner.executeTurn = func(ctx context.Context, stdin io.Reader, opts *claudecode.RunOptions, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		var err error
-		prompt, err = readClaudeStreamInput(stdin)
-		if err != nil {
-			return nil, err
-		}
-		resumeID = opts.ResumeID
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudePersistentTurnSession, error) {
 		if len(opts.MCPConfigs) != 1 {
 			t.Fatalf("unexpected mcp config count: %d", len(opts.MCPConfigs))
 		}
 		mcpConfig = opts.MCPConfigs[0]
-		if control == nil || !control.hasTools() {
-			t.Fatal("expected control server with tools")
-		}
+		return &fakeClaudePersistentSession{
+			runTurn: func(ctx context.Context, stdin io.Reader, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				var err error
+				prompt, err = readClaudeStreamInput(stdin)
+				if err != nil {
+					return nil, err
+				}
+				if control == nil || !control.hasTools() {
+					t.Fatal("expected control server with tools")
+				}
 
-		listResponse, err := control.handleRequest(ctx, map[string]any{
-			"subtype":     "mcp_message",
-			"server_name": claudeSDKMCPServerName,
-			"message": map[string]any{
-				"jsonrpc": "2.0",
-				"id":      1,
-				"method":  "tools/list",
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		callResponse, err := control.handleRequest(ctx, map[string]any{
-			"subtype":     "mcp_message",
-			"server_name": claudeSDKMCPServerName,
-			"message": map[string]any{
-				"jsonrpc": "2.0",
-				"id":      2,
-				"method":  "tools/call",
-				"params": map[string]any{
-					"name": "uppercase",
-					"arguments": map[string]any{
-						"text": "hello",
+				listResponse, err := control.handleRequest(ctx, map[string]any{
+					"subtype":     "mcp_message",
+					"server_name": claudeSDKMCPServerName,
+					"message": map[string]any{
+						"jsonrpc": "2.0",
+						"id":      1,
+						"method":  "tools/list",
 					},
-				},
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
+				})
+				if err != nil {
+					return nil, err
+				}
+				callResponse, err := control.handleRequest(ctx, map[string]any{
+					"subtype":     "mcp_message",
+					"server_name": claudeSDKMCPServerName,
+					"message": map[string]any{
+						"jsonrpc": "2.0",
+						"id":      2,
+						"method":  "tools/call",
+						"params": map[string]any{
+							"name": "uppercase",
+							"arguments": map[string]any{
+								"text": "hello",
+							},
+						},
+					},
+				})
+				if err != nil {
+					return nil, err
+				}
 
-		listData, err := json.Marshal(listResponse)
-		if err != nil {
-			return nil, err
-		}
-		callData, err := json.Marshal(callResponse)
-		if err != nil {
-			return nil, err
-		}
-		return &claudecode.ClaudeResult{
-			Type:      "result",
-			Result:    string(listData) + "\n" + string(callData),
-			SessionID: "session-new",
+				listData, err := json.Marshal(listResponse)
+				if err != nil {
+					return nil, err
+				}
+				callData, err := json.Marshal(callResponse)
+				if err != nil {
+					return nil, err
+				}
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    string(listData) + "\n" + string(callData),
+					SessionID: "session-new",
+				}, nil
+			},
 		}, nil
 	}
 
@@ -329,11 +352,15 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 	if result.RunnerThreadID != "session-new" {
 		t.Fatalf("unexpected session id: %s", result.RunnerThreadID)
 	}
-	if resumeID != "" {
-		t.Fatalf("unexpected resume id: %s", resumeID)
+	if !strings.Contains(mcpConfig, "assistant-claude-mcp-config-") {
+		t.Fatalf("expected mcp config file path, got: %s", mcpConfig)
 	}
-	if !strings.Contains(mcpConfig, `"type": "sdk"`) && !strings.Contains(mcpConfig, `"type":"sdk"`) {
-		t.Fatalf("expected sdk mcp config, got: %s", mcpConfig)
+	mcpConfigData, err := readTestFile(mcpConfig)
+	if err != nil {
+		t.Fatalf("read mcp config file failed: %v", err)
+	}
+	if !strings.Contains(string(mcpConfigData), `"type": "sdk"`) && !strings.Contains(string(mcpConfigData), `"type":"sdk"`) {
+		t.Fatalf("expected sdk mcp config, got: %s", string(mcpConfigData))
 	}
 	if !strings.Contains(prompt, "uppercase hello") {
 		t.Fatalf("expected user prompt, got: %s", prompt)
@@ -352,18 +379,22 @@ func TestClaudeCodeRunnerRetriesRetryableError(t *testing.T) {
 			BackoffFactor: 1,
 		},
 	})
-	runner.executeTurn = func(_ context.Context, _ io.Reader, _ *claudecode.RunOptions, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		attempts++
-		if attempts == 1 {
-			return nil, &claudecode.ClaudeError{
-				Type:    claudecode.ErrorNetwork,
-				Message: "temporary network issue",
-			}
-		}
-		return &claudecode.ClaudeResult{
-			Type:      "result",
-			Result:    "assistant reply",
-			SessionID: "session-new",
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		return &fakeClaudePersistentSession{
+			runTurn: func(_ context.Context, _ io.Reader, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				attempts++
+				if attempts == 1 {
+					return nil, &claudecode.ClaudeError{
+						Type:    claudecode.ErrorNetwork,
+						Message: "temporary network issue",
+					}
+				}
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "assistant reply",
+					SessionID: "session-new",
+				}, nil
+			},
 		}, nil
 	}
 
@@ -403,9 +434,13 @@ func TestClaudeCodeRunnerDoesNotRetryNonRetryableError(t *testing.T) {
 		Type:    claudecode.ErrorAuthentication,
 		Message: "invalid credentials",
 	}
-	runner.executeTurn = func(_ context.Context, _ io.Reader, _ *claudecode.RunOptions, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		attempts++
-		return nil, expectedErr
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		return &fakeClaudePersistentSession{
+			runTurn: func(_ context.Context, _ io.Reader, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				attempts++
+				return nil, expectedErr
+			},
+		}, nil
 	}
 
 	_, err := runner.RunTurn(context.Background(), TurnRequest{
@@ -423,6 +458,253 @@ func TestClaudeCodeRunnerDoesNotRetryNonRetryableError(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("unexpected attempt count: %d", attempts)
 	}
+}
+
+func TestClaudeCodeRunnerReusesLiveSessionForSameConversation(t *testing.T) {
+	t.Parallel()
+
+	createCount := 0
+	runCount := 0
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		createCount++
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			runTurn: func(_ context.Context, _ io.Reader, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				runCount++
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "ok",
+					SessionID: "session-live",
+				}, nil
+			},
+		}, nil
+	}
+
+	first, err := runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("first RunTurn failed: %v", err)
+	}
+	_, err = runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: first.RunnerThreadID},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
+	})
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
+	}
+
+	if createCount != 1 {
+		t.Fatalf("unexpected session create count: %d", createCount)
+	}
+	if runCount != 2 {
+		t.Fatalf("unexpected run count: %d", runCount)
+	}
+}
+
+func TestClaudeCodeRunnerExpiresIdleSession(t *testing.T) {
+	t.Parallel()
+
+	createCount := 0
+	closeCount := 0
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{
+		SessionIdleTimeout: 20 * time.Millisecond,
+	})
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		createCount++
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			runTurn: func(_ context.Context, _ io.Reader, _ *claudeControlServer) (*claudecode.ClaudeResult, error) {
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "ok",
+					SessionID: "session-live",
+				}, nil
+			},
+			closeFunc: func() error {
+				closeCount++
+				return nil
+			},
+		}, nil
+	}
+
+	first, err := runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("first RunTurn failed: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	_, err = runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: first.RunnerThreadID},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
+	})
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
+	}
+
+	if createCount != 2 {
+		t.Fatalf("unexpected session create count: %d", createCount)
+	}
+	if closeCount == 0 {
+		t.Fatal("expected idle session to be closed")
+	}
+}
+
+func TestClaudePersistentProcessSessionShouldInitializeOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	session := &claudePersistentProcessSession{}
+	control := newClaudeControlServer(TurnRequest{}, []Tool{uppercaseTool{}})
+
+	if !session.shouldInitialize(control) {
+		t.Fatal("expected first turn to require initialize")
+	}
+
+	session.markInitialized()
+
+	if session.shouldInitialize(control) {
+		t.Fatal("did not expect initialize after session is marked initialized")
+	}
+}
+
+func TestClaudeCodeRunnerApplyArgumentFilesCachesPaths(t *testing.T) {
+	t.Parallel()
+
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	options := claudecode.RunOptions{
+		SystemPrompt: "system prompt",
+		AppendPrompt: "append prompt",
+		MCPConfigs:   []string{`{"mcpServers":{"assistant":{"type":"sdk"}}}`},
+	}
+	err := runner.applyArgumentFiles(&options)
+	if err != nil {
+		t.Fatalf("applyArgumentFiles failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = runner.Close()
+	})
+
+	args := buildClaudeProcessArgs(&options)
+	if !slices.Contains(args, "--system-prompt-file") || !slices.Contains(args, "--append-system-prompt-file") || !slices.Contains(args, "--mcp-config") {
+		t.Fatalf("expected prompt and mcp args, got %q", args)
+	}
+
+	firstSystemPath := options.SystemPrompt
+	firstAppendPath := options.AppendPrompt
+	firstMCPPath := options.MCPConfigs[0]
+
+	otherOptions := claudecode.RunOptions{
+		SystemPrompt: "system prompt",
+		AppendPrompt: "append prompt",
+		MCPConfigs:   []string{`{"mcpServers":{"assistant":{"type":"sdk"}}}`},
+	}
+	err = runner.applyArgumentFiles(&otherOptions)
+	if err != nil {
+		t.Fatalf("second applyArgumentFiles failed: %v", err)
+	}
+	if otherOptions.SystemPrompt != firstSystemPath {
+		t.Fatalf("expected cached system prompt path, got %q want %q", otherOptions.SystemPrompt, firstSystemPath)
+	}
+	if otherOptions.AppendPrompt != firstAppendPath {
+		t.Fatalf("expected cached append prompt path, got %q want %q", otherOptions.AppendPrompt, firstAppendPath)
+	}
+	if otherOptions.MCPConfigs[0] != firstMCPPath {
+		t.Fatalf("expected cached mcp config path, got %q want %q", otherOptions.MCPConfigs[0], firstMCPPath)
+	}
+
+	systemData, err := readTestFile(firstSystemPath)
+	if err != nil {
+		t.Fatalf("ReadFile system prompt failed: %v", err)
+	}
+	if string(systemData) != "system prompt" {
+		t.Fatalf("unexpected system prompt content: %q", string(systemData))
+	}
+
+	appendData, err := readTestFile(firstAppendPath)
+	if err != nil {
+		t.Fatalf("ReadFile append prompt failed: %v", err)
+	}
+	if string(appendData) != "append prompt" {
+		t.Fatalf("unexpected append prompt content: %q", string(appendData))
+	}
+
+	mcpData, err := readTestFile(firstMCPPath)
+	if err != nil {
+		t.Fatalf("ReadFile mcp config failed: %v", err)
+	}
+	if !strings.Contains(string(mcpData), `"type":"sdk"`) {
+		t.Fatalf("unexpected mcp config content: %q", string(mcpData))
+	}
+}
+
+func TestClaudeCodeRunnerApplyArgumentFilesRecreatesMissingCachedFile(t *testing.T) {
+	t.Parallel()
+
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	options := claudecode.RunOptions{
+		AppendPrompt: "append prompt",
+	}
+	err := runner.applyArgumentFiles(&options)
+	if err != nil {
+		t.Fatalf("applyArgumentFiles failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = runner.Close()
+	})
+
+	firstPath := options.AppendPrompt
+	removeClaudeTempFile(firstPath)
+
+	nextOptions := claudecode.RunOptions{
+		AppendPrompt: "append prompt",
+	}
+	err = runner.applyArgumentFiles(&nextOptions)
+	if err != nil {
+		t.Fatalf("second applyArgumentFiles failed: %v", err)
+	}
+	if nextOptions.AppendPrompt == firstPath {
+		t.Fatalf("expected recreated prompt file path to differ after deletion: %q", firstPath)
+	}
+
+	appendData, err := readTestFile(nextOptions.AppendPrompt)
+	if err != nil {
+		t.Fatalf("ReadFile recreated append prompt failed: %v", err)
+	}
+	if string(appendData) != "append prompt" {
+		t.Fatalf("unexpected recreated append prompt content: %q", string(appendData))
+	}
+}
+
+type fakeClaudePersistentSession struct {
+	runTurn          func(context.Context, io.Reader, *claudeControlServer) (*claudecode.ClaudeResult, error)
+	closeFunc        func() error
+	currentSessionID string
+}
+
+func (s *fakeClaudePersistentSession) RunTurn(ctx context.Context, stdin io.Reader, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
+	if s.runTurn == nil {
+		return nil, errors.New("runTurn is nil")
+	}
+	result, err := s.runTurn(ctx, stdin, control)
+	if result != nil && strings.TrimSpace(result.SessionID) != "" {
+		s.currentSessionID = strings.TrimSpace(result.SessionID)
+	}
+	return result, err
+}
+
+func (s *fakeClaudePersistentSession) CurrentSessionID() string {
+	return s.currentSessionID
+}
+
+func (s *fakeClaudePersistentSession) Close() error {
+	if s.closeFunc == nil {
+		return nil
+	}
+	return s.closeFunc()
 }
 
 func readClaudeStreamInput(stdin io.Reader) (string, error) {
@@ -453,4 +735,9 @@ func readClaudeStreamInput(stdin io.Reader) (string, error) {
 	}
 
 	return strings.Join(parts, "\n"), nil
+}
+
+func readTestFile(path string) ([]byte, error) {
+	//nolint:gosec // Test paths are generated by the test subject with os.CreateTemp.
+	return os.ReadFile(path)
 }

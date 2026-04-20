@@ -47,7 +47,7 @@ func TestNormalizeClaudeConfig(t *testing.T) {
 	cfg := ClaudeConfig{
 		Model:                 " claude-sonnet-4-5 ",
 		Permission:            " ACCEPT-EDITS ",
-		Effort:                " XHIGH ",
+		ReasoningEffort:       " XHIGH ",
 		AdditionalDirectories: []string{" ", rootOne, rootTwo, rootOne},
 	}
 	normalizeClaudeConfig(&cfg)
@@ -58,8 +58,8 @@ func TestNormalizeClaudeConfig(t *testing.T) {
 	if cfg.Permission != "accept-edits" {
 		t.Fatalf("unexpected claude permission: %s", cfg.Permission)
 	}
-	if cfg.Effort != "xhigh" {
-		t.Fatalf("unexpected claude effort: %s", cfg.Effort)
+	if cfg.ReasoningEffort != "xhigh" {
+		t.Fatalf("unexpected claude effort: %s", cfg.ReasoningEffort)
 	}
 	if len(cfg.AdditionalDirectories) != 1 || cfg.AdditionalDirectories[0] != filepath.Clean(rootOne) {
 		t.Fatalf("unexpected claude additional directories: %#v", cfg.AdditionalDirectories)
@@ -73,17 +73,17 @@ func TestNormalizeClaudeConfig(t *testing.T) {
 	if cfg.Permission != "" {
 		t.Fatalf("unexpected default claude permission: %s", cfg.Permission)
 	}
-	if cfg.Effort != "" {
-		t.Fatalf("unexpected default claude effort: %s", cfg.Effort)
+	if cfg.ReasoningEffort != "" {
+		t.Fatalf("unexpected default claude effort: %s", cfg.ReasoningEffort)
 	}
 
-	cfg = ClaudeConfig{Permission: "unsupported", Effort: "unsupported"}
+	cfg = ClaudeConfig{Permission: "unsupported", ReasoningEffort: "unsupported"}
 	normalizeClaudeConfig(&cfg)
 	if cfg.Permission != "" {
 		t.Fatalf("unexpected unsupported claude permission: %s", cfg.Permission)
 	}
-	if cfg.Effort != "" {
-		t.Fatalf("unexpected unsupported claude effort: %s", cfg.Effort)
+	if cfg.ReasoningEffort != "" {
+		t.Fatalf("unexpected unsupported claude effort: %s", cfg.ReasoningEffort)
 	}
 }
 
@@ -273,7 +273,7 @@ func TestDefaultConfigUsesBuiltInDefaults(t *testing.T) {
 	if cfg.Tunnel.CloudflaredToken != "" {
 		t.Fatalf("unexpected cloudflared token: %s", cfg.Tunnel.CloudflaredToken)
 	}
-	if cfg.Codex.Backend != "appserver" || cfg.Codex.Model != "gpt-5.4" || cfg.Codex.ReasoningEffort != "low" || cfg.Codex.Sandbox != "read-only" {
+	if cfg.Codex.Backend != "appserver" || cfg.Codex.Model != "" || cfg.Codex.ReasoningEffort != "" || cfg.Codex.Sandbox != "" {
 		t.Fatalf("unexpected codex defaults: %+v", cfg.Codex)
 	}
 	if cfg.Claude.Model != "" {
@@ -335,7 +335,7 @@ codex:
 claude:
   model: claude-sonnet-4-5
   permission: dont-ask
-  effort: high
+  reasoning_effort: high
   additional_directories:
     - /tmp/claude-a
     - /tmp/claude-a
@@ -375,8 +375,8 @@ seatalk:
 	if cfg.Claude.Permission != "dont-ask" {
 		t.Fatalf("unexpected claude permission: %s", cfg.Claude.Permission)
 	}
-	if cfg.Claude.Effort != "high" {
-		t.Fatalf("unexpected claude effort: %s", cfg.Claude.Effort)
+	if cfg.Claude.ReasoningEffort != "high" {
+		t.Fatalf("unexpected claude effort: %s", cfg.Claude.ReasoningEffort)
 	}
 	if !reflect.DeepEqual(cfg.Claude.AdditionalDirectories, []string{"/tmp/claude-a"}) {
 		t.Fatalf("unexpected claude additional directories: %#v", cfg.Claude.AdditionalDirectories)
@@ -517,7 +517,7 @@ seatalk:
 		"--codex-model", "gpt-5.4",
 		"--claude-model", "claude-sonnet-4-6",
 		"--claude-permission", "plan",
-		"--claude-effort", "max",
+		"--claude-reasoning-effort", "max",
 		"--codex-reasoning-effort", "medium",
 		"--codex-sandbox", "workspace-write",
 	})
@@ -537,8 +537,8 @@ seatalk:
 	if cfg.Claude.Permission != "plan" {
 		t.Fatalf("unexpected claude permission: %s", cfg.Claude.Permission)
 	}
-	if cfg.Claude.Effort != "max" {
-		t.Fatalf("unexpected claude effort: %s", cfg.Claude.Effort)
+	if cfg.Claude.ReasoningEffort != "max" {
+		t.Fatalf("unexpected claude effort: %s", cfg.Claude.ReasoningEffort)
 	}
 	if cfg.Codex.ReasoningEffort != "medium" {
 		t.Fatalf("unexpected codex reasoning effort: %s", cfg.Codex.ReasoningEffort)

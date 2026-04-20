@@ -27,28 +27,35 @@ const claudeSDKMCPServerName = "assistant"
 const claudeSDKEntrypoint = "sdk-py"
 const claudeAgentSDKVersion = "go-local"
 const claudeCodeTerminateTimeout = 2 * time.Second
+const defaultClaudeCodeSessionIdleTimeout = 15 * time.Minute
 
 // ClaudeCodeRunner bridges dispatcher turns to the Claude Code CLI through claude-code-go.
-// Each turn starts a new Claude Code process. Conversation continuity is preserved by resuming
-// the stored Claude session ID when one exists.
+// Claude sessions are reused per conversation while idle and restarted from the stored
+// Claude session ID after eviction or process failure.
 type ClaudeCodeRunner struct {
-	client        *claudecode.ClaudeClient
-	executeTurn   func(context.Context, io.Reader, *claudecode.RunOptions, *claudeControlServer) (*claudecode.ClaudeResult, error)
-	retryPolicy   *claudecode.RetryPolicy
-	runOptions    claudecode.RunOptions
-	mu            sync.RWMutex
-	systemPrompts []string
-	tools         []Tool
+	client             *claudecode.ClaudeClient
+	sessionFactory     func(context.Context, string, claudecode.RunOptions) (claudePersistentTurnSession, error)
+	retryPolicy        *claudecode.RetryPolicy
+	runOptions         claudecode.RunOptions
+	sessionIdleTimeout time.Duration
+	mu                 sync.RWMutex
+	systemPrompts      []string
+	tools              []Tool
+	argFiles           map[string]string
+	sessionsMu         sync.Mutex
+	sessions           map[string]*claudeRunnerSession
+	closed             bool
 }
 
 // ClaudeCodeRunnerOptions configures a ClaudeCodeRunner.
 type ClaudeCodeRunnerOptions struct {
-	Client       *claudecode.ClaudeClient
-	BinaryPath   string
-	RunOptions   claudecode.RunOptions
-	RetryPolicy  *claudecode.RetryPolicy
-	SystemPrompt string
-	Tools        []Tool
+	Client             *claudecode.ClaudeClient
+	BinaryPath         string
+	RunOptions         claudecode.RunOptions
+	RetryPolicy        *claudecode.RetryPolicy
+	SessionIdleTimeout time.Duration
+	SystemPrompt       string
+	Tools              []Tool
 }
 
 // NewClaudeCodeRunner builds a runner backed by the Claude Code CLI.
@@ -64,7 +71,7 @@ func NewClaudeCodeRunner(options ClaudeCodeRunnerOptions) *ClaudeCodeRunner {
 
 	runOptions := options.RunOptions
 	if runOptions.PermissionMode == "" {
-		runOptions.PermissionMode = claudecode.PermissionModeDefault
+		runOptions.PermissionMode = claudecode.PermissionModeDontAsk
 	}
 	if runOptions.WorkingDirectory == "" {
 		workingDirectory, err := os.Getwd()
@@ -79,22 +86,25 @@ func NewClaudeCodeRunner(options ClaudeCodeRunnerOptions) *ClaudeCodeRunner {
 	}
 
 	runner := &ClaudeCodeRunner{
-		client:      client,
-		executeTurn: newClaudeCodeTurnExecutor(client),
-		retryPolicy: cloneClaudeRetryPolicy(retryPolicy),
-		runOptions:  runOptions,
+		client:         client,
+		retryPolicy:    cloneClaudeRetryPolicy(retryPolicy),
+		runOptions:     runOptions,
+		argFiles:       make(map[string]string),
+		sessions:       make(map[string]*claudeRunnerSession),
+		sessionFactory: nil,
+	}
+	runner.sessionFactory = func(ctx context.Context, conversationKey string, sessionOptions claudecode.RunOptions) (claudePersistentTurnSession, error) {
+		return startClaudePersistentTurnSession(ctx, client, conversationKey, sessionOptions)
+	}
+	runner.sessionIdleTimeout = options.SessionIdleTimeout
+	if runner.sessionIdleTimeout <= 0 {
+		runner.sessionIdleTimeout = defaultClaudeCodeSessionIdleTimeout
 	}
 
 	runner.RegisterSystemPrompt(options.SystemPrompt)
 	runner.RegisterTools(options.Tools...)
 
 	return runner
-}
-
-func newClaudeCodeTurnExecutor(client *claudecode.ClaudeClient) func(context.Context, io.Reader, *claudecode.RunOptions, *claudeControlServer) (*claudecode.ClaudeResult, error) {
-	return func(ctx context.Context, stdin io.Reader, opts *claudecode.RunOptions, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
-		return executeClaudeCodeProcess(ctx, client, stdin, opts, control)
-	}
 }
 
 // RegisterSystemPrompt appends one global system prompt block for new conversations.
@@ -110,6 +120,7 @@ func (r *ClaudeCodeRunner) RegisterSystemPrompt(prompt string) {
 
 	r.mu.Lock()
 	r.systemPrompts = append(r.systemPrompts, trimmed)
+	r.clearArgFileCacheLocked()
 	r.mu.Unlock()
 }
 
@@ -131,6 +142,7 @@ func (r *ClaudeCodeRunner) RegisterTools(tools ...Tool) {
 
 	r.mu.Lock()
 	r.tools = append(r.tools, filtered...)
+	r.clearArgFileCacheLocked()
 	r.mu.Unlock()
 }
 
@@ -180,73 +192,24 @@ func (r *ClaudeCodeRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRe
 }
 
 func (r *ClaudeCodeRunner) runClaudeTurn(ctx context.Context, req TurnRequest, prompt string, imagePaths []string, sessionID string) (*claudecode.ClaudeResult, error) {
-	if r.executeTurn == nil {
-		return nil, errors.New("claude code client is nil")
-	}
-
-	systemPrompts, tools := r.globalContext()
-	runOptions := r.runOptions
-	if sessionID == "" {
-		runOptions.AppendPrompt = joinPromptBlocks(runOptions.AppendPrompt, joinPromptBlocks(systemPrompts...))
-	} else {
-		runOptions.AppendPrompt = ""
-	}
-	runOptions.Format = claudecode.StreamJSONOutput
-	runOptions.InputFormat = claudecode.StreamJSONInput
-	runOptions.Verbose = true
-	runOptions.ResumeID = sessionID
-	runOptions.Continue = false
-	runOptions.SessionID = ""
-	runOptions.ForkSession = false
+	_, tools := r.globalContext()
 	control := newClaudeControlServer(req, tools)
-	if control.hasTools() {
-		configJSON, err := control.mcpConfigJSON()
-		if err != nil {
-			return nil, err
-		}
-		runOptions.MCPConfigs = append(append([]string(nil), runOptions.MCPConfigs...), configJSON)
-	}
-
 	inputReader, err := buildClaudeStreamJSONInput(prompt, imagePaths)
 	if err != nil {
 		return nil, err
 	}
-
-	log.Printf(
-		"claude code runner starting process: conversation=%s resume_session=%s prompt_len=%d image_count=%d",
-		req.Conversation.Key,
-		sessionID,
-		len(prompt),
-		len(imagePaths),
-	)
-	result, err := r.streamClaudeTurnWithRetry(ctx, req, inputReader, &runOptions, control)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf(
-		"claude code runner completed process: conversation=%s resume_session=%s session_id=%s result_len=%d",
-		req.Conversation.Key,
-		sessionID,
-		result.SessionID,
-		len(result.Result),
-	)
-
-	return result, nil
-}
-
-func (r *ClaudeCodeRunner) streamClaudeTurnWithRetry(ctx context.Context, req TurnRequest, inputReader io.Reader, runOptions *claudecode.RunOptions, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
-	retryPolicy := cloneClaudeRetryPolicy(r.retryPolicy)
-	if retryPolicy == nil {
-		return r.executeTurn(ctx, inputReader, runOptions, control)
-	}
-
 	inputBytes, err := io.ReadAll(inputReader)
 	if err != nil {
 		return nil, fmt.Errorf("read claude stream input failed: %w", err)
 	}
 
+	retryPolicy := cloneClaudeRetryPolicy(r.retryPolicy)
+	if retryPolicy == nil {
+		retryPolicy = &claudecode.RetryPolicy{}
+	}
+
 	var lastErr error
+	resumeSessionID := sessionID
 	for attempt := 0; attempt <= retryPolicy.MaxRetries; attempt++ {
 		if attempt > 0 {
 			delay := calculateClaudeRetryBackoff(retryPolicy, attempt)
@@ -262,12 +225,32 @@ func (r *ClaudeCodeRunner) streamClaudeTurnWithRetry(ctx context.Context, req Tu
 			}
 		}
 
-		result, err := r.executeTurn(ctx, bytes.NewReader(inputBytes), runOptions, control)
+		session, err := r.acquireClaudeSession(ctx, req.Conversation.Key, resumeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf(
+			"claude code runner using session process: conversation=%s resume_session=%s prompt_len=%d image_count=%d",
+			req.Conversation.Key,
+			session.session.CurrentSessionID(),
+			len(prompt),
+			len(imagePaths),
+		)
+		result, err := session.session.RunTurn(ctx, bytes.NewReader(inputBytes), control)
 		if err == nil {
+			r.releaseClaudeSession(req.Conversation.Key, session)
+			log.Printf(
+				"claude code runner completed turn: conversation=%s session_id=%s result_len=%d",
+				req.Conversation.Key,
+				result.SessionID,
+				len(result.Result),
+			)
 			return result, nil
 		}
 
 		lastErr = err
+		resumeSessionID = session.session.CurrentSessionID()
+		r.discardClaudeSession(req.Conversation.Key, session, err)
 		var claudeErr *claudecode.ClaudeError
 		if !errors.As(err, &claudeErr) || !claudeErr.IsRetryable() {
 			return nil, err
@@ -294,6 +277,264 @@ func (r *ClaudeCodeRunner) streamClaudeTurnWithRetry(ctx context.Context, req Tu
 	}
 
 	return nil, fmt.Errorf("claude code retries exhausted after %d attempts: %w", retryPolicy.MaxRetries+1, lastErr)
+}
+
+type claudePersistentTurnSession interface {
+	RunTurn(ctx context.Context, stdin io.Reader, control *claudeControlServer) (*claudecode.ClaudeResult, error)
+	CurrentSessionID() string
+	Close() error
+}
+
+type claudeRunnerSession struct {
+	session   claudePersistentTurnSession
+	idleTimer *time.Timer
+	inUse     bool
+}
+
+func (r *ClaudeCodeRunner) acquireClaudeSession(ctx context.Context, conversationKey string, sessionID string) (*claudeRunnerSession, error) {
+	if r == nil {
+		return nil, errors.New("claude code runner is nil")
+	}
+
+	r.sessionsMu.Lock()
+	if r.closed {
+		r.sessionsMu.Unlock()
+		return nil, errors.New("claude code runner is closed")
+	}
+	existing := r.sessions[conversationKey]
+	if existing != nil {
+		if existing.idleTimer != nil {
+			existing.idleTimer.Stop()
+			existing.idleTimer = nil
+		}
+		existing.inUse = true
+		r.sessionsMu.Unlock()
+		return existing, nil
+	}
+	r.sessionsMu.Unlock()
+
+	runOptions, err := r.buildClaudeSessionRunOptions(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if r.sessionFactory == nil {
+		return nil, errors.New("claude code session factory is nil")
+	}
+	session, err := r.sessionFactory(ctx, conversationKey, runOptions)
+	if err != nil {
+		return nil, err
+	}
+	managed := &claudeRunnerSession{
+		session: session,
+		inUse:   true,
+	}
+
+	r.sessionsMu.Lock()
+	defer r.sessionsMu.Unlock()
+	if r.closed {
+		_ = session.Close()
+		return nil, errors.New("claude code runner is closed")
+	}
+	existing = r.sessions[conversationKey]
+	if existing != nil {
+		if existing.idleTimer != nil {
+			existing.idleTimer.Stop()
+			existing.idleTimer = nil
+		}
+		existing.inUse = true
+		_ = session.Close()
+		return existing, nil
+	}
+	r.sessions[conversationKey] = managed
+	return managed, nil
+}
+
+func (r *ClaudeCodeRunner) releaseClaudeSession(conversationKey string, managed *claudeRunnerSession) {
+	if r == nil || managed == nil {
+		return
+	}
+	if r.sessionIdleTimeout <= 0 {
+		r.discardClaudeSession(conversationKey, managed, nil)
+		return
+	}
+
+	r.sessionsMu.Lock()
+	defer r.sessionsMu.Unlock()
+	if r.closed || r.sessions[conversationKey] != managed {
+		return
+	}
+	managed.inUse = false
+	if managed.idleTimer != nil {
+		managed.idleTimer.Stop()
+	}
+	managed.idleTimer = time.AfterFunc(r.sessionIdleTimeout, func() {
+		r.sessionsMu.Lock()
+		if r.sessions[conversationKey] != managed || managed.inUse {
+			r.sessionsMu.Unlock()
+			return
+		}
+		r.sessionsMu.Unlock()
+		log.Printf("claude code runner expiring idle session: conversation=%s idle_timeout=%s", conversationKey, r.sessionIdleTimeout)
+		r.discardClaudeSession(conversationKey, managed, nil)
+	})
+}
+
+func (r *ClaudeCodeRunner) discardClaudeSession(conversationKey string, managed *claudeRunnerSession, reason error) {
+	if r == nil || managed == nil {
+		return
+	}
+
+	r.sessionsMu.Lock()
+	if r.sessions[conversationKey] == managed {
+		delete(r.sessions, conversationKey)
+	}
+	managed.inUse = false
+	if managed.idleTimer != nil {
+		managed.idleTimer.Stop()
+		managed.idleTimer = nil
+	}
+	r.sessionsMu.Unlock()
+
+	if reason != nil {
+		log.Printf("claude code runner closing session process: conversation=%s err=%v", conversationKey, reason)
+	}
+	_ = managed.session.Close()
+}
+
+func (r *ClaudeCodeRunner) buildClaudeSessionRunOptions(sessionID string) (claudecode.RunOptions, error) {
+	systemPrompts, tools := r.globalContext()
+	runOptions := r.runOptions
+	if sessionID == "" {
+		runOptions.AppendPrompt = joinPromptBlocks(runOptions.AppendPrompt, joinPromptBlocks(systemPrompts...))
+	} else {
+		runOptions.AppendPrompt = ""
+	}
+	runOptions.Format = claudecode.StreamJSONOutput
+	runOptions.InputFormat = claudecode.StreamJSONInput
+	runOptions.Verbose = true
+	runOptions.ResumeID = sessionID
+	runOptions.Continue = false
+	runOptions.SessionID = ""
+	runOptions.ForkSession = false
+	if len(tools) != 0 {
+		control := newClaudeControlServer(TurnRequest{}, tools)
+		configJSON, err := control.mcpConfigJSON()
+		if err != nil {
+			return claudecode.RunOptions{}, err
+		}
+		runOptions.MCPConfigs = append(append([]string(nil), runOptions.MCPConfigs...), configJSON)
+	}
+	err := r.applyArgumentFiles(&runOptions)
+	if err != nil {
+		return claudecode.RunOptions{}, err
+	}
+	return runOptions, nil
+}
+
+func (r *ClaudeCodeRunner) Close() error {
+	if r == nil {
+		return nil
+	}
+
+	r.sessionsMu.Lock()
+	if r.closed {
+		r.sessionsMu.Unlock()
+		return nil
+	}
+	r.closed = true
+	sessions := make([]*claudeRunnerSession, 0, len(r.sessions))
+	for key, session := range r.sessions {
+		if session.idleTimer != nil {
+			session.idleTimer.Stop()
+			session.idleTimer = nil
+		}
+		sessions = append(sessions, session)
+		delete(r.sessions, key)
+	}
+	r.sessionsMu.Unlock()
+
+	var closeErr error
+	for _, session := range sessions {
+		closeErr = errors.Join(closeErr, session.session.Close())
+	}
+	r.mu.Lock()
+	r.clearArgFileCacheLocked()
+	r.mu.Unlock()
+	return closeErr
+}
+
+func (r *ClaudeCodeRunner) applyArgumentFiles(runOptions *claudecode.RunOptions) error {
+	if r == nil || runOptions == nil {
+		return nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var err error
+	runOptions.SystemPrompt, err = r.argFilePathLocked("system-prompt", runOptions.SystemPrompt)
+	if err != nil {
+		return err
+	}
+	runOptions.AppendPrompt, err = r.argFilePathLocked("append-system-prompt", runOptions.AppendPrompt)
+	if err != nil {
+		return err
+	}
+	for index, config := range runOptions.MCPConfigs {
+		runOptions.MCPConfigs[index], err = r.argFilePathLocked("mcp-config", config)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *ClaudeCodeRunner) argFilePathLocked(name string, content string) (string, error) {
+	if strings.TrimSpace(content) == "" {
+		return "", nil
+	}
+	if r.argFiles == nil {
+		r.argFiles = make(map[string]string)
+	}
+
+	cacheKey := name + "\x00" + content
+	path := r.argFiles[cacheKey]
+	if path != "" {
+		exists, err := claudeTempFileExists(path)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			return path, nil
+		}
+		delete(r.argFiles, cacheKey)
+	}
+
+	var err error
+	path, err = writeClaudeArgumentTempFile(name, content)
+	if err != nil {
+		return "", err
+	}
+	r.argFiles[cacheKey] = path
+	return path, nil
+}
+
+func claudeTempFileExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err == nil {
+		return !info.IsDir(), nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (r *ClaudeCodeRunner) clearArgFileCacheLocked() {
+	for _, path := range r.argFiles {
+		removeClaudeTempFile(path)
+	}
+	clear(r.argFiles)
 }
 
 func cloneClaudeRetryPolicy(policy *claudecode.RetryPolicy) *claudecode.RetryPolicy {
@@ -687,347 +928,562 @@ func formatClaudeMCPToolResult(result any) (string, error) {
 	return string(data), nil
 }
 
-func executeClaudeCodeProcess(ctx context.Context, client *claudecode.ClaudeClient, stdin io.Reader, opts *claudecode.RunOptions, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
+type claudeTurnState struct {
+	handleRequest func(map[string]any) (map[string]any, error)
+	control       *claudeControlServer
+	initRespCh    chan error
+	resultCh      chan *claudecode.ClaudeResult
+	errCh         chan error
+}
+
+type claudePersistentProcessSession struct {
+	conversationKey string
+	runOptions      claudecode.RunOptions
+	cmd             *exec.Cmd
+	cancel          context.CancelFunc
+	stdinPipe       io.WriteCloser
+	waitCh          chan error
+	exitDone        chan struct{}
+	stderrDone      chan struct{}
+	scanDone        chan struct{}
+
+	writeMu sync.Mutex
+	turnMu  sync.Mutex
+	stateMu sync.Mutex
+
+	currentTurn *claudeTurnState
+	sessionID   string
+	initialized bool
+	waitErr     error
+	closed      bool
+}
+
+func startClaudePersistentTurnSession(ctx context.Context, client *claudecode.ClaudeClient, conversationKey string, opts claudecode.RunOptions) (claudePersistentTurnSession, error) {
+	if ctx == nil {
+		return nil, errors.New("claude code session context is nil")
+	}
 	if client == nil {
 		return nil, errors.New("claude code client is nil")
 	}
-
-	runOptions := claudecode.RunOptions{}
-	if opts != nil {
-		runOptions = *opts
-	}
-	if err := claudecode.PreprocessOptions(&runOptions); err != nil {
+	if err := claudecode.PreprocessOptions(&opts); err != nil {
 		return nil, err
 	}
 
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if runOptions.Timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, runOptions.Timeout)
-	} else {
-		runCtx, cancel = context.WithCancel(ctx)
-	}
-	defer cancel()
-
-	args := buildClaudeSDKArgs(&runOptions)
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	args := buildClaudeProcessArgs(&opts)
 	log.Printf(
-		"claude code runner spawning process: bin=%s cwd=%s args=%q has_control=%t",
+		"claude code runner spawning persistent process: conversation=%s bin=%s cwd=%s args=%q",
+		conversationKey,
 		client.BinPath,
-		runOptions.WorkingDirectory,
+		opts.WorkingDirectory,
 		args,
-		control != nil && control.hasTools(),
 	)
+
 	//nolint:gosec // The Claude binary path is configured by the host process and arguments are generated from structured run options.
 	cmd := exec.CommandContext(runCtx, client.BinPath, args...)
-	if runOptions.WorkingDirectory != "" {
-		cmd.Dir = runOptions.WorkingDirectory
+	if opts.WorkingDirectory != "" {
+		cmd.Dir = opts.WorkingDirectory
 	}
-	cmd.Env = buildClaudeSDKEnv(runOptions.WorkingDirectory)
+	cmd.Env = buildClaudeSDKEnv(opts.WorkingDirectory)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
+		cancel()
 		return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to get stdin pipe: %v", err))
 	}
-	defer func() {
-		_ = stdinPipe.Close()
-	}()
-
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cancel()
+		_ = stdinPipe.Close()
 		return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to get stdout pipe: %v", err))
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		cancel()
+		_ = stdinPipe.Close()
 		return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to get stderr pipe: %v", err))
 	}
-
-	stderrBuf := new(bytes.Buffer)
 	if err = cmd.Start(); err != nil {
+		cancel()
+		_ = stdinPipe.Close()
 		return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to start command: %v", err))
 	}
-	log.Printf("claude code runner process started: pid=%d", cmd.Process.Pid)
-	waitCh := make(chan error, 1)
+	log.Printf("claude code runner persistent process started: conversation=%s pid=%d", conversationKey, cmd.Process.Pid)
+
+	session := &claudePersistentProcessSession{
+		conversationKey: conversationKey,
+		runOptions:      opts,
+		cmd:             cmd,
+		cancel:          cancel,
+		stdinPipe:       stdinPipe,
+		waitCh:          make(chan error, 1),
+		exitDone:        make(chan struct{}),
+		stderrDone:      make(chan struct{}),
+		scanDone:        make(chan struct{}),
+		sessionID:       strings.TrimSpace(opts.ResumeID),
+	}
+
 	go func() {
-		waitCh <- cmd.Wait()
+		session.waitCh <- cmd.Wait()
 	}()
 
-	stderrDone := make(chan struct{})
-	go func() {
-		defer close(stderrDone)
-		_, _ = io.Copy(stderrBuf, stderr)
-		stderrText := strings.TrimSpace(stderrBuf.String())
-		if stderrText == "" {
-			log.Printf("claude code runner stderr stream closed: pid=%d bytes=%d", cmd.Process.Pid, stderrBuf.Len())
-			return
-		}
-		log.Printf("claude code runner stderr stream closed: pid=%d bytes=%d stderr=%q", cmd.Process.Pid, stderrBuf.Len(), stderrText)
-	}()
+	go session.captureStderr(stderr)
+	go session.scanStdout(stdout)
+	go session.watchExit()
 
-	var (
-		result      *claudecode.ClaudeResult
-		scanErr     error
-		writeMu     sync.Mutex
-		initRespCh  chan error
-		initRespMu  sync.Mutex
-		initDone    bool
-		stdinMu     sync.Mutex
-		stdinClosed bool
-	)
+	return session, nil
+}
+
+func (s *claudePersistentProcessSession) CurrentSessionID() string {
+	if s == nil {
+		return ""
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.sessionID
+}
+
+func (s *claudePersistentProcessSession) RunTurn(ctx context.Context, stdin io.Reader, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
+	if s == nil {
+		return nil, errors.New("claude session is nil")
+	}
+
+	inputBytes, err := io.ReadAll(stdin)
+	if err != nil {
+		return nil, fmt.Errorf("read claude stdin failed: %w", err)
+	}
+
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+
+	return s.runTurn(ctx, inputBytes, control)
+}
+
+func (s *claudePersistentProcessSession) runTurn(ctx context.Context, inputBytes []byte, control *claudeControlServer) (*claudecode.ClaudeResult, error) {
+	turn := &claudeTurnState{
+		control:  control,
+		resultCh: make(chan *claudecode.ClaudeResult, 1),
+		errCh:    make(chan error, 1),
+	}
 	if control != nil {
-		initRespCh = make(chan error, 1)
+		turn.handleRequest = func(request map[string]any) (map[string]any, error) {
+			return control.handleRequest(ctx, request)
+		}
+	}
+	if s.shouldInitialize(control) {
+		turn.initRespCh = make(chan error, 1)
 	}
 
-	completeInitialize := func(err error) {
-		if initRespCh == nil {
-			return
-		}
-
-		initRespMu.Lock()
-		defer initRespMu.Unlock()
-		if initDone {
-			return
-		}
-		initDone = true
-		initRespCh <- err
+	if err := s.setCurrentTurn(turn); err != nil {
+		return nil, err
 	}
+	defer s.clearCurrentTurn(turn)
 
-	closeStdin := func(reason string) {
-		stdinMu.Lock()
-		defer stdinMu.Unlock()
-		if stdinClosed {
-			return
-		}
-		err := stdinPipe.Close()
-		if err != nil {
-			log.Printf("claude code runner stdin close failed: pid=%d reason=%s err=%v", cmd.Process.Pid, reason, err)
-			return
-		}
-		stdinClosed = true
-		log.Printf("claude code runner stdin closed: pid=%d reason=%s", cmd.Process.Pid, reason)
-	}
-
-	writeJSONLine := func(payload any) error {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		if _, err = stdinPipe.Write(append(data, '\n')); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	scanDone := make(chan struct{})
-	go func() {
-		defer close(scanDone)
-
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.TrimSpace(line) == "" {
-				continue
-			}
-
-			var envelope map[string]any
-			if err := json.Unmarshal([]byte(line), &envelope); err != nil {
-				scanErr = claudecode.NewClaudeError(claudecode.ErrorValidation, fmt.Sprintf("failed to parse JSON message: %v", err))
-				cancel()
-				return
-			}
-
-			switch envelope["type"] {
-			case "control_response":
-				if initRespCh == nil {
-					continue
-				}
-				response, _ := envelope["response"].(map[string]any)
-				requestID, _ := response["request_id"].(string)
-				if requestID != "initialize" {
-					continue
-				}
-				subtype, _ := response["subtype"].(string)
-				if subtype == "error" {
-					completeInitialize(fmt.Errorf("initialize failed: %v", response["error"]))
-				} else {
-					completeInitialize(nil)
-				}
-			case "control_request":
-				if control == nil {
-					scanErr = errors.New("received control request without control handler")
-					cancel()
-					return
-				}
-				requestID, _ := envelope["request_id"].(string)
-				request, _ := envelope["request"].(map[string]any)
-				subtype, _ := request["subtype"].(string)
-				if subtype == "can_use_tool" || subtype == "mcp_message" {
-					log.Printf(
-						"claude code runner received control request: pid=%d request_id=%s subtype=%s",
-						cmd.Process.Pid,
-						requestID,
-						subtype,
-					)
-				}
-				response, err := control.handleRequest(runCtx, request)
-				responseEnvelope := map[string]any{
-					"request_id": requestID,
-				}
-				if err != nil {
-					responseEnvelope["subtype"] = "error"
-					responseEnvelope["error"] = err.Error()
-				} else {
-					responseEnvelope["subtype"] = "success"
-					responseEnvelope["response"] = response
-				}
-				payload := map[string]any{
-					"type":     "control_response",
-					"response": responseEnvelope,
-				}
-				if err = writeJSONLine(payload); err != nil {
-					scanErr = claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to write control response: %v", err))
-					cancel()
-					return
-				}
-			default:
-				var msg claudecode.Message
-				if err := json.Unmarshal([]byte(line), &msg); err != nil {
-					scanErr = claudecode.NewClaudeError(claudecode.ErrorValidation, fmt.Sprintf("failed to decode stream message: %v", err))
-					cancel()
-					return
-				}
-				if msg.Type != "result" {
-					continue
-				}
-				log.Printf(
-					"claude code runner received result message: pid=%d session_id=%s result_len=%d is_error=%t",
-					cmd.Process.Pid,
-					msg.SessionID,
-					len(msg.Result),
-					msg.IsError,
-				)
-				result = &claudecode.ClaudeResult{
-					Type:          msg.Type,
-					Subtype:       msg.Subtype,
-					Result:        msg.Result,
-					CostUSD:       msg.CostUSD,
-					DurationMS:    msg.DurationMS,
-					DurationAPIMS: msg.DurationAPIMS,
-					IsError:       msg.IsError,
-					NumTurns:      msg.NumTurns,
-					SessionID:     msg.SessionID,
-				}
-				closeStdin("result-received")
-			}
-		}
-
-		completeInitialize(errors.New("claude process exited before initialize response"))
-		if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
-			scanErr = claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to scan stream output: %v", err))
-			cancel()
-		}
-	}()
-
-	if initRespCh != nil {
-		if err = writeJSONLine(map[string]any{
+	if turn.initRespCh != nil {
+		if err := s.writeJSONLine(map[string]any{
 			"type":       "control_request",
 			"request_id": "initialize",
 			"request": map[string]any{
 				"subtype": "initialize",
 			},
 		}); err != nil {
-			cancel()
-			_ = awaitClaudeProcess(waitCh)
-			<-stderrDone
-			<-scanDone
 			return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to write initialize request: %v", err))
 		}
 
 		select {
-		case err = <-initRespCh:
+		case err := <-turn.initRespCh:
 			if err != nil {
-				cancel()
-				_ = awaitClaudeProcess(waitCh)
-				<-stderrDone
-				<-scanDone
 				return nil, err
 			}
-		case <-runCtx.Done():
-			cancel()
-			_ = awaitClaudeProcess(waitCh)
-			<-stderrDone
-			<-scanDone
-			return nil, runCtx.Err()
+		case err := <-turn.errCh:
+			return nil, err
+		case <-ctx.Done():
+			_ = s.Close()
+			return nil, ctx.Err()
 		}
 	}
 
-	if stdin != nil {
-		inputBytes, err := io.ReadAll(stdin)
-		if err != nil {
-			cancel()
-			_ = awaitClaudeProcess(waitCh)
-			<-stderrDone
-			<-scanDone
-			return nil, fmt.Errorf("read claude stdin failed: %w", err)
+	if len(inputBytes) > 0 {
+		if err := s.writeRaw(inputBytes); err != nil {
+			return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to write user input: %v", err))
 		}
-		if len(inputBytes) > 0 {
-			writeMu.Lock()
-			_, err = stdinPipe.Write(inputBytes)
-			writeMu.Unlock()
-			if err != nil {
-				cancel()
-				_ = awaitClaudeProcess(waitCh)
-				<-stderrDone
-				<-scanDone
-				return nil, claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to write user input: %v", err))
-			}
-		}
-	}
-	if control == nil || !control.hasTools() {
-		closeStdin("input-finished-no-control")
 	}
 
-	go func() {
-		<-runCtx.Done()
-		closeStdin("context-done")
-		if err := signalClaudeProcessGroup(cmd, syscall.SIGTERM); err != nil {
-			log.Printf("claude code runner terminate process group failed: pid=%d err=%v", cmd.Process.Pid, err)
+	select {
+	case result := <-turn.resultCh:
+		return result, nil
+	case err := <-turn.errCh:
+		return nil, err
+	case <-ctx.Done():
+		_ = s.Close()
+		return nil, ctx.Err()
+	}
+}
+
+func (s *claudePersistentProcessSession) setCurrentTurn(turn *claudeTurnState) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closed {
+		return errors.New("claude session is closed")
+	}
+	if s.waitErr != nil {
+		return s.waitErr
+	}
+	s.currentTurn = turn
+	return nil
+}
+
+func (s *claudePersistentProcessSession) shouldInitialize(control *claudeControlServer) bool {
+	if s == nil || control == nil || !control.hasTools() {
+		return false
+	}
+
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return !s.initialized
+}
+
+func (s *claudePersistentProcessSession) markInitialized() {
+	if s == nil {
+		return
+	}
+
+	s.stateMu.Lock()
+	s.initialized = true
+	s.stateMu.Unlock()
+}
+
+func (s *claudePersistentProcessSession) clearCurrentTurn(turn *claudeTurnState) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.currentTurn == turn {
+		s.currentTurn = nil
+	}
+}
+
+func (s *claudePersistentProcessSession) writeRaw(data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.stdinPipe.Write(data)
+	return err
+}
+
+func (s *claudePersistentProcessSession) writeJSONLine(payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return s.writeRaw(append(data, '\n'))
+}
+
+func (s *claudePersistentProcessSession) captureStderr(stderr io.Reader) {
+	defer close(s.stderrDone)
+	stderrBuf := new(bytes.Buffer)
+	_, _ = io.Copy(stderrBuf, stderr)
+	stderrText := strings.TrimSpace(stderrBuf.String())
+	if stderrText == "" {
+		log.Printf("claude code runner stderr stream closed: conversation=%s pid=%d bytes=%d", s.conversationKey, s.cmd.Process.Pid, stderrBuf.Len())
+		return
+	}
+	log.Printf(
+		"claude code runner stderr stream closed: conversation=%s pid=%d bytes=%d stderr=%q",
+		s.conversationKey,
+		s.cmd.Process.Pid,
+		stderrBuf.Len(),
+		stderrText,
+	)
+}
+
+func (s *claudePersistentProcessSession) scanStdout(stdout io.Reader) {
+	defer close(s.scanDone)
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var envelope map[string]any
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			s.failCurrentTurn(claudecode.NewClaudeError(claudecode.ErrorValidation, fmt.Sprintf("failed to parse JSON message: %v", err)))
+			_ = s.Close()
 			return
 		}
-		if waitClaudeProcess(waitCh, claudeCodeTerminateTimeout) {
+
+		switch envelope["type"] {
+		case "control_response":
+			s.handleControlResponse(envelope)
+		case "control_request":
+			s.handleControlRequest(envelope)
+		default:
+			s.handleStreamMessage(line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		s.failCurrentTurn(claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to scan stream output: %v", err)))
+	}
+}
+
+func (s *claudePersistentProcessSession) handleControlResponse(envelope map[string]any) {
+	turn := s.getCurrentTurn()
+	if turn == nil || turn.initRespCh == nil {
+		return
+	}
+	response, _ := envelope["response"].(map[string]any)
+	requestID, _ := response["request_id"].(string)
+	if requestID != "initialize" {
+		return
+	}
+	subtype, _ := response["subtype"].(string)
+	if subtype == "error" {
+		errText := fmt.Sprintf("%v", response["error"])
+		if strings.Contains(strings.ToLower(errText), "already initialized") {
+			s.markInitialized()
+			turn.initRespCh <- nil
 			return
 		}
-		if err := signalClaudeProcessGroup(cmd, syscall.SIGKILL); err != nil {
-			log.Printf("claude code runner kill process group failed: pid=%d err=%v", cmd.Process.Pid, err)
-		}
-	}()
+		turn.initRespCh <- fmt.Errorf("initialize failed: %v", response["error"])
+		return
+	}
+	s.markInitialized()
+	turn.initRespCh <- nil
+}
 
-	err = awaitClaudeProcess(waitCh)
-	<-stderrDone
-	<-scanDone
-	log.Printf("claude code runner process wait returned: pid=%d err=%v", cmd.Process.Pid, err)
-	if scanErr != nil {
-		return nil, scanErr
+func (s *claudePersistentProcessSession) handleControlRequest(envelope map[string]any) {
+	turn := s.getCurrentTurn()
+	if turn == nil || turn.control == nil || turn.handleRequest == nil {
+		s.failCurrentTurn(errors.New("received control request without active control handler"))
+		_ = s.Close()
+		return
+	}
+
+	requestID, _ := envelope["request_id"].(string)
+	request, _ := envelope["request"].(map[string]any)
+	subtype, _ := request["subtype"].(string)
+	if subtype == "can_use_tool" || subtype == "mcp_message" {
+		log.Printf(
+			"claude code runner received control request: conversation=%s pid=%d request_id=%s subtype=%s",
+			s.conversationKey,
+			s.cmd.Process.Pid,
+			requestID,
+			subtype,
+		)
+	}
+
+	response, err := turn.handleRequest(request)
+	responseEnvelope := map[string]any{
+		"request_id": requestID,
 	}
 	if err != nil {
-		exitCode := 1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		}
-		claudeErr := claudecode.ParseError(stderrBuf.String(), exitCode)
-		claudeErr.Original = err
-		return nil, claudeErr
+		responseEnvelope["subtype"] = "error"
+		responseEnvelope["error"] = err.Error()
+	} else {
+		responseEnvelope["subtype"] = "success"
+		responseEnvelope["response"] = response
 	}
-	if result == nil {
-		return nil, errors.New("claude code stream finished without a result message")
+	payload := map[string]any{
+		"type":     "control_response",
+		"response": responseEnvelope,
+	}
+	if err = s.writeJSONLine(payload); err != nil {
+		s.failCurrentTurn(claudecode.NewClaudeError(claudecode.ErrorCommand, fmt.Sprintf("failed to write control response: %v", err)))
+		_ = s.Close()
+	}
+}
+
+func (s *claudePersistentProcessSession) handleStreamMessage(line string) {
+	var msg claudecode.Message
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		s.failCurrentTurn(claudecode.NewClaudeError(claudecode.ErrorValidation, fmt.Sprintf("failed to decode stream message: %v", err)))
+		_ = s.Close()
+		return
+	}
+	if msg.Type != "result" {
+		return
 	}
 
-	return result, nil
+	//nolint:gosec // Session metadata is structured process output used only for local diagnostics.
+	log.Printf(
+		"claude code runner received result message: conversation=%s pid=%d session_id=%s result_len=%d is_error=%t",
+		s.conversationKey,
+		s.cmd.Process.Pid,
+		msg.SessionID,
+		len(msg.Result),
+		msg.IsError,
+	)
+	result := &claudecode.ClaudeResult{
+		Type:          msg.Type,
+		Subtype:       msg.Subtype,
+		Result:        msg.Result,
+		CostUSD:       msg.CostUSD,
+		DurationMS:    msg.DurationMS,
+		DurationAPIMS: msg.DurationAPIMS,
+		IsError:       msg.IsError,
+		NumTurns:      msg.NumTurns,
+		SessionID:     msg.SessionID,
+	}
+
+	s.stateMu.Lock()
+	if strings.TrimSpace(result.SessionID) != "" {
+		s.sessionID = strings.TrimSpace(result.SessionID)
+	}
+	turn := s.currentTurn
+	s.stateMu.Unlock()
+	if turn != nil {
+		turn.resultCh <- result
+	}
+}
+
+func (s *claudePersistentProcessSession) watchExit() {
+	err := awaitClaudeProcess(s.waitCh)
+	s.stateMu.Lock()
+	closed := s.closed
+	if s.waitErr == nil {
+		if err == nil && !closed {
+			err = errors.New("claude code process exited")
+		}
+		s.waitErr = err
+	}
+	turn := s.currentTurn
+	s.stateMu.Unlock()
+	close(s.exitDone)
+
+	log.Printf("claude code runner persistent process wait returned: conversation=%s pid=%d err=%v", s.conversationKey, s.cmd.Process.Pid, err)
+	if turn != nil && err != nil {
+		turn.errCh <- err
+	}
+}
+
+func (s *claudePersistentProcessSession) getCurrentTurn() *claudeTurnState {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.currentTurn
+}
+
+func (s *claudePersistentProcessSession) failCurrentTurn(err error) {
+	s.stateMu.Lock()
+	turn := s.currentTurn
+	s.stateMu.Unlock()
+	if turn != nil {
+		select {
+		case turn.errCh <- err:
+		default:
+		}
+	}
+}
+
+func (s *claudePersistentProcessSession) Close() error {
+	if s == nil {
+		return nil
+	}
+
+	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.stateMu.Unlock()
+
+	if s.stdinPipe != nil {
+		_ = s.stdinPipe.Close()
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if err := signalClaudeProcessGroup(s.cmd, syscall.SIGTERM); err != nil {
+		log.Printf("claude code runner terminate persistent process failed: conversation=%s err=%v", s.conversationKey, err)
+	}
+	if !s.waitForExit(claudeCodeTerminateTimeout) {
+		if err := signalClaudeProcessGroup(s.cmd, syscall.SIGKILL); err != nil {
+			log.Printf("claude code runner kill persistent process failed: conversation=%s err=%v", s.conversationKey, err)
+		}
+	}
+	<-s.exitDone
+	s.stateMu.Lock()
+	err := s.waitErr
+	s.stateMu.Unlock()
+	<-s.stderrDone
+	<-s.scanDone
+	return err
+}
+
+func (s *claudePersistentProcessSession) waitForExit(timeout time.Duration) bool {
+	if timeout <= 0 {
+		<-s.exitDone
+		return true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-s.exitDone:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func writeClaudeArgumentTempFile(name string, content string) (string, error) {
+	if strings.TrimSpace(content) == "" {
+		return "", nil
+	}
+
+	file, err := os.CreateTemp("", "assistant-claude-"+name+"-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("create claude %s temp file failed: %w", name, err)
+	}
+	path := file.Name()
+	_, err = file.WriteString(content)
+	if closeErr := file.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		removeClaudeTempFile(path)
+		return "", fmt.Errorf("write claude %s temp file failed: %w", name, err)
+	}
+
+	return path, nil
+}
+
+func replaceClaudeArgWithFile(args []string, inlineFlag string, fileFlag string, filePath string) []string {
+	for index := 0; index < len(args)-1; index++ {
+		if args[index] != inlineFlag {
+			continue
+		}
+
+		replaced := make([]string, 0, len(args))
+		replaced = append(replaced, args[:index]...)
+		replaced = append(replaced, fileFlag, filePath)
+		replaced = append(replaced, args[index+2:]...)
+		return replaced
+	}
+
+	return args
+}
+
+func removeClaudeTempFile(path string) {
+	//nolint:gosec // Temp file paths come from os.CreateTemp in this process.
+	_ = os.Remove(path)
+}
+
+func buildClaudeProcessArgs(opts *claudecode.RunOptions) []string {
+	args := buildClaudeSDKArgs(opts)
+	if opts == nil {
+		return args
+	}
+	if opts.SystemPrompt != "" {
+		args = replaceClaudeArgWithFile(args, "--system-prompt", "--system-prompt-file", opts.SystemPrompt)
+	}
+	if opts.AppendPrompt != "" {
+		args = replaceClaudeArgWithFile(args, "--append-system-prompt", "--append-system-prompt-file", opts.AppendPrompt)
+	}
+	return args
 }
 
 func buildClaudeSDKArgs(opts *claudecode.RunOptions) []string {
@@ -1155,19 +1611,6 @@ func awaitClaudeProcess(waitCh <-chan error) error {
 	}
 
 	return <-waitCh
-}
-
-func waitClaudeProcess(waitCh <-chan error, timeout time.Duration) bool {
-	if waitCh == nil {
-		return true
-	}
-
-	select {
-	case <-waitCh:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
 }
 
 func signalClaudeProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {

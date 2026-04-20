@@ -15,7 +15,7 @@ func TestNewClaudeCodeRunOptionsMapsConfig(t *testing.T) {
 	claudeCfg := config.ClaudeConfig{
 		Model:                 "claude-sonnet-4-5",
 		Permission:            "accept-edits",
-		Effort:                "high",
+		ReasoningEffort:       "high",
 		AdditionalDirectories: []string{"/tmp/a", "/tmp/b"},
 	}
 
