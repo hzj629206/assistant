@@ -15,8 +15,6 @@ import (
 
 // TestCodexSDKSmoke verifies the minimal codex-sdk-go flow from the README:
 // NewCodex -> StartThread -> Run.
-// Use medium reasoning here because the runner hardcodes gpt-5.4 and normalizes
-// unsupported minimal reasoning to medium.
 func TestCodexSDKSmoke(t *testing.T) {
 	t.Parallel()
 
@@ -221,7 +219,7 @@ func TestCodexSDKSmokeBehaviorMatrix(t *testing.T) {
 	}
 }
 
-func TestNewCodexRunnerDefaultsReasoningToMedium(t *testing.T) {
+func TestNewCodexRunnerDefaultsReasoningToLow(t *testing.T) {
 	t.Parallel()
 
 	runner := NewCodexRunner(CodexRunnerOptions{})
@@ -229,7 +227,7 @@ func TestNewCodexRunnerDefaultsReasoningToMedium(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get working directory failed: %v", err)
 	}
-	if runner.threadOptions.Model != defaultModel {
+	if runner.threadOptions.Model != "" {
 		t.Fatalf("unexpected default model: %q", runner.threadOptions.Model)
 	}
 	if runner.threadOptions.SandboxMode != codex.SandboxReadOnly {
@@ -244,12 +242,12 @@ func TestNewCodexRunnerDefaultsReasoningToMedium(t *testing.T) {
 	if runner.threadOptions.ApprovalPolicy != codex.ApprovalNever {
 		t.Fatalf("unexpected default approval policy: %q", runner.threadOptions.ApprovalPolicy)
 	}
-	if runner.threadOptions.ModelReasoningEffort != codex.ReasoningMedium {
+	if runner.threadOptions.ModelReasoningEffort != codex.ReasoningLow {
 		t.Fatalf("unexpected default reasoning effort: %q", runner.threadOptions.ModelReasoningEffort)
 	}
 }
 
-func TestNewCodexRunnerNormalizesUnsupportedMinimalReasoningForDefaultModel(t *testing.T) {
+func TestNewCodexRunnerPreservesMinimalReasoningForDefaultModel(t *testing.T) {
 	t.Parallel()
 
 	runner := NewCodexRunner(CodexRunnerOptions{
@@ -277,8 +275,8 @@ func TestNewCodexRunnerNormalizesUnsupportedMinimalReasoningForDefaultModel(t *t
 	if runner.threadOptions.ApprovalPolicy != codex.ApprovalOnRequest {
 		t.Fatalf("unexpected approval policy: %q", runner.threadOptions.ApprovalPolicy)
 	}
-	if runner.threadOptions.ModelReasoningEffort != codex.ReasoningMedium {
-		t.Fatalf("unexpected normalized reasoning effort: %q", runner.threadOptions.ModelReasoningEffort)
+	if runner.threadOptions.ModelReasoningEffort != codex.ReasoningMinimal {
+		t.Fatalf("unexpected reasoning effort: %q", runner.threadOptions.ModelReasoningEffort)
 	}
 }
 
@@ -327,7 +325,7 @@ func TestNewCodexRunnerPreservesExplicitSupportedReasoning(t *testing.T) {
 			ModelReasoningEffort: codex.ReasoningHigh,
 		},
 	})
-	if runner.threadOptions.Model != defaultModel {
+	if runner.threadOptions.Model != "" {
 		t.Fatalf("unexpected default model: %q", runner.threadOptions.Model)
 	}
 	if runner.threadOptions.SandboxMode != codex.SandboxWorkspaceWrite {

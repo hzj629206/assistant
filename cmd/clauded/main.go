@@ -6,7 +6,7 @@ import (
 	claudecode "github.com/lancekrogers/claude-code-go/pkg/claude"
 
 	"github.com/hzj629206/assistant/agent"
-	"github.com/hzj629206/assistant/config"
+	"github.com/hzj629206/assistant/internal/config"
 	"github.com/hzj629206/assistant/internal/daemon"
 )
 

@@ -15,7 +15,7 @@ import (
 	"github.com/hzj629206/assistant/adapter"
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
-	"github.com/hzj629206/assistant/config"
+	"github.com/hzj629206/assistant/internal/config"
 	"github.com/hzj629206/assistant/internal/tunnel"
 )
 

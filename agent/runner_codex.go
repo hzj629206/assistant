@@ -69,12 +69,8 @@ func NewCodexRunner(options CodexRunnerOptions) *CodexRunner {
 		threadOptions.WebSearchEnabled = &webSearchEnabled
 		threadOptions.WebSearchMode = codex.WebSearchLive
 	}
-
-	if threadOptions.Model == "" {
-		threadOptions.Model = defaultModel
-	}
-	if threadOptions.ModelReasoningEffort == "" || (threadOptions.Model == defaultModel && threadOptions.ModelReasoningEffort == codex.ReasoningMinimal) {
-		threadOptions.ModelReasoningEffort = codex.ReasoningMedium
+	if threadOptions.ModelReasoningEffort == "" {
+		threadOptions.ModelReasoningEffort = codex.ReasoningLow
 	}
 
 	maxToolIterations := options.MaxToolIterations

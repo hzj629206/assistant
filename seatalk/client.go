@@ -743,7 +743,7 @@ func (c *Client) GetEmployeeInfo(ctx context.Context, employeeCodes ...string) (
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return GetEmployeeInfoResult{}, fmt.Errorf("get employee info failed: send request: %w", err)
 	}
@@ -818,7 +818,7 @@ func (c *Client) GetGroupInfo(ctx context.Context, groupID string, opts GetGroup
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return GetGroupInfoResult{}, fmt.Errorf("get group info failed: send request: %w", err)
 	}
@@ -896,7 +896,7 @@ func (c *Client) Download(ctx context.Context, downloadURL string) ([]byte, erro
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req) //nolint:gosec // URL is validated above against the configured SeaTalk download URL prefix.
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download file failed: send request: %w", err)
 	}
@@ -962,7 +962,7 @@ func (c *Client) GetPrivateThread(ctx context.Context, employeeCode, threadID st
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return GetPrivateThreadResult{}, fmt.Errorf("get private thread failed: send request: %w", err)
 	}
@@ -1029,7 +1029,7 @@ func (c *Client) GetMessage(ctx context.Context, messageID string) (GetMessageRe
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return GetMessageResult{}, fmt.Errorf("get message failed: send request: %w", err)
 	}
@@ -1119,7 +1119,7 @@ func (c *Client) GetGroupThread(ctx context.Context, groupID, threadID string, o
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return GetGroupThreadResult{}, fmt.Errorf("get group thread failed: send request: %w", err)
 	}
@@ -1191,7 +1191,7 @@ func (c *Client) SetGroupTypingStatus(ctx context.Context, groupID, threadID str
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("set group typing status failed: send request: %w", err)
 	}
@@ -1260,7 +1260,7 @@ func (c *Client) SetPrivateTypingStatus(ctx context.Context, employeeCode, threa
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("set private typing status failed: send request: %w", err)
 	}
@@ -1358,7 +1358,7 @@ func (c *Client) sendMessageRequest(ctx context.Context, endpoint string, reqBod
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return SendMessageResult{}, fmt.Errorf("%s: send request: %w", failurePrefix, err)
 	}

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -151,7 +152,8 @@ func (h *CallbackHandler) handleRequest(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
-	log.Printf("received event: event_id=%s event_type=%s %s", req.EventID, event.EventType(), event.String())
+	log.Printf("received event: event_id=%s event_type=%s %s",
+		strconv.Quote(req.EventID), strconv.Quote(event.EventType()), strconv.Quote(event.String()))
 
 	respBody, err := h.processEvent(ctx, req, event)
 	if err == nil {

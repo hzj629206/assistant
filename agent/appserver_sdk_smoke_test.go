@@ -84,7 +84,7 @@ func TestAppServerSDKResumeThreadSmoke(t *testing.T) {
 	}
 }
 
-func TestNewAppServerRunnerDefaultsReasoningToMedium(t *testing.T) {
+func TestNewAppServerRunnerDefaultsReasoningToLow(t *testing.T) {
 	t.Parallel()
 
 	runner, err := NewAppServerRunner(context.Background(), AppServerRunnerOptions{
@@ -98,13 +98,13 @@ func TestNewAppServerRunnerDefaultsReasoningToMedium(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get working directory failed: %v", err)
 	}
-	if runner.startOptions.Model != defaultModel {
+	if runner.startOptions.Model != "" {
 		t.Fatalf("unexpected default start model: %q", runner.startOptions.Model)
 	}
-	if runner.resumeOptions.Model != defaultModel {
+	if runner.resumeOptions.Model != "" {
 		t.Fatalf("unexpected default resume model: %q", runner.resumeOptions.Model)
 	}
-	if runner.turnOptions.Model != defaultModel {
+	if runner.turnOptions.Model != "" {
 		t.Fatalf("unexpected default turn model: %q", runner.turnOptions.Model)
 	}
 	if runner.startOptions.Cwd != workingDirectory {
@@ -135,7 +135,7 @@ func TestNewAppServerRunnerDefaultsReasoningToMedium(t *testing.T) {
 	if runner.turnOptions.ApprovalPolicy != appcodex.ApprovalPolicyNever {
 		t.Fatalf("unexpected default turn approval policy: %v", runner.turnOptions.ApprovalPolicy)
 	}
-	if runner.turnOptions.Effort != appcodex.ReasoningEffortMedium {
+	if runner.turnOptions.Effort != appcodex.ReasoningEffortLow {
 		t.Fatalf("unexpected default reasoning effort: %v", runner.turnOptions.Effort)
 	}
 	expectedConfig := map[string]any{
@@ -179,7 +179,7 @@ func TestNewAppServerRunnerNormalizesLegacySandboxModes(t *testing.T) {
 	}
 }
 
-func TestNewAppServerRunnerNormalizesUnsupportedMinimalReasoningForDefaultModel(t *testing.T) {
+func TestNewAppServerRunnerPreservesMinimalReasoningForDefaultModel(t *testing.T) {
 	t.Parallel()
 
 	runner, err := NewAppServerRunner(context.Background(), AppServerRunnerOptions{
@@ -235,8 +235,8 @@ func TestNewAppServerRunnerNormalizesUnsupportedMinimalReasoningForDefaultModel(
 	if runner.turnOptions.ApprovalPolicy != appcodex.ApprovalPolicyOnRequest {
 		t.Fatalf("unexpected turn approval policy: %v", runner.turnOptions.ApprovalPolicy)
 	}
-	if runner.turnOptions.Effort != appcodex.ReasoningEffortMedium {
-		t.Fatalf("unexpected normalized reasoning effort: %v", runner.turnOptions.Effort)
+	if runner.turnOptions.Effort != appcodex.ReasoningEffortMinimal {
+		t.Fatalf("unexpected reasoning effort: %v", runner.turnOptions.Effort)
 	}
 }
 

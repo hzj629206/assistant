@@ -124,7 +124,7 @@ func (r *cloudflaredTunnel) run(ctx context.Context) {
 		cmd.Stderr = os.Stderr
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-		log.Printf("cloudflared tunnel starting: %s, expect route: %s", r.executable, r.localTargetURL)
+		log.Printf("cloudflared tunnel starting: %s, expect a route to: %s", r.executable, r.localTargetURL)
 		if err := cmd.Start(); err != nil {
 			log.Printf("cloudflared tunnel unavailable: %v", err)
 			if !waitWithContext(ctx, delay) {

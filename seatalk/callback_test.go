@@ -28,7 +28,7 @@ func TestCallbackHandlerRespondsToVerificationWithoutProcessor(t *testing.T) {
 		SigningSecret: "signing-secret",
 	}, nil)
 
-	req := httptest.NewRequest(http.MethodPost, "/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/callback", bytes.NewReader(body))
 	req.Header.Set("Signature", CalculateSignature(body, "signing-secret"))
 	recorder := httptest.NewRecorder()
 
@@ -52,7 +52,7 @@ func TestCallbackHandlerDelegatesNonVerificationToProcessor(t *testing.T) {
 		SigningSecret: "signing-secret",
 	}, processor)
 
-	req := httptest.NewRequest(http.MethodPost, "/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/callback", bytes.NewReader(body))
 	req.Header.Set("Signature", CalculateSignature(body, "signing-secret"))
 	recorder := httptest.NewRecorder()
 
@@ -77,7 +77,7 @@ func TestCallbackHandlerReturnsEmptyJSONObjectWhenProcessorReturnsNil(t *testing
 		SigningSecret: "signing-secret",
 	}, processor)
 
-	req := httptest.NewRequest(http.MethodPost, "/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/callback", bytes.NewReader(body))
 	req.Header.Set("Signature", CalculateSignature(body, "signing-secret"))
 	recorder := httptest.NewRecorder()
 
@@ -110,14 +110,14 @@ func TestCallbackHandlerLogsEventSummary(t *testing.T) {
 	defer log.SetOutput(originalWriter)
 	defer log.SetFlags(originalFlags)
 
-	req := httptest.NewRequest(http.MethodPost, "/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/callback", bytes.NewReader(body))
 	req.Header.Set("Signature", CalculateSignature(body, "signing-secret"))
 	recorder := httptest.NewRecorder()
 
 	handler.ServeHTTP(recorder, req)
 
 	output := buffer.String()
-	if !strings.Contains(output, "received event: event_id=evt-4 event_type=message_from_bot_subscriber message_id=msg-1 sender=u1") {
+	if !strings.Contains(output, "received event: event_id=\"evt-4\" event_type=\"message_from_bot_subscriber\" \"message_id=msg-1 sender=u1\"") {
 		t.Fatalf("missing event summary log: %q", output)
 	}
 }

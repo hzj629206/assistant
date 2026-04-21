@@ -489,7 +489,7 @@ func (c *Client) UpdateInteractiveMessage(ctx context.Context, messageID string,
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // SeaTalk API endpoint is controlled by trusted configuration.
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("update interactive message failed: send request: %w", err)
 	}

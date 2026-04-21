@@ -1,6 +1,6 @@
 # Project Overview
 
-This is a backend-only Golang project for integrating SeaTalk with Codex CLI/Claude Code.
+This is a backend-only Golang project for integrating SeaTalk with Codex CLI, Claude Code, and ACP Agents.
 
 # Project Guidelines
 
@@ -13,7 +13,7 @@ This is a backend-only Golang project for integrating SeaTalk with Codex CLI/Cla
 - When using foundational variable names like `err` and `ok`, do not implicitly redeclare them with `:=` within the same visible scope. Declare them once and reuse them with `=` afterward. For example, prefer `var err error; a, err = funA(); b, err = funB()` over `a, err := funA(); b, err := funB()`.
 - Use `go run`, `go build`, and `go install` for build and execution workflows.
 - When using `go build`, always set the output path with `-o` so the generated binary is placed under the project `bin` directory, regardless of the current working directory.
-- Use `golangci-lint` v2 for linting and code checks.
+- Use `golangci-lint` **v2.11.4+** for linting and code checks.
 - When executing Python scripts, always use the `python3` command instead of `python`.
 - When installing Python packages or running pip commands, always use `pip3` instead of `pip`.
 - When installing a global Python CLI package, use `uv tool install`.

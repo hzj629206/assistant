@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -72,6 +73,9 @@ func NewClaudeCodeRunner(options ClaudeCodeRunnerOptions) *ClaudeCodeRunner {
 	runOptions := options.RunOptions
 	if runOptions.PermissionMode == "" {
 		runOptions.PermissionMode = claudecode.PermissionModeDontAsk
+	}
+	if runOptions.Effort == "" {
+		runOptions.Effort = claudecode.EffortLow
 	}
 	if runOptions.WorkingDirectory == "" {
 		workingDirectory, err := os.Getwd()
@@ -1319,9 +1323,9 @@ func (s *claudePersistentProcessSession) handleStreamMessage(envelope map[string
 		messageType := sanitizeLogValue(msg.Type)
 		log.Printf(
 			"claude code runner ignoring unsupported stream message: conversation=%s pid=%d type=%s",
-			conversationKey,
+			strconv.Quote(conversationKey),
 			s.cmd.Process.Pid,
-			messageType,
+			strconv.Quote(messageType),
 		)
 	}
 }
@@ -1430,9 +1434,9 @@ func (s *claudePersistentProcessSession) handleResultMessage(envelope map[string
 
 	log.Printf(
 		"claude code runner received result message: conversation=%s pid=%d session_id=%s result_len=%d is_error=%t input_tokens=%d output_tokens=%d",
-		conversationKey,
+		strconv.Quote(conversationKey),
 		s.cmd.Process.Pid,
-		sessionID,
+		strconv.Quote(sessionID),
 		len(msg.Result),
 		msg.IsError,
 		inputTokens,
@@ -1467,9 +1471,9 @@ func (s *claudePersistentProcessSession) handleControlCancelRequest(envelope map
 	requestID = sanitizeLogValue(requestID)
 	log.Printf(
 		"claude code runner received control cancel request: conversation=%s pid=%d request_id=%s",
-		conversationKey,
+		strconv.Quote(conversationKey),
 		s.cmd.Process.Pid,
-		requestID,
+		strconv.Quote(requestID),
 	)
 }
 
@@ -1705,7 +1709,6 @@ func replaceClaudeArgWithFile(args []string, inlineFlag string, fileFlag string,
 }
 
 func removeClaudeTempFile(path string) {
-	//nolint:gosec // Temp file paths come from os.CreateTemp in this process.
 	_ = os.Remove(path)
 }
 

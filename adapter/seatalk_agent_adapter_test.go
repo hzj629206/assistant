@@ -196,7 +196,7 @@ func TestSeaTalkAgentAdapterNewCallbackHandlerUsesAdapterConfig(t *testing.T) {
 	})
 	handler := adapter.NewCallbackHandler()
 
-	req := httptest.NewRequest(http.MethodPost, "/callback", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/callback", bytes.NewReader(body))
 	req.Header.Set("Signature", seatalk.CalculateSignature(body, "signing-secret"))
 	recorder := httptest.NewRecorder()
 

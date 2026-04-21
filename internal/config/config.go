@@ -21,6 +21,7 @@ type Config struct {
 	Tunnel     TunnelConfig   `json:"tunnel" yaml:"tunnel"`
 	Codex      CodexConfig    `json:"codex" yaml:"codex"`
 	Claude     ClaudeConfig   `json:"claude" yaml:"claude"`
+	ACP        ACPConfig      `json:"acp" yaml:"acp"`
 	SeaTalk    seatalk.Config `json:"seatalk" yaml:"seatalk"`
 }
 
@@ -48,6 +49,14 @@ type ClaudeConfig struct {
 	ReasoningEffort       string   `json:"reasoning_effort" yaml:"reasoning_effort"`
 	Permission            string   `json:"permission" yaml:"permission"`
 	AdditionalDirectories []string `json:"additional_directories" yaml:"additional_directories"`
+}
+
+// ACPConfig contains ACP daemon configuration.
+type ACPConfig struct {
+	Command    string   `json:"command" yaml:"command"`
+	Args       []string `json:"args" yaml:"args"`
+	Env        []string `json:"env" yaml:"env"`
+	AuthMethod string   `json:"auth_method" yaml:"auth_method"`
 }
 
 type flagOverlay struct {
@@ -98,17 +107,15 @@ func ParseConfig(programName string, args []string) (Config, error) {
 	} else if err = loadOptionalConfigFile(configPath, &cfg); err != nil {
 		return Config{}, err
 	}
-	if err = normalizeCodexConfig(&cfg.Codex); err != nil {
-		return Config{}, err
-	}
+	normalizeCodexConfig(&cfg.Codex)
 	normalizeClaudeConfig(&cfg.Claude)
+	normalizeACPConfig(&cfg.ACP)
 	fs.Visit(func(f *flag.Flag) {
 		applyFlagOverride(&cfg, overlay, f.Name)
 	})
-	if err = normalizeCodexConfig(&cfg.Codex); err != nil {
-		return Config{}, err
-	}
+	normalizeCodexConfig(&cfg.Codex)
 	normalizeClaudeConfig(&cfg.Claude)
+	normalizeACPConfig(&cfg.ACP)
 	if err = validateSeaTalkConfig(&cfg.SeaTalk); err != nil {
 		return Config{}, err
 	}
@@ -130,6 +137,7 @@ func defaultConfig() (Config, error) {
 			SSHKey:           filepath.Join(homeDir, ".ssh", "id_rsa"),
 			CloudflaredToken: "",
 		},
+		ACP: ACPConfig{},
 		Codex: CodexConfig{
 			Backend: "appserver",
 		},
@@ -227,9 +235,9 @@ func defaultConfigPath() (string, error) {
 	return filepath.Join(homeDir, ".assistant", "config.yml"), nil
 }
 
-func normalizeCodexConfig(cfg *CodexConfig) error {
+func normalizeCodexConfig(cfg *CodexConfig) {
 	if cfg == nil {
-		return nil
+		return
 	}
 
 	cfg.Backend = strings.TrimSpace(strings.ToLower(cfg.Backend))
@@ -245,22 +253,23 @@ func normalizeCodexConfig(cfg *CodexConfig) error {
 	switch cfg.Backend {
 	case "appserver", "exec":
 	default:
-		return fmt.Errorf("unsupported codex backend %q", cfg.Backend)
+		log.Printf("ignoring unsupported codex backend %q", cfg.Backend)
+		cfg.Backend = "appserver"
 	}
 
 	switch cfg.ReasoningEffort {
 	case "", "none", "minimal", "low", "medium", "high", "xhigh":
 	default:
-		return fmt.Errorf("unsupported codex reasoning effort %q", cfg.ReasoningEffort)
+		log.Printf("ignoring unsupported codex reasoning effort %q", cfg.ReasoningEffort)
+		cfg.ReasoningEffort = ""
 	}
 
 	switch cfg.Sandbox {
 	case "", "read-only", "workspace-write", "danger-full-access":
 	default:
-		return fmt.Errorf("unsupported codex sandbox %q", cfg.Sandbox)
+		log.Printf("ignoring unsupported codex sandbox %q", cfg.Sandbox)
+		cfg.Sandbox = ""
 	}
-
-	return nil
 }
 
 func normalizeCodexAdditionalWritableRoots(roots []string) []string {
@@ -352,6 +361,36 @@ func normalizeClaudeAdditionalDirectories(paths []string) []string {
 	}
 
 	return directories
+}
+
+func normalizeACPConfig(cfg *ACPConfig) {
+	if cfg == nil {
+		return
+	}
+
+	cfg.Command = strings.TrimSpace(cfg.Command)
+	cfg.AuthMethod = strings.TrimSpace(cfg.AuthMethod)
+	cfg.Args = normalizeACPStringSlice(cfg.Args)
+	cfg.Env = normalizeACPStringSlice(cfg.Env)
+}
+
+func normalizeACPStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		normalized = append(normalized, value)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
 }
 
 func validateSeaTalkConfig(cfg *seatalk.Config) error {

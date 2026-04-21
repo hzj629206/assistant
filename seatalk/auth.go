@@ -92,7 +92,7 @@ func obtainAccessToken(ctx context.Context, client *http.Client, endpoint string
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req) //nolint:gosec // Endpoint is controlled by trusted configuration/private flow.
+	resp, err := client.Do(req)
 	if err != nil {
 		return AppAccessToken{}, fmt.Errorf("obtain access token failed: send request: %w", err)
 	}

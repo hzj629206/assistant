@@ -131,16 +131,6 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 		}
 	}
 
-	if startOptions.Model == "" {
-		startOptions.Model = defaultModel
-	}
-	if resumeOptions.Model == "" {
-		resumeOptions.Model = startOptions.Model
-	}
-	if turnOptions.Model == "" {
-		turnOptions.Model = startOptions.Model
-	}
-
 	if startOptions.ApprovalPolicy == nil {
 		startOptions.ApprovalPolicy = appcodex.ApprovalPolicyNever
 	}
@@ -176,9 +166,8 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	}
 	turnOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(turnOptions.SandboxPolicy)
 
-	if turnOptions.Effort == nil || (turnOptions.Model == defaultModel && turnOptions.Effort == appcodex.ReasoningEffortMinimal) {
-		// `gpt-5.4` doesn't support `minimal`.
-		turnOptions.Effort = appcodex.ReasoningEffortMedium
+	if turnOptions.Effort == nil {
+		turnOptions.Effort = appcodex.ReasoningEffortLow
 	}
 
 	runner := &AppServerRunner{

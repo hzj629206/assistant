@@ -1,11 +1,11 @@
 # Assistant
 
-Backend-only Golang project for integrating SeaTalk with Codex CLI.
+Backend-only Golang project for integrating SeaTalk with local agent CLIs such as Codex CLI and Claude Code.
 
 ## How It Works
 
 The service receives SeaTalk bot callbacks from both direct chats and group chats,
-normalizes inbound messages into a shared agent model, and dispatches them to the Codex-backed assistant layer.
+normalizes inbound messages into a shared agent model, and dispatches them to the configured agent runner.
 
 The SeaTalk integration supports common bot-facing message forms, including text messages, image messages, file messages, video messages, combined-forwarded messages, quoted messages, and interactive cards.
 
@@ -37,8 +37,8 @@ or when it needs to present images or links instead of relying only on plain tex
 In real-time conversations, edited messages and updated interactive-card messages do not take effect for the bot.
 SeaTalk message update events are not visible to bots, so the service only processes the original message content delivered in the callback.
 
-At runtime, the Go service communicates with the locally installed `codex` CLI.
-This keeps the application lightweight while allowing the local Codex environment to provide skills, MCP servers, and other assistant capabilities.
+At runtime, the Go service communicates with the locally installed agent CLI selected by the daemon you run, such as `codex` for `codexd` or `claude` for `clauded`.
+This keeps the application lightweight while allowing the local agent environment to provide skills, MCP servers, and other assistant capabilities.
 
 When the service shuts down, the dispatcher stops accepting new work immediately.
 It drops messages that are still waiting in the in-memory queue, pending batch, or delayed merge window,
@@ -56,7 +56,7 @@ and only keeps already-running turns alive for a short grace period.
 - Agent support for sending generated data files such as CSV, JSON, and text reports back to users
 - Outbound interactive-card guidance for complex task progress updates and structured presentation of complex results
 - Shared agent layer for normalized message processing and conversation state management
-- Codex runner integration through the local `codex` CLI
+- Runner integrations for local agent CLIs, including Codex CLI and Claude Code
 - Lightweight cache abstractions for storing assistant-related state
 - Flexible configuration through defaults, YAML config files, and command-line flags
 - Deployment-friendly design for public callback endpoints, including reverse SSH forwarding support
@@ -65,26 +65,33 @@ and only keeps already-running turns alive for a short grace period.
 
 This project requires `Go 1.25+`.
 
-This project depends on a locally installed `Codex CLI`.
+This project depends on a locally installed agent CLI for the daemon you choose to run.
 
-The Go service communicates with the local `codex` executable at runtime. This repository does not bundle or manage the CLI itself.
+The Go service communicates with the local CLI executable at runtime. This repository does not bundle or manage those CLIs itself.
 
-If you want to extend Codex capabilities for this project, configure the local `Codex CLI` installation directly, for example:
+For `codexd`, install and configure the local `Codex CLI`.
+For `clauded`, install and configure the local `Claude Code` CLI.
+For `acpd`, install and configure a local `ACP`-compatible agent CLI.
 
-- add or enable `MCP` servers in the `Codex CLI` configuration
-- install or manage `Skills` in the `Codex CLI` environment
+If you want to extend the local agent capabilities used by this project, configure the selected CLI installation directly.
+For example, in environments that support those features, you can:
 
-Those extensions are picked up through the local `Codex CLI` used by the service.
+- add or enable `MCP` servers in the local CLI configuration
+- install or manage local skills in the CLI environment
 
-Codex also discovers and loads applicable `AGENTS.md` files from the directory context where it is started.
-You can use `AGENTS.md` to inject project-specific context, coding conventions, and workflow instructions when Codex is launched inside the relevant workspace.
+Those extensions are picked up through the local CLI used by the service.
+
+Codex discovers and loads applicable `AGENTS.md` files from the directory context where it is started.
+Claude Code supports `CLAUDE.md` in the same role for workspace-specific instructions.
+You can use those files to inject project-specific context, coding conventions, and workflow instructions when `codexd` launches Codex or `clauded` launches Claude Code inside the relevant workspace.
 
 If MCP tool outputs are truncated in the local `Codex CLI`, increase `tool_output_token_limit` in the `Codex CLI` configuration.
-This setting is managed by the local `Codex CLI`, not by this repository.
+This Codex-specific setting is managed by the local `Codex CLI`, not by this repository.
 
 ## Onboarding
 
 Before running the service in production or for SeaTalk callback testing, complete the following setup:
+Restrict the bot's access scope to the minimum necessary to reduce the risk of misuse, abuse, and attacks by others.
 
 1. Create an application on the SeaTalk Open Platform and enable the Bot capability. See the SeaTalk guide: <https://open.seatalk.io/docs/quickly-build-a-bot>.
    In the app permission page, manually enable `Get Thread by Thread ID in Group Chat`. This permission is not selected by default.
@@ -93,8 +100,8 @@ Before running the service in production or for SeaTalk callback testing, comple
    That capability requires additional platform approval and is disabled by default in this service through the `seatalk.employee_info_enabled` configuration toggle.
 2. Set up `Nginx` on a machine with public internet access, and configure the domain, HTTPS, and reverse proxy for this service.
 3. Run this project. If the service runs on a local machine without public inbound access, expose the callback endpoint through one of the supported traffic-entry approaches:
-   - Use the built-in reverse SSH forwarding support so the public `Nginx` host can reach the callback endpoint.
-   - Or use a third-party tunnel service such as `ngrok` or `Cloudflare Tunnel` to publish the local service through a public HTTPS endpoint.
+   - Use the built-in reverse SSH forwarding support so a public `Nginx` host can reach the callback endpoint through `tunnel.ssh_addr`, `tunnel.ssh_user`, and `tunnel.ssh_key`.
+   - Or use the built-in `Cloudflare Tunnel` integration through `tunnel.cloudflared_token` to publish the local service through a public HTTPS endpoint managed by Cloudflare.
 
    When reverse SSH forwarding is enabled with `tunnel.ssh_addr`, the service reuses only the port from `listen_addr` and requests a remote listen address in the form `:<port>`.
 
@@ -102,7 +109,10 @@ Before running the service in production or for SeaTalk callback testing, comple
    - `AllowTcpForwarding yes` must allow remote forwarding.
    - `GatewayPorts clientspecified` is recommended if you want the server to honor the requested remote bind semantics.
    - With the default `GatewayPorts no`, the server may force the remote listener onto loopback even when the client requests `:<port>`.
-4. Configure the SeaTalk callback URL as `https://<domain>/callback` in the SeaTalk platform. If you use `ngrok` or `Cloudflare Tunnel`, use the public HTTPS URL provided by that service.
+
+   When `tunnel.cloudflared_token` is configured and `tunnel.ssh_addr` is empty, the service starts `cloudflared tunnel run --token <token>` and forwards traffic to the local `listen_addr`.
+   You must configure the Cloudflare Tunnel route separately so the public hostname points to this local HTTP service port.
+4. Configure the SeaTalk callback URL as `https://<domain>/callback` in the SeaTalk platform. If you use `Cloudflare Tunnel`, use the public HTTPS URL provided by that tunnel. If you use reverse SSH forwarding, use the public domain served by your `Nginx` host.
 
 ## Configuration
 
@@ -115,9 +125,15 @@ The process loads configuration in this order:
 
 Later sources override earlier ones.
 
+See [config.yaml.example](./config.yaml.example) for a complete example with all supported fields and inline descriptions.
+
+Use `<daemon> -h` to see the supported flags.
+
 ## Install
 
-Install the daemon binary into your Go bin directory:
+### Install `codexd`
+
+Install the `codexd` daemon binary into your Go bin directory:
 
 ```bash
 go install github.com/hzj629206/assistant/cmd/codexd@master
@@ -125,64 +141,31 @@ go install github.com/hzj629206/assistant/cmd/codexd@master
 
 After installation, run the service with `codexd`.
 
-Security note: the service runs with `read-only` sandbox mode and `never` approval by default, while `WebSearch` and `NetworkAccess` are enabled by default for the local `codex` CLI backend.
+Security note for `codexd`: the service runs with `read-only` sandbox mode and `never` approval by default, while `WebSearch` and `NetworkAccess` are enabled by default for the local `codex` CLI backend.
 Do not store sensitive data in the working directory because the bot is able to read files from that directory, search the web, and access network resources.
-Restrict the bot's access scope to the minimum necessary to reduce the risk of misuse, abuse, and attacks by others.
-### 1. Use The Default Config File
 
-The service primarily relies on a YAML config file. If `$HOME/.assistant/config.yml` exists, it is loaded automatically.
+### Install `clauded`
 
-Example `$HOME/.assistant/config.yml`:
-
-```yaml
-listen_addr: :8421
-tunnel:
-  ssh_addr: example.com
-  ssh_user: ubuntu
-  ssh_key: /path/to/id_rsa
-codex:
-  backend: appserver
-  model: gpt-5.4
-  reasoning_effort: low
-  sandbox: read-only
-seatalk:
-  app_id: your-app-id
-  app_secret: your-app-secret
-  signing_secret: your-signing-secret
-  employee_info_enabled: false
-```
-
-Supported `codex.sandbox` values are `read-only`, `workspace-write`, and `danger-full-access`.
-
-When a config file is loaded, the service logs the resolved file path.
-
-Run:
+Install the `clauded` daemon binary into your Go bin directory:
 
 ```bash
-codexd
+go install github.com/hzj629206/assistant/cmd/clauded@master
 ```
 
-### 2. Override A Few Common Options From CLI
+After installation, run the service with `clauded`.
 
-Command-line flags are only intended for a small set of common non-sensitive overrides:
+Security note for `clauded`: the service inherits the permissions and tool-access behavior of the local `Claude Code` CLI environment. The default permission mode is `dontAsk`, and any permission request that still requires user confirmation is currently accepted by default.
+Do not store sensitive data in the working directory because the bot may be able to read local files, invoke configured tools, and access external resources depending on that local CLI configuration.
+
+### Install `acpd`
+
+Install the `acpd` daemon binary into your Go bin directory:
 
 ```bash
-codexd \
-  -listen-addr :8421 \
-  -codex-backend appserver \
-  -codex-model gpt-5.4 \
-  -codex-reasoning-effort low \
-  -codex-sandbox read-only
+go install github.com/hzj629206/assistant/cmd/acpd@master
 ```
 
-Common flags: `codexd -h`
+After installation, run the service with `acpd`.
 
-### 3. Use A Custom Config File
-
-Pass a YAML config file with `-config` or `-f` to override the default config path.
-
-Example:
-
-```bash
-codexd -config /path/to/config.yml
-```
+Security note for `acpd`: the service launches a locally configured `ACP`-compatible agent process and inherits the capabilities, permissions, and authentication flow exposed by that local agent runtime. Any permission request that still requires user confirmation is currently accepted silently by default.
+Do not store sensitive data in the working directory because the configured `ACP` agent may be able to read local files, invoke tools, and access external resources depending on its implementation and configuration.

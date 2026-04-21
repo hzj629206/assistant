@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hzj629206/assistant/config"
+	"github.com/hzj629206/assistant/internal/config"
 	"github.com/hzj629206/assistant/internal/tunnel"
 )
 

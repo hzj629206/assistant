@@ -19,9 +19,7 @@ func TestNormalizeCodexConfig(t *testing.T) {
 		Sandbox:                 " READ-ONLY ",
 		AdditionalWritableRoots: []string{" ", rootOne, rootTwo},
 	}
-	if err := normalizeCodexConfig(&cfg); err != nil {
-		t.Fatalf("normalizeCodexConfig failed: %v", err)
-	}
+	normalizeCodexConfig(&cfg)
 	if cfg.Backend != "appserver" {
 		t.Fatalf("unexpected backend: %s", cfg.Backend)
 	}
@@ -36,6 +34,40 @@ func TestNormalizeCodexConfig(t *testing.T) {
 	}
 	if len(cfg.AdditionalWritableRoots) != 1 || cfg.AdditionalWritableRoots[0] != filepath.Clean(rootOne) {
 		t.Fatalf("unexpected additional writable roots: %#v", cfg.AdditionalWritableRoots)
+	}
+}
+
+func TestNormalizeACPConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := ACPConfig{
+		Command:    " agent ",
+		Args:       []string{" acp ", " ", "extra"},
+		Env:        []string{" A=B ", " ", "C=D"},
+		AuthMethod: " token ",
+	}
+	normalizeACPConfig(&cfg)
+
+	if cfg.Command != "agent" {
+		t.Fatalf("unexpected command: %q", cfg.Command)
+	}
+	if !reflect.DeepEqual(cfg.Args, []string{"acp", "extra"}) {
+		t.Fatalf("unexpected args: %#v", cfg.Args)
+	}
+	if !reflect.DeepEqual(cfg.Env, []string{"A=B", "C=D"}) {
+		t.Fatalf("unexpected env: %#v", cfg.Env)
+	}
+	if cfg.AuthMethod != "token" {
+		t.Fatalf("unexpected auth method: %q", cfg.AuthMethod)
+	}
+
+	cfg = ACPConfig{}
+	normalizeACPConfig(&cfg)
+	if cfg.Command != "" {
+		t.Fatalf("unexpected default command: %q", cfg.Command)
+	}
+	if cfg.Args != nil {
+		t.Fatalf("unexpected default args: %#v", cfg.Args)
 	}
 }
 
@@ -87,7 +119,7 @@ func TestNormalizeClaudeConfig(t *testing.T) {
 	}
 }
 
-func TestNormalizeCodexConfigRejectsUnsupportedValues(t *testing.T) {
+func TestNormalizeCodexConfigClearsUnsupportedValues(t *testing.T) {
 	t.Parallel()
 
 	cfg := CodexConfig{
@@ -96,8 +128,9 @@ func TestNormalizeCodexConfigRejectsUnsupportedValues(t *testing.T) {
 		ReasoningEffort: "low",
 		Sandbox:         "read-only",
 	}
-	if err := normalizeCodexConfig(&cfg); err == nil {
-		t.Fatal("expected unsupported backend error")
+	normalizeCodexConfig(&cfg)
+	if cfg.Backend != "appserver" {
+		t.Fatalf("unexpected backend after normalization: %q", cfg.Backend)
 	}
 
 	cfg = CodexConfig{
@@ -106,8 +139,9 @@ func TestNormalizeCodexConfigRejectsUnsupportedValues(t *testing.T) {
 		ReasoningEffort: "extreme",
 		Sandbox:         "read-only",
 	}
-	if err := normalizeCodexConfig(&cfg); err == nil {
-		t.Fatal("expected unsupported reasoning effort error")
+	normalizeCodexConfig(&cfg)
+	if cfg.ReasoningEffort != "" {
+		t.Fatalf("unexpected reasoning effort after normalization: %q", cfg.ReasoningEffort)
 	}
 
 	cfg = CodexConfig{
@@ -116,8 +150,9 @@ func TestNormalizeCodexConfigRejectsUnsupportedValues(t *testing.T) {
 		ReasoningEffort: "low",
 		Sandbox:         "invalid",
 	}
-	if err := normalizeCodexConfig(&cfg); err == nil {
-		t.Fatal("expected unsupported sandbox error")
+	normalizeCodexConfig(&cfg)
+	if cfg.Sandbox != "" {
+		t.Fatalf("unexpected sandbox after normalization: %q", cfg.Sandbox)
 	}
 }
 
@@ -276,6 +311,9 @@ func TestDefaultConfigUsesBuiltInDefaults(t *testing.T) {
 	if cfg.Codex.Backend != "appserver" || cfg.Codex.Model != "" || cfg.Codex.ReasoningEffort != "" || cfg.Codex.Sandbox != "" {
 		t.Fatalf("unexpected codex defaults: %+v", cfg.Codex)
 	}
+	if cfg.ACP.Command != "" || cfg.ACP.Args != nil || cfg.ACP.Env != nil || cfg.ACP.AuthMethod != "" {
+		t.Fatalf("unexpected acp defaults: %+v", cfg.ACP)
+	}
 	if cfg.Claude.Model != "" {
 		t.Fatalf("unexpected claude defaults: %+v", cfg.Claude)
 	}
@@ -324,6 +362,14 @@ func TestParseConfigLoadsDefaultConfigFile(t *testing.T) {
 tunnel:
   ssh_user: admin
   cloudflared_token: cloudflare-token
+acp:
+  command: cursor-agent
+  args:
+    - acp
+    - --fast
+  env:
+    - ACP_ENV=1
+  auth_method: cursor_login
 codex:
   backend: exec
   model: gpt-5.4
@@ -362,6 +408,15 @@ seatalk:
 	}
 	if cfg.Tunnel.CloudflaredToken != "cloudflare-token" {
 		t.Fatalf("unexpected cloudflared token: %s", cfg.Tunnel.CloudflaredToken)
+	}
+	if cfg.ACP.Command != "cursor-agent" || cfg.ACP.AuthMethod != "cursor_login" {
+		t.Fatalf("unexpected acp config: %+v", cfg.ACP)
+	}
+	if !reflect.DeepEqual(cfg.ACP.Args, []string{"acp", "--fast"}) {
+		t.Fatalf("unexpected acp args: %#v", cfg.ACP.Args)
+	}
+	if !reflect.DeepEqual(cfg.ACP.Env, []string{"ACP_ENV=1"}) {
+		t.Fatalf("unexpected acp env: %#v", cfg.ACP.Env)
 	}
 	if cfg.Codex.Backend != "exec" || cfg.Codex.Model != "gpt-5.4" || cfg.Codex.ReasoningEffort != "medium" || cfg.Codex.Sandbox != "workspace-write" {
 		t.Fatalf("unexpected codex config: %+v", cfg.Codex)

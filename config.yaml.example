@@ -1,0 +1,115 @@
+# Example configuration for the assistant daemons.
+#
+# Copy the fields you need into your real config file.
+# The default lookup path at runtime is: ~/.assistant/config.yml
+
+# HTTP listen address for the local callback server.
+# Default: ":8421"
+listen_addr: ":8421"
+
+# Optional public tunnel configuration.
+# If both ssh_addr and cloudflared_token are empty, no tunnel is started.
+# If ssh_addr is set, SSH reverse tunneling is used and takes precedence.
+# Otherwise cloudflared is used when cloudflared_token is set.
+# Both tunnel modes forward traffic to the local listen_addr.
+tunnel:
+  # Optional remote SSH server used for reverse port forwarding.
+  # Example: "example.com:22"
+  # Default: ""
+  ssh_addr: ""
+
+  # Optional SSH username for the tunnel connection.
+  # Default: ""
+  ssh_user: ""
+
+  # SSH private key path for the tunnel connection.
+  # Default: "~/.ssh/id_rsa"
+  ssh_key: ""
+
+  # Optional Cloudflare Tunnel token.
+  # Default: ""
+  cloudflared_token: ""
+
+# Configuration used by the codexd daemon.
+codex:
+  # Codex runner backend.
+  # Supported values: "appserver", "exec"
+  # Default: "appserver"
+  backend: ""
+
+  # Optional Codex model name.
+  # Default: ""
+  model: ""
+
+  # Optional Codex reasoning effort.
+  # Supported values: "", "none", "minimal", "low", "medium", "high", "xhigh"
+  # Default: "low"
+  reasoning_effort: ""
+
+  # Optional Codex sandbox mode.
+  # Supported values: "", "read-only", "workspace-write", "danger-full-access"
+  # Default: "read-only"
+  sandbox: ""
+
+  # Optional extra writable directories for Codex.
+  # Paths are normalized to absolute paths.
+  # Default: []
+  additional_writable_roots: []
+
+# Configuration used by the clauded daemon.
+claude:
+  # Optional Claude model name.
+  # Default: ""
+  model: ""
+
+  # Optional Claude reasoning effort.
+  # Supported values: "", "low", "medium", "high", "xhigh", "max"
+  # Default: "low"
+  reasoning_effort: ""
+
+  # Optional Claude permission mode.
+  # Supported values: "", "default", "auto", "plan", "accept-edits",
+  # "bypass-permissions", "dont-ask"
+  # Default: "dont-ask"
+  permission: ""
+
+  # Optional extra directories exposed to Claude Code.
+  # Paths are normalized to absolute paths.
+  # Default: []
+  additional_directories: []
+
+# Configuration used by the acpd daemon.
+acp:
+  # ACP agent command.
+  # Required by acpd.
+  command: ""
+
+  # ACP agent command arguments.
+  # Example: ["acp"]
+  # Default: []
+  args: []
+
+  # Extra environment variables passed to the ACP agent process.
+  # Format: ["KEY=value", "OTHER=value"]
+  # Default: []
+  env: []
+
+  # Optional ACP authentication method ID.
+  # This must match one of the IDs returned by ACP initialize authMethods.
+  # Default: ""
+  auth_method: ""
+
+# Configuration for SeaTalk Bot integration.
+seatalk:
+  # Required SeaTalk app ID.
+  app_id: ""
+
+  # Required SeaTalk app secret.
+  app_secret: ""
+
+  # Required SeaTalk callback signing secret.
+  signing_secret: ""
+
+  # Whether employee profile lookup APIs are allowed.
+  # Default: false
+  employee_info_enabled: false
