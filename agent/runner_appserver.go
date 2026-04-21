@@ -25,18 +25,21 @@ import (
 
 // AppServerRunner bridges dispatcher turns to the Codex app-server through pmenglund/codex-sdk-go.
 type AppServerRunner struct {
-	closeFn         func() error
-	rpcClient       *apprpc.Client
-	startThread     func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error)
-	resumeThread    func(context.Context, appcodex.ThreadResumeOptions) (appServerThread, error)
-	runThreadTurnFn func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error)
-	startOptions    appcodex.ThreadStartOptions
-	resumeOptions   appcodex.ThreadResumeOptions
-	turnOptions     appcodex.TurnOptions
-	mu              sync.RWMutex
-	systemPrompts   []string
-	tools           []Tool
-	activeTurns     map[string]appServerActiveTurn
+	closeFn             func() error
+	rpcClient           *apprpc.Client
+	rpcClientFactory    func(context.Context, apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error)
+	canRecoverRPCClient bool
+	closed              bool
+	startThread         func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error)
+	resumeThread        func(context.Context, appcodex.ThreadResumeOptions) (appServerThread, error)
+	runThreadTurnFn     func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error)
+	startOptions        appcodex.ThreadStartOptions
+	resumeOptions       appcodex.ThreadResumeOptions
+	turnOptions         appcodex.TurnOptions
+	mu                  sync.RWMutex
+	systemPrompts       []string
+	tools               []Tool
+	activeTurns         map[string]appServerActiveTurn
 }
 
 // AppServerRunnerOptions configures an AppServerRunner.
@@ -171,26 +174,21 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	}
 
 	runner := &AppServerRunner{
-		startOptions:  startOptions,
-		resumeOptions: resumeOptions,
-		turnOptions:   turnOptions,
-		activeTurns:   make(map[string]appServerActiveTurn),
+		startOptions:        startOptions,
+		resumeOptions:       resumeOptions,
+		turnOptions:         turnOptions,
+		activeTurns:         make(map[string]appServerActiveTurn),
+		canRecoverRPCClient: options.Client == nil && options.CodexOptions.Transport == nil,
+	}
+	runner.rpcClientFactory = func(ctx context.Context, handler apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
+		return newAppServerRPCClient(ctx, options.CodexOptions, options.Client, handler)
 	}
 
-	rpcClient, closeFn, _, err := newAppServerRPCClient(ctx, options.CodexOptions, options.Client, runner)
+	rpcClient, closeFn, _, err := runner.rpcClientFactory(ctx, runner)
 	if err != nil {
 		return nil, fmt.Errorf("create codex app-server client failed: %w", err)
 	}
-	runner.rpcClient = rpcClient
-	runner.closeFn = closeFn
-	if runner.rpcClient != nil {
-		runner.startThread = func(ctx context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
-			return runner.startRPCThread(ctx, options)
-		}
-		runner.resumeThread = func(ctx context.Context, options appcodex.ThreadResumeOptions) (appServerThread, error) {
-			return runner.resumeRPCThread(ctx, options)
-		}
-	}
+	runner.bindRPCClient(rpcClient, closeFn)
 
 	runner.RegisterSystemPrompt(options.SystemPrompt)
 	runner.RegisterTools(options.Tools...)
@@ -296,11 +294,26 @@ func describeAppServerApprovalPolicy(policy any) string {
 
 // Close shuts down the underlying app-server client.
 func (r *AppServerRunner) Close() error {
-	if r == nil || r.closeFn == nil {
+	if r == nil {
 		return nil
 	}
 
-	return r.closeFn()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	closeFn := r.closeFn
+	r.closeFn = nil
+	r.rpcClient = nil
+	r.startThread = nil
+	r.resumeThread = nil
+	r.mu.Unlock()
+	if closeFn == nil {
+		return nil
+	}
+	return closeFn()
 }
 
 // RegisterSystemPrompt appends one global system prompt block for new conversations.
@@ -356,6 +369,9 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 	if r == nil {
 		return TurnResult{}, errors.New("run app-server turn failed: runner is nil")
 	}
+	if err := r.ensureRPCClient(ctx); err != nil {
+		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
+	}
 
 	turnContext := appServerTurnContext{
 		prompts: r.globalPrompts(),
@@ -373,6 +389,7 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 		options.ThreadID = req.Conversation.RunnerThreadID
 		thread, err = r.resumeThread(ctx, options)
 		if err != nil {
+			r.invalidateRPCClientIfRecoverable(err)
 			log.Printf(
 				"app-server runner resume thread failed: conversation=%s thread_id=%s model=%s cwd=%s sandbox=%s approval=%s err=%v",
 				req.Conversation.Key,
@@ -393,6 +410,7 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 			thread, err = r.startThread(ctx, options)
 		}
 		if err != nil {
+			r.invalidateRPCClientIfRecoverable(err)
 			log.Printf(
 				"app-server runner start thread failed: conversation=%s model=%s cwd=%s sandbox=%s approval=%s err=%v",
 				req.Conversation.Key,
@@ -434,6 +452,7 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 
 	turn, runErr := r.runThreadTurn(ctx, req, thread, inputs, &r.turnOptions)
 	if runErr != nil {
+		r.invalidateRPCClientIfRecoverable(runErr)
 		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", runErr)
 	}
 	replyText := turn.FinalResponse
@@ -447,6 +466,83 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 		RunnerThreadID: threadID,
 		ReplyText:      replyText,
 	}, nil
+}
+
+func (r *AppServerRunner) bindRPCClient(client *apprpc.Client, closeFn func() error) {
+	r.rpcClient = client
+	r.closeFn = closeFn
+	if client == nil {
+		r.startThread = nil
+		r.resumeThread = nil
+		return
+	}
+	r.startThread = func(ctx context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
+		return r.startRPCThread(ctx, options)
+	}
+	r.resumeThread = func(ctx context.Context, options appcodex.ThreadResumeOptions) (appServerThread, error) {
+		return r.resumeRPCThread(ctx, options)
+	}
+}
+
+func (r *AppServerRunner) ensureRPCClient(ctx context.Context) error {
+	if r == nil {
+		return errors.New("app-server runner is nil")
+	}
+
+	r.mu.RLock()
+	client := r.rpcClient
+	closed := r.closed
+	factory := r.rpcClientFactory
+	canRecover := r.canRecoverRPCClient
+	r.mu.RUnlock()
+	if closed {
+		return errors.New("app-server runner is closed")
+	}
+	if client != nil {
+		return nil
+	}
+	if !canRecover || factory == nil {
+		return nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return errors.New("app-server runner is closed")
+	}
+	if r.rpcClient != nil {
+		return nil
+	}
+
+	client, closeFn, _, err := factory(ctx, r)
+	if err != nil {
+		return fmt.Errorf("recreate codex app-server client failed: %w", err)
+	}
+	r.bindRPCClient(client, closeFn)
+	log.Printf("app-server runner rpc client recreated")
+	return nil
+}
+
+func (r *AppServerRunner) invalidateRPCClientIfRecoverable(err error) {
+	if r == nil || !shouldRecoverAppServerRPCClient(err) {
+		return
+	}
+
+	r.mu.Lock()
+	if r.closed || r.rpcClient == nil {
+		r.mu.Unlock()
+		return
+	}
+	closeFn := r.closeFn
+	r.bindRPCClient(nil, nil)
+	r.mu.Unlock()
+
+	log.Printf("app-server runner invalidating rpc client after transport failure: err=%v", err)
+	if closeFn != nil {
+		if closeErr := closeFn(); closeErr != nil {
+			log.Printf("app-server runner rpc client close failed during invalidation: err=%v", closeErr)
+		}
+	}
 }
 
 func joinAppServerDeveloperInstructions(base string, prompts []string) string {
@@ -1124,6 +1220,7 @@ func (t *appServerStdioTransport) Close() error {
 
 	err, exited := waitProcess(waitCh, appServerStdioCloseTimeout)
 	if exited {
+		logAppServerProcessExit(t.cmd, err)
 		return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
 	}
 
@@ -1133,6 +1230,7 @@ func (t *appServerStdioTransport) Close() error {
 
 	err, exited = waitProcess(waitCh, appServerStdioTerminateTimeout)
 	if exited {
+		logAppServerProcessExit(t.cmd, err)
 		return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
 	}
 
@@ -1141,6 +1239,7 @@ func (t *appServerStdioTransport) Close() error {
 	}
 
 	err = <-waitCh
+	logAppServerProcessExit(t.cmd, err)
 	return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
 }
 
@@ -1150,6 +1249,56 @@ func waitProcess(waitCh <-chan error, timeout time.Duration) (error, bool) {
 		return err, true
 	case <-time.After(timeout):
 		return nil, false
+	}
+}
+
+func logAppServerProcessExit(cmd *exec.Cmd, err error) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err == nil {
+		log.Printf("app-server runner process exited: pid=%d", cmd.Process.Pid)
+		return
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ProcessState != nil {
+		waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+		if ok && waitStatus.Signaled() {
+			log.Printf("app-server runner process exited: pid=%d", cmd.Process.Pid)
+			return
+		}
+	}
+
+	log.Printf("app-server runner process wait returned: pid=%d err=%v", cmd.Process.Pid, err)
+}
+
+func shouldRecoverAppServerRPCClient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+		return true
+	}
+
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "connection closed"):
+		return true
+	case strings.Contains(message, "client closed"):
+		return true
+	case strings.Contains(message, "closed pipe"):
+		return true
+	case strings.Contains(message, "broken pipe"):
+		return true
+	case strings.Contains(message, "use of closed network connection"):
+		return true
+	case strings.Contains(message, "file already closed"):
+		return true
+	case strings.Contains(message, "eof"):
+		return true
+	default:
+		return false
 	}
 }
 

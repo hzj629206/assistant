@@ -30,6 +30,8 @@ const claudeAgentSDKVersion = "go-local"
 const claudeCodeTerminateTimeout = 2 * time.Second
 const defaultClaudeCodeSessionIdleTimeout = 10 * time.Minute
 
+var errClaudeProcessExited = errors.New("claude code process exited")
+
 // ClaudeCodeRunner bridges dispatcher turns to the Claude Code CLI through claude-code-go.
 // Claude sessions are reused per conversation while idle and restarted from the stored
 // Claude session ID after eviction or process failure.
@@ -1580,12 +1582,13 @@ func parseClaudeUsageInt(value any) int {
 }
 
 func (s *claudePersistentProcessSession) watchExit() {
-	err := awaitClaudeProcess(s.waitCh)
+	rawWaitErr := awaitClaudeProcess(s.waitCh)
+	err := ignoreExpectedClaudeExit(rawWaitErr)
 	s.stateMu.Lock()
 	closed := s.closed
 	if s.waitErr == nil {
 		if err == nil && !closed {
-			err = errors.New("claude code process exited")
+			err = errClaudeProcessExited
 		}
 		s.waitErr = err
 	}
@@ -1593,7 +1596,21 @@ func (s *claudePersistentProcessSession) watchExit() {
 	s.stateMu.Unlock()
 	close(s.exitDone)
 
-	log.Printf("claude code runner persistent process wait returned: conversation=%s pid=%d err=%v", s.conversationKey, s.cmd.Process.Pid, err)
+	if rawWaitErr == nil {
+		log.Printf("claude code runner persistent process exited: conversation=%s pid=%d closed=%t", s.conversationKey, s.cmd.Process.Pid, closed)
+	} else {
+		var exitErr *exec.ExitError
+		if errors.As(rawWaitErr, &exitErr) && exitErr.ProcessState != nil {
+			waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+			if ok && waitStatus.Signaled() {
+				log.Printf("claude code runner persistent process exited: conversation=%s pid=%d closed=%t", s.conversationKey, s.cmd.Process.Pid, closed)
+			} else {
+				log.Printf("claude code runner persistent process wait returned: conversation=%s pid=%d err=%v", s.conversationKey, s.cmd.Process.Pid, rawWaitErr)
+			}
+		} else {
+			log.Printf("claude code runner persistent process wait returned: conversation=%s pid=%d err=%v", s.conversationKey, s.cmd.Process.Pid, rawWaitErr)
+		}
+	}
 	if turn != nil && err != nil {
 		turn.errCh <- err
 	}
@@ -1650,6 +1667,9 @@ func (s *claudePersistentProcessSession) Close() error {
 	s.stateMu.Unlock()
 	<-s.stderrDone
 	<-s.scanDone
+	if errors.Is(err, errClaudeProcessExited) {
+		return nil
+	}
 	return err
 }
 
@@ -1851,6 +1871,29 @@ func awaitClaudeProcess(waitCh <-chan error) error {
 	}
 
 	return <-waitCh
+}
+
+func ignoreExpectedClaudeExit(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ProcessState == nil {
+		return err
+	}
+
+	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !waitStatus.Signaled() {
+		return err
+	}
+
+	switch waitStatus.Signal() {
+	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
+		return nil
+	default:
+		return err
+	}
 }
 
 func signalClaudeProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -875,4 +876,64 @@ func fakeClaudeExecCmd(pid int) *exec.Cmd {
 		},
 	}
 	return cmd
+}
+
+func TestIgnoreExpectedClaudeExitReturnsNilForSIGTERM(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "kill -TERM $$")
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	if got := ignoreExpectedClaudeExit(err); got != nil {
+		t.Fatalf("ignoreExpectedClaudeExit returned %v, want nil", got)
+	}
+}
+
+func TestIgnoreExpectedClaudeExitPreservesNonSignalExit(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "exit 7")
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	got := ignoreExpectedClaudeExit(err)
+	if got == nil {
+		t.Fatal("ignoreExpectedClaudeExit returned nil, want error")
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(got, &exitErr) {
+		t.Fatalf("ignoreExpectedClaudeExit returned %T, want *exec.ExitError", got)
+	}
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); !ok || status.ExitStatus() != 7 {
+		t.Fatalf("unexpected wait status: %#v", exitErr.Sys())
+	}
+}
+
+func TestClaudePersistentProcessSessionCloseIgnoresUnexpectedExitSentinel(t *testing.T) {
+	t.Parallel()
+
+	exitDone := make(chan struct{})
+	close(exitDone)
+	stderrDone := make(chan struct{})
+	close(stderrDone)
+	scanDone := make(chan struct{})
+	close(scanDone)
+
+	session := &claudePersistentProcessSession{
+		cmd:        fakeClaudeExecCmd(12345),
+		waitErr:    errClaudeProcessExited,
+		exitDone:   exitDone,
+		stderrDone: stderrDone,
+		scanDone:   scanDone,
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close returned %v, want nil", err)
+	}
 }

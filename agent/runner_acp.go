@@ -590,25 +590,28 @@ func newACPProcessSession(ctx context.Context, options acpSessionOptions) (*acpP
 	})
 
 	session.wg.Go(func() {
-		waitErr := cmd.Wait()
+		rawWaitErr := cmd.Wait()
+		waitErr := ignoreExpectedACPExit(rawWaitErr)
 		session.closed.Store(true)
-		if waitErr != nil {
+		if rawWaitErr == nil {
+			log.Printf("acp process exited")
+		} else {
 			var exitErr *exec.ExitError
-			if !errors.As(waitErr, &exitErr) || exitErr.ProcessState == nil {
+			if !errors.As(rawWaitErr, &exitErr) || exitErr.ProcessState == nil {
 				message := strings.TrimSpace(stderrBuf.String())
 				if message != "" {
-					log.Printf("acp process exited: err=%v stderr=%s", waitErr, message)
+					log.Printf("acp process exited: err=%v stderr=%s", rawWaitErr, message)
 				} else {
-					log.Printf("acp process exited: err=%v", waitErr)
+					log.Printf("acp process exited: err=%v", rawWaitErr)
 				}
 			} else {
 				waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
 				if !ok || waitStatus.Signal() == 0 {
 					message := strings.TrimSpace(stderrBuf.String())
 					if message != "" {
-						log.Printf("acp process exited: err=%v stderr=%s", waitErr, message)
+						log.Printf("acp process exited: err=%v stderr=%s", rawWaitErr, message)
 					} else {
-						log.Printf("acp process exited: err=%v", waitErr)
+						log.Printf("acp process exited: err=%v", rawWaitErr)
 					}
 				} else {
 					log.Printf("acp process exited")
@@ -1274,6 +1277,29 @@ func signalACPProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
 		return nil
 	}
 	return err
+}
+
+func ignoreExpectedACPExit(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ProcessState == nil {
+		return err
+	}
+
+	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !waitStatus.Signaled() {
+		return err
+	}
+
+	switch waitStatus.Signal() {
+	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
+		return nil
+	default:
+		return err
+	}
 }
 
 type acpRPCTransport struct {

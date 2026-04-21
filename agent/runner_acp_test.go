@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -181,6 +184,43 @@ func TestACPRunnerCloseClosesManagedSessions(t *testing.T) {
 	}
 	if err := runner.Close(); err != nil {
 		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+func TestIgnoreExpectedACPExitReturnsNilForSIGTERM(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "kill -TERM $$")
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	if got := ignoreExpectedACPExit(err); got != nil {
+		t.Fatalf("ignoreExpectedACPExit returned %v, want nil", got)
+	}
+}
+
+func TestIgnoreExpectedACPExitPreservesNonSignalExit(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "exit 7")
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	got := ignoreExpectedACPExit(err)
+	if got == nil {
+		t.Fatal("ignoreExpectedACPExit returned nil, want error")
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(got, &exitErr) {
+		t.Fatalf("ignoreExpectedACPExit returned %T, want *exec.ExitError", got)
+	}
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); !ok || status.ExitStatus() != 7 {
+		t.Fatalf("unexpected wait status: %#v", exitErr.Sys())
 	}
 }
 

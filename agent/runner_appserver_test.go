@@ -349,6 +349,73 @@ func TestAppServerRunTurnDoesNotPassSystemPromptAsDeveloperInstructionsOnResume(
 	}
 }
 
+func TestAppServerRunTurnInvalidatesRecoverableRPCClientError(t *testing.T) {
+	t.Parallel()
+
+	clientClosed := false
+	runner := &AppServerRunner{
+		rpcClient: &apprpc.Client{},
+		closeFn:   func() error { clientClosed = true; return nil },
+		resumeThread: func(_ context.Context, _ appcodex.ThreadResumeOptions) (appServerThread, error) {
+			return nil, errors.New("connection closed")
+		},
+		activeTurns: make(map[string]appServerActiveTurn),
+	}
+
+	_, err := runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{RunnerThreadID: "thread-existing"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err == nil {
+		t.Fatal("RunTurn returned nil error")
+	}
+	if runner.rpcClient != nil {
+		t.Fatal("expected rpcClient to be invalidated")
+	}
+	if runner.startThread != nil || runner.resumeThread != nil {
+		t.Fatal("expected rpc thread hooks to be cleared")
+	}
+	if !clientClosed {
+		t.Fatal("expected invalidation to close the old client")
+	}
+}
+
+func TestEnsureRPCClientRecreatesMissingClient(t *testing.T) {
+	t.Parallel()
+
+	createCount := 0
+	runner := &AppServerRunner{
+		canRecoverRPCClient: true,
+		rpcClientFactory: func(context.Context, apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
+			createCount++
+			return &apprpc.Client{}, func() error { return nil }, true, nil
+		},
+		activeTurns: make(map[string]appServerActiveTurn),
+	}
+
+	if err := runner.ensureRPCClient(context.Background()); err != nil {
+		t.Fatalf("ensureRPCClient failed: %v", err)
+	}
+	if createCount != 1 {
+		t.Fatalf("unexpected create count after first ensure: %d", createCount)
+	}
+	if runner.rpcClient == nil {
+		t.Fatal("expected rpcClient to be recreated")
+	}
+	if runner.startThread == nil || runner.resumeThread == nil {
+		t.Fatal("expected rpc thread hooks to be rebound")
+	}
+
+	runner.bindRPCClient(nil, nil)
+
+	if err := runner.ensureRPCClient(context.Background()); err != nil {
+		t.Fatalf("second ensureRPCClient failed: %v", err)
+	}
+	if createCount != 2 {
+		t.Fatalf("unexpected create count after second ensure: %d", createCount)
+	}
+}
+
 func TestAppServerRunTurnUsesFrozenPromptSnapshotForNewThread(t *testing.T) {
 	t.Parallel()
 
