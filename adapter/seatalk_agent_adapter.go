@@ -86,14 +86,14 @@ Security restrictions:
 Working context:
 - Tasks may not be related to the current working directory. Do not assume file paths are based on it.
 
-Output restrictions:
-- Must use SeaTalk Markdown format and satisfy the restrictions.
-- Each top-level Markdown block must be no longer than 4K characters.
-
 SeaTalk Markdown restrictions:
 - SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.
 - SeaTalk Markdown italic and bold do not support nesting.
-- SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines.
+- SeaTalk Markdown lists support at most three nesting levels, and nested lists must be strictly compact without line breaks or blank lines.
+
+Output restrictions:
+- Must use SeaTalk Markdown format and satisfy the restrictions.
+- Each top-level paragraph, list, or code block must be no longer than 4K characters.
 
 User interactions:
 - When you need the user to choose between explicit actions, confirm a risky operation, or provide approval in SeaTalk, prefer sending an interactive message instead of a plain text question.
@@ -1279,47 +1279,32 @@ func normalizeSeaTalkMarkdown(value string) string {
 		return value
 	}
 
-	escaped := escapeSeaTalkMarkdownOrderedSectionNumbers(value)
-	source := []byte(escaped)
+	source := []byte(value)
 	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
 	edits := collectSeaTalkMarkdownEdits(document, source)
+	normalized := value
 	if len(edits) == 0 {
-		return escaped
+		normalized = value
+	} else {
+		normalized = applySeaTalkMarkdownEdits(source, edits)
 	}
 
-	return applySeaTalkMarkdownEdits(source, edits)
+	return escapeSeaTalkMarkdownOrderedSectionNumbers(normalized)
 }
 
 func escapeSeaTalkMarkdownOrderedSectionNumbers(value string) string {
-	lines := strings.SplitAfter(value, "\n")
-	if len(lines) == 0 {
+	if value == "" {
 		return value
 	}
 
-	var output strings.Builder
-	output.Grow(len(value) + len(lines))
-
-	inFence := false
-	for _, line := range lines {
-		numberEnd := 0
-		for numberEnd < len(line) && line[numberEnd] >= '0' && line[numberEnd] <= '9' {
-			numberEnd++
-		}
-
-		if !inFence && numberEnd > 0 && len(line) >= numberEnd+2 && line[numberEnd] == '.' && line[numberEnd+1] == ' ' {
-			output.WriteString(line[:numberEnd])
-			output.WriteString(`\.`)
-			output.WriteString(line[numberEnd+1:])
-		} else {
-			output.WriteString(line)
-		}
-
-		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
-			inFence = !inFence
-		}
+	source := []byte(value)
+	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
+	edits := seaTalkMarkdownOrderedSectionNumberEdits(document, source)
+	if len(edits) == 0 {
+		return value
 	}
 
-	return output.String()
+	return applySeaTalkMarkdownEdits(source, edits)
 }
 
 type seaTalkMarkdownEdit struct {
@@ -1362,9 +1347,7 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 			if seaTalkMarkdownListIsNested(list) {
 				edits = append(edits, seaTalkMarkdownNestedListIndentationEdits(list, source)...)
 			}
-			if list.IsTight {
-				return goldmarkast.WalkContinue, nil
-			}
+			edits = append(edits, seaTalkMarkdownListMarkerSpacingEdits(list, source)...)
 			edits = append(edits, seaTalkMarkdownListSpacingEdits(list, source)...)
 		}
 
@@ -1372,6 +1355,327 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 	})
 
 	return edits
+}
+
+// seaTalkMarkdownOrderedSectionNumberEdits escapes loose top-level ordered-list
+// markers so SeaTalk does not misrender them as numbered sections.
+func seaTalkMarkdownOrderedSectionNumberEdits(document goldmarkast.Node, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+
+	_ = goldmarkast.Walk(document, func(node goldmarkast.Node, entering bool) (goldmarkast.WalkStatus, error) {
+		if !entering {
+			return goldmarkast.WalkContinue, nil
+		}
+
+		list, ok := node.(*goldmarkast.List)
+		if !ok || !list.IsOrdered() || !seaTalkMarkdownListIsTopLevel(list) {
+			return goldmarkast.WalkContinue, nil
+		}
+
+		if seaTalkMarkdownListIsStrictTight(list) {
+			// SeaTalk Markdown doesn't support Markdown headings, and the model may use a top-level heading-like line,
+			// which looks like a single-item ordered list.
+			// So escaping the marker preserves the line as plain text instead of an ordered list item.
+			if list.ChildCount() != 1 {
+				return goldmarkast.WalkContinue, nil
+			}
+
+			listItem, ok := list.FirstChild().(*goldmarkast.ListItem)
+			if !ok || !seaTalkMarkdownListItemIsSimple(listItem) {
+				return goldmarkast.WalkContinue, nil
+			}
+
+			edit, ok := seaTalkMarkdownOrderedListItemMarkerEscapeEdit(listItem, source)
+			if ok {
+				edits = append(edits, edit)
+			}
+
+			return goldmarkast.WalkContinue, nil
+		}
+
+		edits = append(edits, seaTalkMarkdownPromoteLooseTopLevelOrderedListItemContinuationEdits(list, source)...)
+
+		for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+			listItem, ok := item.(*goldmarkast.ListItem)
+			if !ok {
+				continue
+			}
+
+			edit, ok := seaTalkMarkdownOrderedListItemMarkerEscapeEdit(listItem, source)
+			if ok {
+				edits = append(edits, edit)
+			}
+		}
+
+		return goldmarkast.WalkContinue, nil
+	})
+
+	return edits
+}
+
+func seaTalkMarkdownListIsStrictTight(list *goldmarkast.List) bool {
+	if list == nil || !list.IsTight {
+		return false
+	}
+
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		listItem, ok := item.(*goldmarkast.ListItem)
+		if !ok {
+			return false
+		}
+		if !seaTalkMarkdownListItemIsStrictTight(listItem) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func seaTalkMarkdownListItemIsStrictTight(listItem *goldmarkast.ListItem) bool {
+	if listItem == nil {
+		return false
+	}
+
+	hasNestedList := false
+	hasOtherBlock := false
+	for child := listItem.FirstChild(); child != nil; child = child.NextSibling() {
+		if _, ok := child.(*goldmarkast.List); ok {
+			hasNestedList = true
+			continue
+		}
+
+		hasOtherBlock = true
+		if !seaTalkMarkdownListItemBlockIsSingleLine(child) {
+			return false
+		}
+	}
+
+	if hasNestedList && hasOtherBlock {
+		return false
+	}
+
+	return hasNestedList || hasOtherBlock
+}
+
+func seaTalkMarkdownListItemIsSimple(listItem *goldmarkast.ListItem) bool {
+	if listItem == nil || listItem.ChildCount() != 1 {
+		return false
+	}
+
+	return seaTalkMarkdownListItemBlockIsSingleLine(listItem.FirstChild())
+}
+
+func seaTalkMarkdownListItemBlockIsSingleLine(node goldmarkast.Node) bool {
+	if node == nil {
+		return false
+	}
+
+	switch value := node.(type) {
+	case *goldmarkast.TextBlock:
+		lines := value.Lines()
+		return lines != nil && lines.Len() == 1
+	case *goldmarkast.Paragraph:
+		lines := value.Lines()
+		return lines != nil && lines.Len() == 1
+	default:
+		return false
+	}
+}
+
+// seaTalkMarkdownPromoteLooseTopLevelOrderedListItemContinuationEdits shifts
+// continuation lines inside loose top-level ordered items one level left.
+func seaTalkMarkdownPromoteLooseTopLevelOrderedListItemContinuationEdits(list *goldmarkast.List, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if list == nil {
+		return edits
+	}
+
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		listItem, ok := item.(*goldmarkast.ListItem)
+		if !ok {
+			continue
+		}
+
+		edits = append(edits, seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits(listItem, source)...)
+	}
+
+	return edits
+}
+
+// seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits rewrites every
+// continuation line after the ordered item's first line with one less indent
+// level, removing either one leading tab or up to four leading spaces.
+func seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits(listItem *goldmarkast.ListItem, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if listItem == nil {
+		return edits
+	}
+
+	firstLineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
+	position := seaTalkMarkdownLineEnd(source, firstLineStart)
+	if position < len(source) && source[position] == '\n' {
+		position++
+	}
+
+	stop := seaTalkMarkdownNodeStop(listItem, source)
+	for position < stop {
+		lineStart := position
+		edit, ok := seaTalkMarkdownPromoteOrderedListItemLineIndentationEdit(lineStart, source)
+		if ok {
+			edits = append(edits, edit)
+		}
+
+		position = seaTalkMarkdownLineEnd(source, lineStart)
+		if position < len(source) && source[position] == '\n' {
+			position++
+		}
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownPromoteOrderedListItemLineIndentationEdit(lineStart int, source []byte) (seaTalkMarkdownEdit, bool) {
+	if lineStart < 0 || lineStart >= len(source) {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	lineEnd := seaTalkMarkdownLineEnd(source, lineStart)
+	if lineEnd <= lineStart {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	switch source[lineStart] {
+	case '\t':
+		return seaTalkMarkdownEdit{
+			start:       lineStart,
+			stop:        lineStart + 1,
+			replacement: "",
+		}, true
+	case ' ':
+		stop := lineStart
+		for stop < lineEnd && stop-lineStart < 4 && source[stop] == ' ' {
+			stop++
+		}
+		if stop == lineStart {
+			return seaTalkMarkdownEdit{}, false
+		}
+		return seaTalkMarkdownEdit{
+			start:       lineStart,
+			stop:        stop,
+			replacement: "",
+		}, true
+	default:
+		return seaTalkMarkdownEdit{}, false
+	}
+}
+
+func seaTalkMarkdownOrderedListItemMarkerEscapeEdit(listItem *goldmarkast.ListItem, source []byte) (seaTalkMarkdownEdit, bool) {
+	if listItem == nil {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	lineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
+	lineEnd := seaTalkMarkdownLineEnd(source, lineStart)
+	if lineStart < 0 || lineStart >= len(source) || lineEnd <= lineStart {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	position := lineStart
+	for position < lineEnd && source[position] == ' ' {
+		position++
+	}
+
+	numberStart := position
+	for position < lineEnd && source[position] >= '0' && source[position] <= '9' {
+		position++
+	}
+	if position == numberStart || position >= lineEnd || source[position] != '.' {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	return seaTalkMarkdownEdit{
+		start:       position,
+		stop:        position + 1,
+		replacement: `\.`,
+	}, true
+}
+
+// seaTalkMarkdownListMarkerSpacingEdits normalizes whitespace after list
+// markers so SeaTalk sees a single-space separator consistently.
+func seaTalkMarkdownListMarkerSpacingEdits(list *goldmarkast.List, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if list == nil {
+		return edits
+	}
+
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		listItem, ok := item.(*goldmarkast.ListItem)
+		if !ok {
+			continue
+		}
+
+		edit, ok := seaTalkMarkdownListItemMarkerSpacingEdit(listItem, source)
+		if ok {
+			edits = append(edits, edit)
+		}
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownListItemMarkerSpacingEdit(listItem *goldmarkast.ListItem, source []byte) (seaTalkMarkdownEdit, bool) {
+	if listItem == nil {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	lineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
+	lineEnd := seaTalkMarkdownLineEnd(source, lineStart)
+	if lineStart < 0 || lineStart >= len(source) || lineEnd <= lineStart {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	markerStart := lineStart
+	for markerStart < lineEnd && (source[markerStart] == ' ' || source[markerStart] == '\t') {
+		markerStart++
+	}
+	if markerStart >= lineEnd {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	markerStop := markerStart
+	switch source[markerStart] {
+	case '-', '*', '+':
+		markerStop++
+	default:
+		for markerStop < lineEnd && source[markerStop] >= '0' && source[markerStop] <= '9' {
+			markerStop++
+		}
+		if markerStop == markerStart || markerStop >= lineEnd {
+			return seaTalkMarkdownEdit{}, false
+		}
+		if source[markerStop] != '.' && source[markerStop] != ')' {
+			return seaTalkMarkdownEdit{}, false
+		}
+		markerStop++
+	}
+
+	spaceStart := markerStop
+	spaceStop := spaceStart
+	for spaceStop < lineEnd && (source[spaceStop] == ' ' || source[spaceStop] == '\t') {
+		spaceStop++
+	}
+	if spaceStop == spaceStart {
+		return seaTalkMarkdownEdit{}, false
+	}
+	if spaceStop-spaceStart == 1 && source[spaceStart] == ' ' {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	return seaTalkMarkdownEdit{
+		start:       spaceStart,
+		stop:        spaceStop,
+		replacement: " ",
+	}, true
 }
 
 // seaTalkMarkdownItalicToBoldEdits rewrites tight inline italic into bold so
@@ -1548,18 +1852,16 @@ func seaTalkMarkdownListNeedsCompaction(list *goldmarkast.List) bool {
 	if list == nil {
 		return false
 	}
-	if list.IsOrdered() {
-		return true
+	return !seaTalkMarkdownListIsTopLevel(list)
+}
+
+func seaTalkMarkdownListIsTopLevel(list *goldmarkast.List) bool {
+	if list == nil {
+		return false
 	}
 
-	for parent := list.Parent(); parent != nil; parent = parent.Parent() {
-		ancestorList, ok := parent.(*goldmarkast.List)
-		if ok && ancestorList.IsOrdered() {
-			return true
-		}
-	}
-
-	return false
+	_, ok := list.Parent().(*goldmarkast.ListItem)
+	return !ok
 }
 
 func seaTalkMarkdownListItemNeedsCompaction(node goldmarkast.Node) bool {
@@ -1604,6 +1906,14 @@ func seaTalkMarkdownNestedListIndentationEdits(list *goldmarkast.List, source []
 		return edits
 	}
 
+	parentListItem, ok := list.Parent().(*goldmarkast.ListItem)
+	if !ok {
+		return edits
+	}
+
+	parentActualIndent := seaTalkMarkdownListItemIndentation(parentListItem, source)
+	parentNormalizedIndent := seaTalkMarkdownNormalizedListItemIndentation(parentListItem, source)
+
 	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
 		listItem, ok := item.(*goldmarkast.ListItem)
 		if !ok {
@@ -1611,24 +1921,91 @@ func seaTalkMarkdownNestedListIndentationEdits(list *goldmarkast.List, source []
 		}
 
 		lineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
-		if lineStart+2 > len(source) {
+		indentStop, actualIndent := seaTalkMarkdownLineIndentationSpan(source, lineStart)
+		if actualIndent < parentActualIndent {
 			continue
 		}
-		if source[lineStart] != ' ' || source[lineStart+1] != ' ' {
+
+		relativeIndent := actualIndent - parentActualIndent
+		if relativeIndent != 2 && relativeIndent != 3 {
 			continue
 		}
-		if lineStart+3 < len(source) && source[lineStart+2] == ' ' && source[lineStart+3] == ' ' {
+
+		desiredIndent := parentNormalizedIndent + 4
+		if desiredIndent == actualIndent {
 			continue
 		}
 
 		edits = append(edits, seaTalkMarkdownEdit{
 			start:       lineStart,
-			stop:        lineStart + 2,
-			replacement: "    ",
+			stop:        indentStop,
+			replacement: strings.Repeat(" ", desiredIndent),
 		})
 	}
 
 	return edits
+}
+
+func seaTalkMarkdownListItemIndentation(listItem *goldmarkast.ListItem, source []byte) int {
+	if listItem == nil {
+		return 0
+	}
+
+	lineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
+	_, indent := seaTalkMarkdownLineIndentationSpan(source, lineStart)
+
+	return indent
+}
+
+func seaTalkMarkdownLineIndentationSpan(source []byte, lineStart int) (int, int) {
+	if lineStart < 0 {
+		lineStart = 0
+	}
+	if lineStart > len(source) {
+		lineStart = len(source)
+	}
+
+	lineEnd := seaTalkMarkdownLineEnd(source, lineStart)
+	position := lineStart
+	indentWidth := 0
+	for position < lineEnd {
+		switch source[position] {
+		case ' ':
+			indentWidth++
+		case '\t':
+			indentWidth += 4
+		default:
+			return position, indentWidth
+		}
+		position++
+	}
+
+	return position, indentWidth
+}
+
+func seaTalkMarkdownNormalizedListItemIndentation(listItem *goldmarkast.ListItem, source []byte) int {
+	if listItem == nil {
+		return 0
+	}
+
+	parentList, ok := listItem.Parent().(*goldmarkast.List)
+	if !ok || seaTalkMarkdownListIsTopLevel(parentList) {
+		return seaTalkMarkdownListItemIndentation(listItem, source)
+	}
+
+	parentListItem, ok := parentList.Parent().(*goldmarkast.ListItem)
+	if !ok {
+		return seaTalkMarkdownListItemIndentation(listItem, source)
+	}
+
+	parentActualIndent := seaTalkMarkdownListItemIndentation(parentListItem, source)
+	actualIndent := seaTalkMarkdownListItemIndentation(listItem, source)
+	relativeIndent := actualIndent - parentActualIndent
+	if relativeIndent == 2 || relativeIndent == 3 {
+		relativeIndent = 4
+	}
+
+	return seaTalkMarkdownNormalizedListItemIndentation(parentListItem, source) + relativeIndent
 }
 
 // seaTalkMarkdownBlankLineEditBeforePosition removes the contiguous blank lines

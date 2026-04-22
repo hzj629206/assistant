@@ -156,12 +156,12 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 		t.Fatalf("system prompt missing nested emphasis guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
-		!strings.Contains(prompt, "Each top-level Markdown block must be no longer than 4K characters.") ||
+		!strings.Contains(prompt, "Each top-level paragraph, list, or code block must be no longer than 4K characters.") ||
 		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") {
 		t.Fatalf("system prompt missing output restriction guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown lists must be compact and must not contain line breaks or blank lines.") {
-		t.Fatalf("system prompt missing list item line break guidance: %q", prompt)
+	if !strings.Contains(prompt, "SeaTalk Markdown lists support at most three nesting levels, and nested lists must be strictly compact without line breaks or blank lines.") {
+		t.Fatalf("system prompt missing nested list compactness guidance: %q", prompt)
 	}
 	if strings.Contains(prompt, "Must use bold instead of italic when emphasizing East Asian text.") {
 		t.Fatalf("system prompt should not include East Asian emphasis guidance: %q", prompt)
@@ -2069,7 +2069,7 @@ func TestSeaTalkResponderSendTextRemovesBlankLinesBetweenListItems(t *testing.T)
 				t.Fatalf("unexpected group message format: %d", body.Message.Text.Format)
 			}
 
-			expected := "- item 1\n\n- item 2\n\n\t- item 2a\n\n3\\. item 3"
+				expected := "- item 1\n\n- item 2\n\n\t- item 2a\n\n3\\. item 3"
 			if body.Message.Text.Content != expected {
 				t.Fatalf("unexpected group message content: %q", body.Message.Text.Content)
 			}
@@ -2169,13 +2169,37 @@ func TestNormalizeSeaTalkMarkdownPreservesParagraphAndCodeFenceBlankLines(t *tes
 	}
 }
 
-func TestNormalizeSeaTalkMarkdownEscapesTopLevelOrderedSectionNumbers(t *testing.T) {
+func TestNormalizeSeaTalkMarkdownEscapesLooseTopLevelOrderedListMarkers(t *testing.T) {
 	t.Parallel()
 
-	text := "1. Overview\n10. Details\n\n  20. Keep as-is\n```md\n12. code sample\n```\n200. Summary"
+	text := "1. first item\n\n2. second item"
 	got := normalizeSeaTalkMarkdown(text)
 
-	want := "1\\. Overview\n10\\. Details\n\n  20. Keep as-is\n```\n12. code sample\n```\n200\\. Summary"
+	want := "1\\. first item\n\n2\\. second item"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownEscapesSingleItemStrictTightTopLevelOrderedListMarker(t *testing.T) {
+	t.Parallel()
+
+	text := "1. only item"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "1\\. only item"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPreservesTightTopLevelOrderedListMarkers(t *testing.T) {
+	t.Parallel()
+
+	text := "1. first item\n2. second item"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "1. first item\n2. second item"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
 	}
@@ -2193,13 +2217,109 @@ func TestNormalizeSeaTalkMarkdownConvertsNestedListTwoSpaceIndentationToFourSpac
 	}
 }
 
+func TestNormalizeSeaTalkMarkdownConvertsNestedListThreeSpaceIndentationToFourSpaces(t *testing.T) {
+	t.Parallel()
+
+	text := "- item 1\n   - item 1a\n   - item 1b\n- item 2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- item 1\n    - item 1a\n    - item 1b\n- item 2"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
 func TestNormalizeSeaTalkMarkdownCompactsUnorderedListNestedInsideOrderedList(t *testing.T) {
 	t.Parallel()
 
 	text := "Topic:\n  1. parent item\n\n     - child item 1\n\n     - child item 2\n       continued line"
 	got := normalizeSeaTalkMarkdown(text)
 
-	want := "Topic:\n  1. parent item\n\n     - child item 1\n     - child item 2 continued line"
+	want := "Topic:\n  1\\. parent item\n\n  - child item 1\n  - child item 2 continued line"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPromotesLooseTopLevelOrderedListItemContinuationLines(t *testing.T) {
+	t.Parallel()
+
+	text := "1. parent item\n\n   - child item\n\n      * grandchild item\n\n2. another parent"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "1\\. parent item\n\n- child item\n\n    * grandchild item\n\n2\\. another parent"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPromotesLooseTopLevelOrderedListItemContinuationLinesWithTabs(t *testing.T) {
+	t.Parallel()
+
+	text := "1. parent item\n\n\t- child item\n\n\t\t* grandchild item\n\n2. another parent"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "1\\. parent item\n\n- child item\n\n\t* grandchild item\n\n2\\. another parent"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownTreatsGoldmarkTightMixedOrderedListAsNonStrictTight(t *testing.T) {
+	t.Parallel()
+
+	text := "1.\t第一项\n\t这里有一些使用 tab 缩进的文本\n\t继续第一项的内容\n\t*\t嵌套无序列表项 A\n\t*\t嵌套无序列表项 B\n2.\t第二项\n\t第二项也有 tab 缩进\n\t和更多内容\n\t*\t嵌套无序列表项 C\n\t*\t嵌套无序列表项 D\n3.\t第三项\n\t简单的第三项\n\t*\t嵌套无序列表项 E\n"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "1\\. 第一项\n这里有一些使用 tab 缩进的文本\n继续第一项的内容\n* 嵌套无序列表项 A\n* 嵌套无序列表项 B\n2\\. 第二项\n第二项也有 tab 缩进\n和更多内容\n* 嵌套无序列表项 C\n* 嵌套无序列表项 D\n3\\. 第三项\n简单的第三项\n* 嵌套无序列表项 E\n"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownCompactsNestedOrderedListSpacing(t *testing.T) {
+	t.Parallel()
+
+	text := "- parent item\n  1. child item 1\n\n  2. child item 2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- parent item\n    1. child item 1\n    2. child item 2"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownCompactsNestedUnorderedListSpacingWithoutOrderedAncestor(t *testing.T) {
+	t.Parallel()
+
+	text := "- parent item\n  - child item 1\n\n  - child item 2\n    continued line"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- parent item\n    - child item 1\n    - child item 2 continued line"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownCompactsListMarkerSpacingToSingleSpace(t *testing.T) {
+	t.Parallel()
+
+	text := "*   第一层无序列表项 1\n    *   第二层无序列表项 1.1\n        1.  第三层有序列表项 1.1.1\n        2.  第三层有序列表项 1.1.2\n            *   第四层无序列表项 1.1.2.1\n            *   第四层无序列表项 1.1.2.2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "* 第一层无序列表项 1\n    * 第二层无序列表项 1.1\n        1. 第三层有序列表项 1.1.1\n        2. 第三层有序列表项 1.1.2\n            * 第四层无序列表项 1.1.2.1\n            * 第四层无序列表项 1.1.2.2"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownNormalizesNestedIndentationRelativeToParent(t *testing.T) {
+	t.Parallel()
+
+	text := "**纯无序列表嵌套**\n* 第一层\n  * 第二层\n    * 第三层\n  * 第二层另一个\n* 第一层另一个"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "**纯无序列表嵌套**\n* 第一层\n    * 第二层\n        * 第三层\n    * 第二层另一个\n* 第一层另一个"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
 	}
