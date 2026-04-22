@@ -191,13 +191,8 @@ func (r *CodexRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult,
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
 	}
 
-	typing := newTypingStatusController(
-		req.Message.Responder,
-		defaultTypingInitialDelay,
-		defaultTypingRefreshCooldown,
-	)
-	typing.Start(ctx)
-	defer typing.Stop()
+	stopTyping := startTyping(ctx, req.Message.Responder)
+	defer stopTyping()
 
 	var replyText string
 	if len(tools) == 0 {

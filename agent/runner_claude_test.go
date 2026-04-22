@@ -608,7 +608,7 @@ func TestClaudeCodeRunnerApplyArgumentFilesCachesPaths(t *testing.T) {
 		_ = runner.Close()
 	})
 
-	args := claudecode.BuildProcessArgs(&options)
+	args := claudecode.BuildCLIArgs(&options)
 	if !slices.Contains(args, "--system-prompt-file") || !slices.Contains(args, "--append-system-prompt-file") || !slices.Contains(args, "--mcp-config") {
 		t.Fatalf("expected prompt and mcp args, got %q", args)
 	}

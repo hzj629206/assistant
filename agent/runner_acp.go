@@ -315,13 +315,8 @@ func (r *ACPRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, e
 		len(tools),
 	)
 
-	typing := newTypingStatusController(
-		req.Message.Responder,
-		defaultTypingInitialDelay,
-		defaultTypingRefreshCooldown,
-	)
-	typing.Start(ctx)
-	defer typing.Stop()
+	stopTyping := startTyping(ctx, req.Message.Responder)
+	defer stopTyping()
 
 	replyText, err := session.session.RunPrompt(ctx, promptBlocks)
 	if err != nil {

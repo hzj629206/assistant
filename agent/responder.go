@@ -107,3 +107,18 @@ func (c *typingStatusController) Stop() {
 	})
 	c.wg.Wait()
 }
+
+// startTyping starts typing status updates for one turn and returns a stop function.
+func startTyping(ctx context.Context, responder Responder) func() {
+	typing := newTypingStatusController(
+		responder,
+		defaultTypingInitialDelay,
+		defaultTypingRefreshCooldown,
+	)
+	if typing == nil {
+		return func() {}
+	}
+
+	typing.Start(ctx)
+	return typing.Stop
+}

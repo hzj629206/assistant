@@ -444,14 +444,8 @@ func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRes
 	)
 
 	inputs := r.buildTurnInputs(req)
-
-	typing := newTypingStatusController(
-		req.Message.Responder,
-		defaultTypingInitialDelay,
-		defaultTypingRefreshCooldown,
-	)
-	typing.Start(ctx)
-	defer typing.Stop()
+	stopTyping := startTyping(ctx, req.Message.Responder)
+	defer stopTyping()
 
 	log.Printf("app-server runner executing turn: conversation=%s mode=direct", req.Conversation.Key)
 	r.setActiveTurn(thread.ID(), "", req, turnContext.tools)

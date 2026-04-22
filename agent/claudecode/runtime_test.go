@@ -10,7 +10,7 @@ import (
 func TestBuildProcessArgsUsesFileFlagsOnlyForExistingFiles(t *testing.T) {
 	t.Parallel()
 
-	inlineArgs := BuildProcessArgs(&RunOptions{
+	inlineArgs := BuildCLIArgs(&RunOptions{
 		SystemPrompt: "inline system prompt",
 		AppendPrompt: "inline append prompt",
 	})
@@ -33,7 +33,7 @@ func TestBuildProcessArgsUsesFileFlagsOnlyForExistingFiles(t *testing.T) {
 		t.Fatalf("WriteFile append prompt failed: %v", err)
 	}
 
-	fileArgs := BuildProcessArgs(&RunOptions{
+	fileArgs := BuildCLIArgs(&RunOptions{
 		SystemPrompt: systemPath,
 		AppendPrompt: appendPath,
 	})

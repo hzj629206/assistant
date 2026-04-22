@@ -161,22 +161,13 @@ func (r *ClaudeCodeRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnRe
 
 	prompt, imagePaths := r.buildTurnPrompt(req)
 
-	typing := newTypingStatusController(
-		req.Message.Responder,
-		defaultTypingInitialDelay,
-		defaultTypingRefreshCooldown,
-	)
-	typing.Start(ctx)
-	defer typing.Stop()
-
 	sessionID := req.Conversation.RunnerThreadID
 	_, tools := r.globalContext()
 	log.Printf("claude code runner executing turn: conversation=%s session_id=%s tool_count=%d", req.Conversation.Key, sessionID, len(tools))
-	var (
-		result *claudecode.ClaudeResult
-		err    error
-	)
-	result, err = r.runClaudeTurn(ctx, req, prompt, imagePaths, sessionID)
+	stopTyping := startTyping(ctx, req.Message.Responder)
+	defer stopTyping()
+
+	result, err := r.runClaudeTurn(ctx, req, prompt, imagePaths, sessionID)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("run claude code turn failed: %w", err)
 	}

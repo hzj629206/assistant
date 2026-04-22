@@ -300,11 +300,6 @@ func shouldUseFileArgument(path string) bool {
 	return !info.IsDir()
 }
 
-// BuildProcessArgs builds the Claude CLI argv for one process execution.
-func BuildProcessArgs(opts *RunOptions) []string {
-	return BuildCLIArgs(opts)
-}
-
 // BuildStreamProcessArgs builds the Claude CLI argv for one persistent stream session.
 func BuildStreamProcessArgs(opts *RunOptions) []string {
 	if opts == nil {
