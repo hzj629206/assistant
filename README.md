@@ -91,7 +91,6 @@ This Codex-specific setting is managed by the local `Codex CLI`, not by this rep
 ## Onboarding
 
 Before running the service in production or for SeaTalk callback testing, complete the following setup:
-Restrict the bot's access scope to the minimum necessary to reduce the risk of misuse, abuse, and attacks by others.
 
 1. Create an application on the SeaTalk Open Platform and enable the Bot capability. See the SeaTalk guide: <https://open.seatalk.io/docs/quickly-build-a-bot>.
    In the app permission page, manually enable `Get Thread by Thread ID in Group Chat`. This permission is not selected by default.
@@ -99,7 +98,7 @@ Restrict the bot's access scope to the minimum necessary to reduce the risk of m
    The bot can attach employee information to private-thread context when that capability is enabled.
    That capability requires additional platform approval and is disabled by default in this service through the `seatalk.employee_info_enabled` configuration toggle.
 2. Set up `Nginx` on a machine with public internet access, and configure the domain, HTTPS, and reverse proxy for this service.
-3. Run this project. If the service runs on a local machine without public inbound access, expose the callback endpoint through one of the supported traffic-entry approaches:
+3. Run this project with SeaTalk Bot `app_id`/`app_secret`/`signing_secret` obtained in step 1. If the service runs on a local machine without public inbound access, expose the callback endpoint through one of the supported traffic-entry approaches:
    - Use the built-in reverse SSH forwarding support so a public `Nginx` host can reach the callback endpoint through `tunnel.ssh_addr`, `tunnel.ssh_user`, and `tunnel.ssh_key`.
    - Or use the built-in `Cloudflare Tunnel` integration through `tunnel.cloudflared_token` to publish the local service through a public HTTPS endpoint managed by Cloudflare.
 
@@ -113,6 +112,8 @@ Restrict the bot's access scope to the minimum necessary to reduce the risk of m
    When `tunnel.cloudflared_token` is configured and `tunnel.ssh_addr` is empty, the service starts `cloudflared tunnel run --token <token>` and forwards traffic to the local `listen_addr`.
    You must configure the Cloudflare Tunnel route separately so the public hostname points to this local HTTP service port.
 4. Configure the SeaTalk callback URL as `https://<domain>/callback` in the SeaTalk platform. If you use `Cloudflare Tunnel`, use the public HTTPS URL provided by that tunnel. If you use reverse SSH forwarding, use the public domain served by your `Nginx` host.
+
+Security note: Restrict the bot's access scope to the minimum necessary to reduce the risk of misuse, abuse, and attacks by others.
 
 ## Configuration
 
