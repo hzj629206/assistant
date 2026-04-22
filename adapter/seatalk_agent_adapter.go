@@ -87,8 +87,8 @@ Working context:
 - Tasks may not be related to the current working directory. Do not assume file paths are based on it.
 
 Output restrictions:
-- Replies must be no longer than 4K characters.
 - Must use SeaTalk Markdown format and satisfy the restrictions.
+- Each top-level Markdown block must be no longer than 4K characters.
 
 SeaTalk Markdown restrictions:
 - SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.
@@ -1220,16 +1220,14 @@ func (r *SeaTalkResponder) SendText(ctx context.Context, text string) error {
 	}
 
 	text = normalizeSeaTalkMarkdown(text)
-	textParts, err := splitSeaTalkText(text, seatalkTextMessageMaxChars)
-	if err != nil {
-		return err
-	}
+	textParts := splitSeaTalkText(text, seatalkTextMessageMaxChars)
 	log.Printf(
 		"seatalk responder sending text: target=%s text_len=%d chunk_count=%d",
 		r.target.logValue(),
 		utf8.RuneCountInString(text),
 		len(textParts),
 	)
+	var err error
 
 	if r.target.isGroup {
 		for index, part := range textParts {
@@ -1723,12 +1721,12 @@ func seaTalkMarkdownLineEnd(source []byte, position int) int {
 }
 
 // splitSeaTalkText chunks a reply into SeaTalk-sized text messages while preferring natural separators.
-func splitSeaTalkText(text string, maxChars int) ([]string, error) {
+func splitSeaTalkText(text string, maxChars int) []string {
 	if text == "" {
-		return nil, nil
+		return nil
 	}
 	if maxChars <= 0 || utf8.RuneCountInString(text) <= maxChars {
-		return []string{text}, nil
+		return []string{text}
 	}
 
 	blocks := splitSeaTalkMarkdownTopLevelBlocks(text)
@@ -1738,11 +1736,12 @@ func splitSeaTalkText(text string, maxChars int) ([]string, error) {
 	for _, block := range blocks {
 		blockLen := utf8.RuneCountInString(block)
 		if blockLen > maxChars {
-			return nil, fmt.Errorf(
-				"SeaTalk reply contains a top-level Markdown block longer than 4K characters (%d > %d); shorten that single paragraph, list, or code block and retry",
+			log.Printf(
+				"seatalk responder truncating oversized markdown block: block_len=%d max_chars=%d",
 				blockLen,
 				maxChars,
 			)
+			block = truncateSeaTalkBlock(block, maxChars)
 		}
 
 		if current.Len() == 0 {
@@ -1765,7 +1764,123 @@ func splitSeaTalkText(text string, maxChars int) ([]string, error) {
 		parts = append(parts, current.String())
 	}
 
-	return parts, nil
+	return parts
+}
+
+func seaTalkOversizedBlockNotice(maxChars int, inCodeBlock bool) string {
+	notice := "_[Content truncated: a top-level Markdown block exceeded SeaTalk's 4K-character limit.]_"
+	if inCodeBlock {
+		notice = "[Content truncated: a top-level Markdown block exceeded SeaTalk's 4K-character limit.]"
+	}
+	return truncateRunes(notice, maxChars)
+}
+
+func truncateSeaTalkBlock(block string, maxChars int) string {
+	if maxChars <= 0 {
+		return ""
+	}
+
+	if openingFence, body, closingFence, suffix, ok := splitSeaTalkCodeBlock(block); ok {
+		truncated := truncateSeaTalkBlockByLine(body, maxChars, openingFence, closingFence+suffix, true)
+		if truncated != "" {
+			if !strings.HasSuffix(truncated, "\n") {
+				truncated += "\n"
+			}
+			return openingFence + truncated + closingFence + suffix
+		}
+
+		fallback := openingFence + closingFence
+		notice := seaTalkOversizedBlockNotice(maxChars, true)
+		if utf8.RuneCountInString(fallback) > maxChars {
+			return truncateRunes(fallback, maxChars)
+		}
+		if notice == "" {
+			return fallback
+		}
+		if utf8.RuneCountInString(openingFence+notice+"\n"+closingFence+suffix) <= maxChars {
+			return openingFence + notice + "\n" + closingFence + suffix
+		}
+		if utf8.RuneCountInString(openingFence+notice+closingFence+suffix) <= maxChars {
+			return openingFence + notice + closingFence + suffix
+		}
+		return truncateRunes(openingFence+closingFence+suffix, maxChars)
+	}
+
+	return truncateSeaTalkBlockByLine(block, maxChars, "", "", false)
+}
+
+func truncateSeaTalkBlockByLine(content string, maxChars int, prefix string, suffix string, inCodeBlock bool) string {
+	notice := seaTalkOversizedBlockNotice(maxChars, inCodeBlock)
+	if notice == "" {
+		return ""
+	}
+
+	lines := strings.SplitAfter(content, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for len(lines) > 0 {
+		candidate := strings.Join(lines, "")
+		withNotice := appendSeaTalkTruncationNotice(candidate, notice, inCodeBlock)
+		if utf8.RuneCountInString(prefix+withNotice+suffix) <= maxChars {
+			return withNotice
+		}
+		lines = lines[:len(lines)-1]
+	}
+
+	if utf8.RuneCountInString(prefix+notice+suffix) <= maxChars {
+		return notice
+	}
+
+	return ""
+}
+
+func appendSeaTalkTruncationNotice(content string, notice string, inCodeBlock bool) string {
+	if content == "" {
+		return notice
+	}
+	if strings.HasSuffix(content, "\n") {
+		return content + notice
+	}
+	if inCodeBlock {
+		return content + "\n" + notice
+	}
+	return content + "\n\n" + notice
+}
+
+func splitSeaTalkCodeBlock(block string) (string, string, string, string, bool) {
+	if !strings.HasPrefix(block, "```") {
+		return "", "", "", "", false
+	}
+
+	openingEnd := strings.Index(block, "\n")
+	if openingEnd < 0 {
+		return "", "", "", "", false
+	}
+	openingFence := block[:openingEnd+1]
+	remainder := block[openingEnd+1:]
+
+	closingStart := strings.LastIndex(remainder, "\n```")
+	if closingStart < 0 {
+		if remainder == "```" {
+			return openingFence, "", "```", "", true
+		}
+		return "", "", "", "", false
+	}
+
+	body := remainder[:closingStart+1]
+	closingAndSuffix := remainder[closingStart+1:]
+	closingFenceEnd := len(closingAndSuffix)
+	if newline := strings.Index(closingAndSuffix, "\n"); newline >= 0 {
+		closingFenceEnd = newline
+	}
+	closingFence := closingAndSuffix[:closingFenceEnd]
+	suffix := closingAndSuffix[closingFenceEnd:]
+	if closingFence != "```" {
+		return "", "", "", "", false
+	}
+
+	return openingFence, body, closingFence, suffix, true
 }
 
 func splitSeaTalkMarkdownTopLevelBlocks(text string) []string {

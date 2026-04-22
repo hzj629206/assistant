@@ -156,7 +156,7 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 		t.Fatalf("system prompt missing nested emphasis guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
-		!strings.Contains(prompt, "Replies must be no longer than 4K characters.") ||
+		!strings.Contains(prompt, "Each top-level Markdown block must be no longer than 4K characters.") ||
 		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") {
 		t.Fatalf("system prompt missing output restriction guidance: %q", prompt)
 	}
@@ -1905,10 +1905,7 @@ func TestSplitSeaTalkTextSplitsByTopLevelMarkdownBlocks(t *testing.T) {
 		"Final paragraph.\n",
 	}, "")
 
-	parts, err := splitSeaTalkText(text, 60)
-	if err != nil {
-		t.Fatalf("split text failed: %v", err)
-	}
+	parts := splitSeaTalkText(text, 60)
 	if len(parts) != 3 {
 		t.Fatalf("unexpected chunk count: %d", len(parts))
 	}
@@ -1923,17 +1920,66 @@ func TestSplitSeaTalkTextSplitsByTopLevelMarkdownBlocks(t *testing.T) {
 	}
 }
 
-func TestSplitSeaTalkTextReturnsErrorForOversizedTopLevelMarkdownBlock(t *testing.T) {
+func TestSplitSeaTalkTextReplacesOversizedTopLevelMarkdownBlock(t *testing.T) {
 	t.Parallel()
 
 	text := strings.Repeat("a", seatalkTextMessageMaxChars+1)
 
-	parts, err := splitSeaTalkText(text, seatalkTextMessageMaxChars)
-	if err == nil {
-		t.Fatalf("expected error, got parts: %#v", parts)
+	parts := splitSeaTalkText(text, seatalkTextMessageMaxChars)
+	if len(parts) != 1 {
+		t.Fatalf("unexpected chunk count: %d", len(parts))
 	}
-	if !strings.Contains(err.Error(), "top-level Markdown block longer than 4K characters") {
-		t.Fatalf("unexpected error: %v", err)
+	if !strings.HasSuffix(parts[0], seaTalkOversizedBlockNotice(seatalkTextMessageMaxChars, false)) {
+		t.Fatalf("unexpected replacement block: %q", parts[0])
+	}
+	if utf8.RuneCountInString(parts[0]) > seatalkTextMessageMaxChars {
+		t.Fatalf("replacement block exceeds limit: %d", utf8.RuneCountInString(parts[0]))
+	}
+}
+
+func TestSplitSeaTalkTextTruncatesOversizedBlockByRemovingTrailingLines(t *testing.T) {
+	t.Parallel()
+
+	text := strings.Join([]string{
+		"keep line 1",
+		"keep line 2",
+		"drop line 3 " + strings.Repeat("x", 32),
+		"drop line 4 " + strings.Repeat("y", 32),
+	}, "\n")
+	expected := "keep line 1\n_[Content truncated: a top-level Markdown block exceeded SeaTalk's 4K-character limit.]_"
+	maxChars := utf8.RuneCountInString(expected)
+	if utf8.RuneCountInString(text) <= maxChars {
+		t.Fatalf("test input must exceed truncation threshold")
+	}
+
+	parts := splitSeaTalkText(text, maxChars)
+	if len(parts) != 1 {
+		t.Fatalf("unexpected chunk count: %d", len(parts))
+	}
+
+	expected = "keep line 1\n" + seaTalkOversizedBlockNotice(maxChars, false)
+	if parts[0] != expected {
+		t.Fatalf("unexpected truncated block: %q", parts[0])
+	}
+}
+
+func TestSplitSeaTalkTextTruncatesOversizedCodeBlockInsideFence(t *testing.T) {
+	t.Parallel()
+
+	text := "```\nkeep line 1\nkeep line 2\ndrop line 3 " + strings.Repeat("x", 32) + "\ndrop line 4 " + strings.Repeat("y", 32) + "\n```\n"
+	expected := "```\nkeep line 1\n[Content truncated: a top-level Markdown block exceeded SeaTalk's 4K-character limit.]\n```\n"
+	maxChars := utf8.RuneCountInString(expected)
+	if utf8.RuneCountInString(text) <= maxChars {
+		t.Fatalf("test input must exceed truncation threshold")
+	}
+
+	parts := splitSeaTalkText(text, maxChars)
+	if len(parts) != 1 {
+		t.Fatalf("unexpected chunk count: %d", len(parts))
+	}
+
+	if parts[0] != expected {
+		t.Fatalf("unexpected truncated code block: %q", parts[0])
 	}
 }
 
