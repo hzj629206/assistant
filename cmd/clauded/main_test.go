@@ -4,8 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	claudecode "github.com/lancekrogers/claude-code-go/pkg/claude"
-
+	"github.com/hzj629206/assistant/agent/claudecode"
 	"github.com/hzj629206/assistant/internal/config"
 )
 

@@ -311,9 +311,16 @@ func (r *AppServerRunner) Close() error {
 	r.resumeThread = nil
 	r.mu.Unlock()
 	if closeFn == nil {
+		log.Printf("app-server runner closed")
 		return nil
 	}
-	return closeFn()
+	err := closeFn()
+	if err != nil {
+		log.Printf("app-server runner closed: err=%v", err)
+	} else {
+		log.Printf("app-server runner closed")
+	}
+	return err
 }
 
 // RegisterSystemPrompt appends one global system prompt block for new conversations.

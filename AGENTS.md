@@ -34,4 +34,3 @@ This is a backend-only Golang project for integrating SeaTalk with Codex CLI, Cl
 ## Dependencies
 - Codex SDK (Golang): `github.com/godeps/codex-sdk-go`. Similar to official SDK `@openai/codex-sdk` (TypeScript).
 - AppServer SDK (Golang): `github.com/pmenglund/codex-sdk-go`.
-- Claude Code SDK (Golang): `github.com/lancekrogers/claude-code-go`.

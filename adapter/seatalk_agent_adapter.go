@@ -1481,16 +1481,6 @@ func seaTalkMarkdownIsASCIIPunctuationBoundary(r rune) bool {
 	return !('0' <= r && r <= '9') && !('a' <= r && r <= 'z') && !('A' <= r && r <= 'Z')
 }
 
-func seaTalkMarkdownNodeHasAncestor(node goldmarkast.Node, kind goldmarkast.NodeKind) bool {
-	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
-		if parent.Kind() == kind {
-			return true
-		}
-	}
-
-	return false
-}
-
 func seaTalkMarkdownNodeStop(node goldmarkast.Node, source []byte) int {
 	if node == nil {
 		return -1
@@ -1501,12 +1491,20 @@ func seaTalkMarkdownNodeStop(node goldmarkast.Node, source []byte) int {
 	if node.LastChild() != nil {
 		return seaTalkMarkdownNodeStop(node.LastChild(), source)
 	}
-	textValue := node.Text(source)
-	if len(textValue) == 0 {
+	if node.Type() == goldmarkast.TypeBlock {
+		lines := node.Lines()
+		if lines != nil && lines.Len() > 0 {
+			return lines.At(lines.Len() - 1).Stop
+		}
+	}
+	if node.Pos() < 0 {
+		return -1
+	}
+	if len(source) <= node.Pos() {
 		return node.Pos()
 	}
 
-	return node.Pos() + len(textValue)
+	return node.Pos() + len(source[node.Pos():node.Pos()+1])
 }
 
 func seaTalkMarkdownListIsNested(list *goldmarkast.List) bool {

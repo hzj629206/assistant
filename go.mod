@@ -6,8 +6,6 @@ require golang.org/x/crypto v0.50.0
 
 require github.com/godeps/codex-sdk-go v0.1.1
 
-require github.com/lancekrogers/claude-code-go v1.2.0
-
 require github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d
 
 require (

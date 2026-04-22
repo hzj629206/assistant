@@ -2162,9 +2162,11 @@ func TestNormalizeSeaTalkMarkdownCompactsUnorderedListNestedInsideOrderedList(t 
 func TestNormalizeSeaTalkMarkdownPreservesLineBreakAfterEmphasizedHeadingLine(t *testing.T) {
 	t.Parallel()
 
+	//nolint:gosmopolitan // This test intentionally covers SeaTalk markdown normalization with Han text.
 	text := "*1. 2026-04-16 产品大更新*\nCodex 从“写代码代理”扩展成更广义的工作空间：新增 *in-app browser*、*computer use*（可操作 macOS 应用）、*artifact viewer*、*chat/automation* 连续线程、PR 评审侧边栏、记忆能力、SSH 远程连接 alpha、多终端、多窗口、新插件。官方单独发布了《Codex for (almost) everything》。"
 	got := normalizeSeaTalkMarkdown(text)
 
+	//nolint:gosmopolitan // This test intentionally covers SeaTalk markdown normalization with Han text.
 	want := "*1. 2026-04-16 产品大更新*\nCodex 从“写代码代理”扩展成更广义的工作空间：新增 **in-app browser**、**computer use**（可操作 macOS 应用）、**artifact viewer**、**chat/automation** 连续线程、PR 评审侧边栏、记忆能力、SSH 远程连接 alpha、多终端、多窗口、新插件。官方单独发布了《Codex for (almost) everything》。"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
@@ -2174,9 +2176,11 @@ func TestNormalizeSeaTalkMarkdownPreservesLineBreakAfterEmphasizedHeadingLine(t 
 func TestNormalizeSeaTalkMarkdownConvertsItalicToBold(t *testing.T) {
 	t.Parallel()
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	text := "这是在测试*斜体*内容。"
 	got := normalizeSeaTalkMarkdown(text)
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	want := "这是在测试**斜体**内容。"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
@@ -2186,9 +2190,11 @@ func TestNormalizeSeaTalkMarkdownConvertsItalicToBold(t *testing.T) {
 func TestNormalizeSeaTalkMarkdownConvertsItalicToBoldWithExistingLeadingSpace(t *testing.T) {
 	t.Parallel()
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	text := "这是在测试 *斜体*内容。"
 	got := normalizeSeaTalkMarkdown(text)
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	want := "这是在测试 **斜体**内容。"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
@@ -2198,9 +2204,11 @@ func TestNormalizeSeaTalkMarkdownConvertsItalicToBoldWithExistingLeadingSpace(t 
 func TestNormalizeSeaTalkMarkdownConvertsItalicToBoldWithExistingTrailingSpace(t *testing.T) {
 	t.Parallel()
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	text := "这是在测试*斜体* 内容。"
 	got := normalizeSeaTalkMarkdown(text)
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	want := "这是在测试**斜体** 内容。"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
@@ -2210,6 +2218,7 @@ func TestNormalizeSeaTalkMarkdownConvertsItalicToBoldWithExistingTrailingSpace(t
 func TestNormalizeSeaTalkMarkdownPreservesItalicWithWhitespaceOnBothSides(t *testing.T) {
 	t.Parallel()
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis normalization.
 	text := "这是在测试 *斜体* 内容。"
 	got := normalizeSeaTalkMarkdown(text)
 
@@ -2254,6 +2263,7 @@ func TestNormalizeSeaTalkMarkdownPreservesItalicInsideParentheses(t *testing.T) 
 func TestNormalizeSeaTalkMarkdownPreservesExistingBoldText(t *testing.T) {
 	t.Parallel()
 
+	//nolint:gosmopolitan // This test intentionally covers Han text emphasis preservation.
 	text := "这是在测试 **粗体** 内容。"
 	got := normalizeSeaTalkMarkdown(text)
 

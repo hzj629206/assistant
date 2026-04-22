@@ -226,6 +226,11 @@ func (r *ACPRunner) Close() error {
 	if toolServer != nil {
 		closeErr = errors.Join(closeErr, toolServer.Close())
 	}
+	if closeErr != nil {
+		log.Printf("acp runner closed: sessions=%d err=%v", len(sessions), closeErr)
+	} else {
+		log.Printf("acp runner closed: sessions=%d", len(sessions))
+	}
 	return closeErr
 }
 
@@ -552,6 +557,7 @@ func newACPProcessSession(ctx context.Context, options acpSessionOptions) (*acpP
 	}
 
 	sessionCtx, cancel := context.WithCancel(ctx)
+	log.Printf("starting acp session process: path=%s args=%q work_dir=%s", command, options.Args, workDir)
 	//nolint:gosec // The ACP command path and args come from explicit local runner configuration.
 	cmd := exec.CommandContext(sessionCtx, command, options.Args...)
 	cmd.Dir = workDir
