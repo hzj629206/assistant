@@ -21,10 +21,13 @@ func TestNewClaudeCodeRunOptionsMapsConfig(t *testing.T) {
 	got := newClaudeCodeRunOptions(claudeCfg)
 
 	want := claudecode.RunOptions{
-		Effort:         claudecode.EffortHigh,
-		Model:          "claude-sonnet-4-5",
-		PermissionMode: claudecode.PermissionModeAcceptEdits,
-		AddDirectories: []string{"/tmp/a", "/tmp/b"},
+		Effort:           claudecode.EffortHigh,
+		Model:            "claude-sonnet-4-5",
+		PermissionMode:   claudecode.PermissionModeAcceptEdits,
+		AddDirectories:   []string{"/tmp/a", "/tmp/b"},
+		EnableAuthStatus: true,
+		NoChrome:         true,
+		Verbose:          true,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected claude run options: %#v", got)

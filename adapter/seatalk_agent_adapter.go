@@ -89,7 +89,7 @@ Working context:
 SeaTalk Markdown restrictions:
 - SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.
 - SeaTalk Markdown italic and bold do not support nesting.
-- SeaTalk Markdown lists support at most three nesting levels, and nested lists must be strictly compact without line breaks or blank lines.
+- SeaTalk Markdown lists support at most three nesting levels, and indented sublists must be strictly compact without line breaks or blank lines.
 
 Output restrictions:
 - Must use SeaTalk Markdown format and satisfy the restrictions.
@@ -1283,9 +1283,7 @@ func normalizeSeaTalkMarkdown(value string) string {
 	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
 	edits := collectSeaTalkMarkdownEdits(document, source)
 	normalized := value
-	if len(edits) == 0 {
-		normalized = value
-	} else {
+	if len(edits) != 0 {
 		normalized = applySeaTalkMarkdownEdits(source, edits)
 	}
 
@@ -1347,6 +1345,7 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 			if seaTalkMarkdownListIsNested(list) {
 				edits = append(edits, seaTalkMarkdownNestedListIndentationEdits(list, source)...)
 			}
+			edits = append(edits, seaTalkMarkdownUnorderedListMarkerEdits(list, source)...)
 			edits = append(edits, seaTalkMarkdownListMarkerSpacingEdits(list, source)...)
 			edits = append(edits, seaTalkMarkdownListSpacingEdits(list, source)...)
 		}
@@ -1676,6 +1675,60 @@ func seaTalkMarkdownListItemMarkerSpacingEdit(listItem *goldmarkast.ListItem, so
 		stop:        spaceStop,
 		replacement: " ",
 	}, true
+}
+
+// seaTalkMarkdownUnorderedListMarkerEdits normalizes '*' unordered list markers
+// to '-' because SeaTalk only supports that marker reliably.
+func seaTalkMarkdownUnorderedListMarkerEdits(list *goldmarkast.List, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if list == nil || list.IsOrdered() {
+		return edits
+	}
+
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		listItem, ok := item.(*goldmarkast.ListItem)
+		if !ok {
+			continue
+		}
+
+		edit, ok := seaTalkMarkdownUnorderedListItemMarkerEdit(listItem, source)
+		if ok {
+			edits = append(edits, edit)
+		}
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownUnorderedListItemMarkerEdit(listItem *goldmarkast.ListItem, source []byte) (seaTalkMarkdownEdit, bool) {
+	if listItem == nil {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	lineStart := seaTalkMarkdownLineStart(source, listItem.Pos())
+	lineEnd := seaTalkMarkdownLineEnd(source, lineStart)
+	if lineStart < 0 || lineStart >= len(source) || lineEnd <= lineStart {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	markerStart := lineStart
+	for markerStart < lineEnd && (source[markerStart] == ' ' || source[markerStart] == '\t') {
+		markerStart++
+	}
+	if markerStart >= lineEnd {
+		return seaTalkMarkdownEdit{}, false
+	}
+
+	switch source[markerStart] {
+	case '*':
+		return seaTalkMarkdownEdit{
+			start:       markerStart,
+			stop:        markerStart + 1,
+			replacement: "-",
+		}, true
+	default:
+		return seaTalkMarkdownEdit{}, false
+	}
 }
 
 // seaTalkMarkdownItalicToBoldEdits rewrites tight inline italic into bold so

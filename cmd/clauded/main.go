@@ -21,10 +21,13 @@ func newClaudeCodeRunner(_ context.Context, cfg config.Config) (agent.Runner, er
 
 func newClaudeCodeRunOptions(cfg config.ClaudeConfig) claudecode.RunOptions {
 	return claudecode.RunOptions{
-		Effort:         claudeReasoningEffort(cfg.ReasoningEffort),
-		Model:          cfg.Model,
-		PermissionMode: claudePermissionMode(cfg.Permission),
-		AddDirectories: append([]string(nil), cfg.AdditionalDirectories...),
+		Effort:           claudeReasoningEffort(cfg.ReasoningEffort),
+		Model:            cfg.Model,
+		PermissionMode:   claudePermissionMode(cfg.Permission),
+		AddDirectories:   append([]string(nil), cfg.AdditionalDirectories...),
+		EnableAuthStatus: true,
+		NoChrome:         true,
+		Verbose:          true,
 	}
 }
 

@@ -4,13 +4,12 @@ Backend-only Golang project for integrating SeaTalk with local agent CLIs such a
 
 ## How It Works
 
-The service receives SeaTalk bot callbacks from both direct chats and group chats,
-normalizes inbound messages into a shared agent model, and dispatches them to the configured agent runner.
+The service receives SeaTalk bot callbacks from both direct chats and group chats, normalizes inbound messages, and dispatches them to the configured agent runner.
 
 The SeaTalk integration supports common bot-facing message forms, including text messages, image messages, file messages, video messages, combined-forwarded messages, quoted messages, and interactive cards.
 
-The agent layer manages conversation context per chat thread so the assistant can reply inside the same thread and continue the conversation across follow-up messages in that thread.
-When the bot is mentioned from the middle of an existing group chat thread, the service loads the full thread history so the assistant can respond with the surrounding context.
+The agent layer manages conversation context per chat thread so the bot can reply inside the same thread and continue the conversation across follow-up messages in that thread.
+When the bot is mentioned from the middle of an existing group chat thread, the service loads the full thread history so the bot can respond with the surrounding context.
 Technically, when a new agent thread is created for an existing SeaTalk thread, the service first loads that chat thread's history into the initial turn context.
 Messages from the middle of a group chat thread that do not mention the bot are still dispatched to the agent, and the agent is guided to treat them as optional-reply messages.
 
@@ -23,22 +22,22 @@ otherwise the non-text message is processed after the timeout.
 This applies to private top-level chats, private threads, and group threads. Specifically for private top-level chats, the service treats SeaTalk top-level messages as one shared chat thread for conversation continuity,
 and anchors replies for a merged batch to the last merged message.
 
-Inbound interactive cards are preserved as interactive-card messages in the shared agent model.
-The service extracts a compact text summary from card titles, descriptions, buttons, redirect links, and images,
+Inbound interactive cards are preserved as interactive-card messages after normalization.
+The service extracts a compact text summary from card titles, descriptions, action buttons, redirect links, and images,
 while still keeping interactive-card semantics distinct from plain user text.
 
 Interactive card callback buttons use a JSON callback action payload serialized into the SeaTalk button `value`.
-The supported actions are `tool_call`, which asks the assistant to execute a selected tool call,
+The supported actions are `tool_call`, which asks the agent to execute a selected tool call,
 and `prompt`, which submits a new user prompt into the current conversation thread when the button is clicked.
 
-For outbound assistant replies, interactive cards are required when the user explicitly asks for progress reporting,
+For outbound bot replies, interactive cards are required when the user explicitly asks for progress reporting,
 or when it needs to present images or links instead of relying only on plain text.
 
 In real-time conversations, edited messages and updated interactive-card messages do not take effect for the bot.
 SeaTalk message update events are not visible to bots, so the service only processes the original message content delivered in the callback.
 
 At runtime, the Go service communicates with the locally installed agent CLI selected by the daemon you run, such as `codex` for `codexd` or `claude` for `clauded`.
-This keeps the application lightweight while allowing the local agent environment to provide skills, MCP servers, and other assistant capabilities.
+This keeps the application lightweight while allowing the local agent environment to provide skills, MCP servers, and other agent capabilities.
 
 When the service shuts down, the dispatcher stops accepting new work immediately.
 It drops messages that are still waiting in the in-memory queue, pending batch, or delayed merge window,
@@ -47,17 +46,17 @@ and only keeps already-running turns alive for a short grace period.
 ## Key Features
 
 - SeaTalk bot callback handling and reply delivery for both direct chats and group chats
-- Thread-aware conversation handling so the assistant can reply and continue chatting in the same thread
+- Thread-aware conversation handling so the bot can reply and continue chatting in the same thread
 - Delayed merge for non-text inbound messages so follow-up explanatory text in the same chat thread can be processed together
 - Per-thread queued merge handling so messages that arrive during an active or queued turn are appended to the next pending batch
 - Support for text messages, image messages, file messages, video messages, combined-forwarded messages, quoted messages, and interactive cards
 - Interactive-card summaries that preserve card semantics, including button labels, redirect links, and card images
-- Interactive-card callback actions for both assistant tool execution and button-triggered prompt submission
+- Interactive-card callback actions for both tool execution and button-triggered prompt submission
 - Agent support for sending generated data files such as CSV, JSON, and text reports back to users
 - Outbound interactive-card guidance for complex task progress updates and structured presentation of complex results
 - Shared agent layer for normalized message processing and conversation state management
 - Runner integrations for local agent CLIs, including Codex CLI and Claude Code
-- Lightweight cache abstractions for storing assistant-related state
+- Lightweight cache abstractions for storing state
 - Flexible configuration through defaults, YAML config files, and command-line flags
 - Deployment-friendly design for public callback endpoints, including reverse SSH forwarding support
 

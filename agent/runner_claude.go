@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/hzj629206/assistant/agent/claudecode"
@@ -64,6 +66,9 @@ func NewClaudeCodeRunner(options ClaudeCodeRunnerOptions) *ClaudeCodeRunner {
 	runOptions := options.RunOptions
 	if runOptions.PermissionMode == "" {
 		runOptions.PermissionMode = claudecode.PermissionModeDontAsk
+	}
+	if len(runOptions.SettingSources) == 0 {
+		runOptions.SettingSources = []string{"user", "project", "local"}
 	}
 	if runOptions.Effort == "" {
 		runOptions.Effort = claudecode.EffortLow
@@ -301,19 +306,6 @@ func newClaudeSessionObserver(conversationKey string) claudecode.SessionObserver
 		OnProcessStarted: func(pid int) {
 			log.Printf("claude code runner persistent process started: conversation=%s pid=%d", conversationKey, pid)
 		},
-		OnStderrClosed: func(pid int, byteCount int, stderrText string) {
-			if stderrText == "" {
-				log.Printf("claude code runner stderr stream closed: conversation=%s pid=%d bytes=%d", conversationKey, pid, byteCount)
-				return
-			}
-			log.Printf(
-				"claude code runner stderr stream closed: conversation=%s pid=%d bytes=%d stderr=%q",
-				conversationKey,
-				pid,
-				byteCount,
-				stderrText,
-			)
-		},
 		OnControlRequest: func(pid int, requestID string, subtype string) {
 			if subtype != "can_use_tool" && subtype != "mcp_message" {
 				return
@@ -439,12 +431,46 @@ func newClaudeSessionObserver(conversationKey string) claudecode.SessionObserver
 		},
 		OnProcessExit: func(pid int, closed bool, waitErr error) {
 			if claudecode.IgnoreExpectedExit(waitErr) == nil {
-				log.Printf("claude code runner persistent process exited: conversation=%s pid=%d closed=%t", conversationKey, pid, closed)
+				details := claudeProcessExitLogDetails(waitErr)
+				if details == "" {
+					log.Printf("claude code runner persistent process exited: conversation=%s pid=%d closed=%t", conversationKey, pid, closed)
+					return
+				}
+				log.Printf(
+					"claude code runner persistent process exited: conversation=%s pid=%d closed=%t %s",
+					conversationKey,
+					pid,
+					closed,
+					details,
+				)
 				return
 			}
 			log.Printf("claude code runner persistent process wait returned: conversation=%s pid=%d err=%v", conversationKey, pid, waitErr)
 		},
 	}
+}
+
+func claudeProcessExitLogDetails(waitErr error) string {
+	if waitErr == nil {
+		return "exit_code=0"
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.ProcessState == nil {
+		return ""
+	}
+
+	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		return ""
+	}
+	if waitStatus.Signaled() {
+		return fmt.Sprintf("signal=%s", waitStatus.Signal())
+	}
+	if waitStatus.Exited() {
+		return fmt.Sprintf("exit_code=%d", waitStatus.ExitStatus())
+	}
+	return ""
 }
 
 func (r *ClaudeCodeRunner) acquireClaudeSession(ctx context.Context, conversationKey string, sessionID string) (*claudeRunnerSession, error) {
@@ -704,8 +730,7 @@ func (r *ClaudeCodeRunner) clearArgFileCacheLocked() {
 }
 
 func (r *ClaudeCodeRunner) buildTurnPrompt(req TurnRequest) (string, []string) {
-	prompt, imagePaths := buildTurnPrompt(req.Message)
-	return prompt, imagePaths
+	return buildTurnPrompt(req.Message)
 }
 
 type claudeControlServer struct {
@@ -799,10 +824,6 @@ func (s *claudeControlServer) CallTool(ctx context.Context, toolName string, arg
 		return nil, err
 	}
 	return result, nil
-}
-
-func formatClaudeMCPToolResult(result any) (string, error) {
-	return claudecode.FormatMCPToolResult(result)
 }
 
 func sanitizeLogValue(value string) string {

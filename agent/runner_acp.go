@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -10,40 +8,29 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/hzj629206/assistant/agent/acp"
 )
 
 const (
 	defaultACPToolServerName     = "assistant"
-	defaultACPProtocolVersion    = 1
-	defaultACPReadLoopErrorCode  = -32000
-	defaultACPClientName         = "assistant"
-	defaultACPClientVersion      = "1.0.0"
 	defaultACPSessionIdleTimeout = 10 * time.Minute
-	defaultHTTPReadHeaderTimeout = 5 * time.Second
 	defaultACPEmbeddedContextMax = 256 * 1024
-	acpProcessTerminateTimeout   = 5 * time.Second
 )
 
 // ACPRunner bridges dispatcher turns to an ACP-compatible local agent process.
-// Global tools are exposed by creating a temporary local streamable HTTP MCP server for each turn.
+// Global tools are exposed through a runner-scoped streamable HTTP MCP server,
+// while individual tool calls are routed with the active turn context.
 type ACPRunner struct {
 	command            string
 	args               []string
@@ -51,15 +38,18 @@ type ACPRunner struct {
 	authMethod         string
 	workDir            string
 	sessionIdleTimeout time.Duration
-	sessionFactory     func(context.Context, acpSessionOptions) (acpSession, error)
-	mu                 sync.RWMutex
-	systemPrompts      []string
-	tools              []Tool
-	sessionsMu         sync.Mutex
-	sessions           map[string]*acpRunnerSession
-	activeTurns        map[string]TurnRequest
-	toolServer         *acpToolHTTPServer
-	closed             bool
+	sessionFactory     func(context.Context, acp.SessionOptions) (acp.Session, error)
+	//nolint:containedctx // This is the runner lifecycle root context shared by managed ACP sessions.
+	lifecycleCtx  context.Context
+	cancel        context.CancelFunc
+	mu            sync.RWMutex
+	systemPrompts []string
+	tools         []Tool
+	sessionsMu    sync.Mutex
+	sessions      map[string]*acpRunnerSession
+	activeTurns   map[string]TurnRequest
+	toolServer    *acp.HTTPToolServer
+	closed        bool
 }
 
 // ACPRunnerOptions configures an ACPRunner.
@@ -75,91 +65,16 @@ type ACPRunnerOptions struct {
 }
 
 type acpRunnerSession struct {
-	session   acpSession
+	session   acp.Session
 	token     string
 	idleTimer *time.Timer
 	inUse     bool
 }
 
-type acpSession interface {
-	RunPrompt(ctx context.Context, prompt []acpContentBlock) (string, error)
-	CurrentSessionID() string
-	AgentCapabilities() acpAgentCapabilities
-	Close() error
-}
-
-type acpSessionOptions struct {
-	Command         string
-	Args            []string
-	Env             []string
-	WorkingDir      string
-	ResumeSessionID string
-	AuthMethod      string
-	MCPServers      []acpMCPServer
-}
-
-type acpMCPServer struct {
-	Name    string         `json:"name"`
-	Type    string         `json:"type,omitempty"`
-	Command string         `json:"command,omitempty"`
-	Args    []string       `json:"args,omitempty"`
-	Env     []acpMCPEnvVar `json:"env,omitempty"`
-	URL     string         `json:"url,omitempty"`
-	Headers []acpMCPHeader `json:"headers,omitempty"`
-	Meta    map[string]any `json:"-"`
-}
-
-type acpMCPEnvVar struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
-type acpMCPHeader struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
-type acpContentBlock map[string]any
-
-type acpAgentCapabilities struct {
-	Prompt acpPromptCapabilities
-	MCP    acpMCPCapabilities
-}
-
-type acpPromptCapabilities struct {
-	Image           bool
-	EmbeddedContext bool
-}
-
-type acpMCPCapabilities struct {
-	HTTP bool
-}
-
-type acpAttachmentKind string
-
-const (
-	acpAttachmentImage acpAttachmentKind = "image"
-	acpAttachmentFile  acpAttachmentKind = "file"
-	acpAttachmentVideo acpAttachmentKind = "video"
-)
-
-type acpAttachmentRef struct {
-	Kind acpAttachmentKind
-	Path string
-}
-
-type acpSessionMode struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-}
-
-type acpSessionModes struct {
-	CurrentModeID  string           `json:"currentModeId"`
-	AvailableModes []acpSessionMode `json:"availableModes"`
-}
-
 // NewACPRunner builds a runner backed by an ACP agent CLI.
-func NewACPRunner(options ACPRunnerOptions) *ACPRunner {
+//
+//nolint:contextcheck // This constructor intentionally accepts a root lifecycle context for the runner.
+func NewACPRunner(ctx context.Context, options ACPRunnerOptions) *ACPRunner {
 	command := strings.TrimSpace(options.Command)
 
 	workDir := strings.TrimSpace(options.WorkingDir)
@@ -180,12 +95,17 @@ func NewACPRunner(options ACPRunnerOptions) *ACPRunner {
 		sessions:           make(map[string]*acpRunnerSession),
 		activeTurns:        make(map[string]TurnRequest),
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// The runner outlives daemon startup and should only stop on explicit close.
+	lifecycleCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	runner.lifecycleCtx = lifecycleCtx
+	runner.cancel = cancel
 	if runner.sessionIdleTimeout <= 0 {
 		runner.sessionIdleTimeout = defaultACPSessionIdleTimeout
 	}
-	runner.sessionFactory = func(ctx context.Context, sessionOptions acpSessionOptions) (acpSession, error) {
-		return newACPProcessSession(ctx, sessionOptions)
-	}
+	runner.sessionFactory = acp.StartSession
 
 	runner.RegisterSystemPrompt(options.SystemPrompt)
 	runner.RegisterTools(options.Tools...)
@@ -217,7 +137,13 @@ func (r *ACPRunner) Close() error {
 	clear(r.activeTurns)
 	toolServer := r.toolServer
 	r.toolServer = nil
+	cancel := r.cancel
+	r.cancel = nil
 	r.sessionsMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 
 	var closeErr error
 	for _, session := range sessions {
@@ -299,7 +225,7 @@ func (r *ACPRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, e
 	if req.Conversation.RunnerThreadID == "" {
 		initialPromptBlocks = prompts
 	}
-	promptBlocks, err := buildACPPromptBlocks(initialPromptBlocks, req.Message, session.session.AgentCapabilities().Prompt)
+	promptBlocks, err := buildACPPromptBlocks(initialPromptBlocks, req.Message, session.session.Capabilities().Prompt)
 	if err != nil {
 		r.discardACPSession(req.Conversation.Key, session, err)
 		return TurnResult{}, fmt.Errorf("run acp turn failed: build prompt blocks: %w", err)
@@ -318,15 +244,15 @@ func (r *ACPRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, e
 	stopTyping := startTyping(ctx, req.Message.Responder)
 	defer stopTyping()
 
-	replyText, err := session.session.RunPrompt(ctx, promptBlocks)
+	turnResult, err := session.session.RunTurn(ctx, promptBlocks)
 	if err != nil {
 		r.discardACPSession(req.Conversation.Key, session, err)
 		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", err)
 	}
 
 	return TurnResult{
-		RunnerThreadID: session.session.CurrentSessionID(),
-		ReplyText:      replyText,
+		RunnerThreadID: turnResult.SessionID,
+		ReplyText:      turnResult.ReplyText,
 	}, nil
 }
 
@@ -352,7 +278,7 @@ func (r *ACPRunner) acquireACPSession(ctx context.Context, conversationKey, sess
 	}
 	r.sessionsMu.Unlock()
 
-	sessionOptions := acpSessionOptions{
+	sessionOptions := acp.SessionOptions{
 		Command:         r.command,
 		Args:            append([]string(nil), r.args...),
 		Env:             append([]string(nil), r.env...),
@@ -366,21 +292,25 @@ func (r *ACPRunner) acquireACPSession(ctx context.Context, conversationKey, sess
 		return nil, err
 	}
 	if needsTools {
-		toolServer, err := r.ensureACPToolServer(ctx)
+		toolServer, err := r.ensureACPToolServer(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
 		}
-		sessionOptions.MCPServers = []acpMCPServer{toolServer.ServerConfig(token)}
+		sessionOptions.MCPServers = []acp.MCPServer{toolServer.ServerConfig(token)}
 	}
 
 	if r.sessionFactory == nil {
 		return nil, errors.New("acp session factory is nil")
 	}
-	session, err := r.sessionFactory(ctx, sessionOptions)
+	if r.lifecycleCtx == nil {
+		return nil, errors.New("acp runner lifecycle context is nil")
+	}
+	//nolint:contextcheck // ACP sessions intentionally inherit the runner lifecycle context.
+	session, err := r.sessionFactory(r.lifecycleCtx, sessionOptions)
 	if err != nil {
 		return nil, err
 	}
-	if needsTools && !session.AgentCapabilities().MCP.HTTP {
+	if needsTools && !session.Capabilities().MCP.HTTP {
 		_ = session.Close()
 		return nil, errors.New("acp agent does not advertise HTTP MCP support")
 	}
@@ -463,23 +393,20 @@ func (r *ACPRunner) discardACPSession(conversationKey string, managed *acpRunner
 	_ = managed.session.Close()
 }
 
-func (r *ACPRunner) ensureACPToolServer(ctx context.Context) (*acpToolHTTPServer, error) {
+func (r *ACPRunner) ensureACPToolServer(ctx context.Context) (*acp.HTTPToolServer, error) {
 	r.sessionsMu.Lock()
 	defer r.sessionsMu.Unlock()
 	if r.toolServer != nil {
 		return r.toolServer, nil
 	}
 
-	server, err := newACPToolHTTPServer(ctx, acpToolHTTPServerOptions{
+	server, err := acp.NewHTTPToolServer(ctx, acp.HTTPToolServerOptions{
+		ServerName: defaultACPToolServerName,
 		IsAuthorized: func(token string) bool {
 			return r.isAuthorizedACPToken(token)
 		},
-		ResolveTurnRequest: func(token string) (TurnRequest, bool) {
-			return r.activeTurnForToken(token)
-		},
-		Tools: func() []Tool {
-			_, tools := r.globalContext()
-			return tools
+		Tools: func(token string) []acp.HTTPTool {
+			return r.acpHTTPTools(token)
 		},
 	})
 	if err != nil {
@@ -519,329 +446,73 @@ func (r *ACPRunner) clearActiveTurn(token string) {
 	r.sessionsMu.Unlock()
 }
 
-type acpProcessSession struct {
-	cancel    context.CancelFunc
-	cmd       *exec.Cmd
-	stdin     io.Closer
-	transport *acpRPCTransport
-
-	sessionMu sync.RWMutex
-	sessionID string
-	caps      acpAgentCapabilities
-
-	promptMu      sync.Mutex
-	promptBuilder *strings.Builder
-	closed        atomic.Bool
-
-	wg sync.WaitGroup
-}
-
-func newACPProcessSession(ctx context.Context, options acpSessionOptions) (*acpProcessSession, error) {
-	command := strings.TrimSpace(options.Command)
-	if command == "" {
-		return nil, errors.New("acp command is empty")
-	}
-
-	workDir := strings.TrimSpace(options.WorkingDir)
-	if workDir == "" {
-		workDir = "."
-	}
-	workDir, err := filepath.Abs(workDir)
-	if err != nil {
-		workDir = options.WorkingDir
-	}
-
-	sessionCtx, cancel := context.WithCancel(ctx)
-	log.Printf("starting acp session process: path=%s args=%q work_dir=%s", command, options.Args, workDir)
-	//nolint:gosec // The ACP command path and args come from explicit local runner configuration.
-	cmd := exec.CommandContext(sessionCtx, command, options.Args...)
-	cmd.Dir = workDir
-	cmd.Env = mergeACPEnv(os.Environ(), options.Env)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("acp stdin pipe failed: %w", err)
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("acp stdout pipe failed: %w", err)
-	}
-
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	session := &acpProcessSession{
-		cancel: cancel,
-		cmd:    cmd,
-		stdin:  stdin,
-	}
-	session.transport = newACPRPCTransport(stdout, stdin, session.handleNotification, session.handleRequest)
-
-	if err = cmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("start acp command %q failed: %w", command, err)
-	}
-
-	session.wg.Go(func() {
-		session.transport.readLoop(sessionCtx)
-	})
-
-	session.wg.Go(func() {
-		rawWaitErr := cmd.Wait()
-		waitErr := ignoreExpectedACPExit(rawWaitErr)
-		session.closed.Store(true)
-		if rawWaitErr == nil {
-			log.Printf("acp process exited")
-		} else {
-			var exitErr *exec.ExitError
-			if !errors.As(rawWaitErr, &exitErr) || exitErr.ProcessState == nil {
-				message := strings.TrimSpace(stderrBuf.String())
-				if message != "" {
-					log.Printf("acp process exited: err=%v stderr=%s", rawWaitErr, message)
-				} else {
-					log.Printf("acp process exited: err=%v", rawWaitErr)
-				}
-			} else {
-				waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
-				if !ok || waitStatus.Signal() == 0 {
-					message := strings.TrimSpace(stderrBuf.String())
-					if message != "" {
-						log.Printf("acp process exited: err=%v stderr=%s", rawWaitErr, message)
-					} else {
-						log.Printf("acp process exited: err=%v", rawWaitErr)
-					}
-				} else {
-					log.Printf("acp process exited")
-				}
-			}
+func (r *ACPRunner) acpHTTPTools(token string) []acp.HTTPTool {
+	_, tools := r.globalContext()
+	adapted := make([]acp.HTTPTool, 0, len(tools))
+	for _, tool := range tools {
+		if tool == nil {
+			continue
 		}
-		session.transport.cancelAll(waitErr)
-	})
-
-	if err = session.handshake(sessionCtx, options.ResumeSessionID, options.AuthMethod, options.MCPServers, workDir); err != nil {
-		_ = session.Close()
-		return nil, err
-	}
-
-	return session, nil
-}
-
-func (s *acpProcessSession) handshake(ctx context.Context, resumeSessionID, authMethod string, mcpServers []acpMCPServer, workDir string) error {
-	initializeParams := map[string]any{
-		"protocolVersion": defaultACPProtocolVersion,
-		"clientCapabilities": map[string]any{
-			"fs": map[string]any{
-				"readTextFile":  false,
-				"writeTextFile": false,
-			},
-			"terminal": false,
-		},
-		"clientInfo": map[string]any{
-			"name":    defaultACPClientName,
-			"version": defaultACPClientVersion,
-		},
-	}
-	result, err := s.transport.call(ctx, "initialize", initializeParams)
-	if err != nil {
-		return fmt.Errorf("acp initialize failed: %w", err)
-	}
-
-	var initResponse struct {
-		ProtocolVersion int `json:"protocolVersion"`
-		AgentInfo       struct {
-			Name    string `json:"name"`
-			Title   string `json:"title"`
-			Version string `json:"version"`
-		} `json:"agentInfo"`
-		AuthMethods []struct {
-			ID string `json:"id"`
-		} `json:"authMethods"`
-		AgentCapabilities struct {
-			LoadSession        bool `json:"loadSession"`
-			PromptCapabilities struct {
-				Image           bool `json:"image"`
-				EmbeddedContext bool `json:"embeddedContext"`
-			} `json:"promptCapabilities"`
-			MCPCapabilities struct {
-				HTTP bool `json:"http"`
-			} `json:"mcpCapabilities"`
-		} `json:"agentCapabilities"`
-	}
-	if err = json.Unmarshal(result, &initResponse); err != nil {
-		return fmt.Errorf("decode acp initialize response failed: %w", err)
-	}
-	s.caps = acpAgentCapabilities{
-		Prompt: acpPromptCapabilities{
-			Image:           initResponse.AgentCapabilities.PromptCapabilities.Image,
-			EmbeddedContext: initResponse.AgentCapabilities.PromptCapabilities.EmbeddedContext,
-		},
-		MCP: acpMCPCapabilities{
-			HTTP: initResponse.AgentCapabilities.MCPCapabilities.HTTP,
-		},
-	}
-	log.Printf(
-		"acp initialize completed: protocol_version=%d agent_name=%s agent_title=%s agent_version=%s load_session=%t prompt_image=%t prompt_embedded_context=%t mcp_http=%t auth_methods=%d",
-		initResponse.ProtocolVersion,
-		sanitizeACPLogValue(initResponse.AgentInfo.Name),
-		sanitizeACPLogValue(initResponse.AgentInfo.Title),
-		sanitizeACPLogValue(initResponse.AgentInfo.Version),
-		initResponse.AgentCapabilities.LoadSession,
-		initResponse.AgentCapabilities.PromptCapabilities.Image,
-		initResponse.AgentCapabilities.PromptCapabilities.EmbeddedContext,
-		initResponse.AgentCapabilities.MCPCapabilities.HTTP,
-		len(initResponse.AuthMethods),
-	)
-
-	if strings.TrimSpace(authMethod) != "" {
-		if !supportsACPAuthMethod(initResponse.AuthMethods, authMethod) {
-			return fmt.Errorf("acp agent does not advertise auth method %q", authMethod)
-		}
-		if _, err = s.transport.call(ctx, "authenticate", map[string]any{"methodId": authMethod}); err != nil {
-			return fmt.Errorf("acp authenticate failed: %w", err)
-		}
-	}
-
-	if strings.TrimSpace(resumeSessionID) != "" && initResponse.AgentCapabilities.LoadSession {
-		if err = s.loadSession(ctx, resumeSessionID, workDir, mcpServers); err == nil {
-			return nil
-		}
-		log.Printf("acp session/load failed, starting new session instead: requested_session=%s err=%v", resumeSessionID, err)
-	}
-
-	return s.newSession(ctx, workDir, mcpServers)
-}
-
-func (s *acpProcessSession) loadSession(ctx context.Context, sessionID, workDir string, mcpServers []acpMCPServer) error {
-	result, err := s.transport.call(ctx, "session/load", map[string]any{
-		"sessionId":  sessionID,
-		"cwd":        workDir,
-		"mcpServers": mcpServers,
-	})
-	if err != nil {
-		return err
-	}
-	var payload struct {
-		SessionID     string          `json:"sessionId"`
-		Modes         acpSessionModes `json:"modes"`
-		ConfigOptions json.RawMessage `json:"configOptions"`
-	}
-	if len(result) != 0 && !bytes.Equal(bytes.TrimSpace(result), []byte("null")) {
-		if err = json.Unmarshal(result, &payload); err != nil {
-			return fmt.Errorf("decode session/load response failed: %w", err)
-		}
-	}
-	if strings.TrimSpace(payload.SessionID) != "" {
-		s.setSessionID(payload.SessionID)
-		logACPModes("session/load", payload.SessionID, payload.Modes)
-		logACPConfigOptions("session/load", payload.SessionID, payload.ConfigOptions)
-		return nil
-	}
-	s.setSessionID(sessionID)
-	logACPModes("session/load", sessionID, payload.Modes)
-	logACPConfigOptions("session/load", sessionID, payload.ConfigOptions)
-	return nil
-}
-
-func (s *acpProcessSession) newSession(ctx context.Context, workDir string, mcpServers []acpMCPServer) error {
-	result, err := s.transport.call(ctx, "session/new", map[string]any{
-		"cwd":        workDir,
-		"mcpServers": mcpServers,
-	})
-	if err != nil {
-		return err
-	}
-	var payload struct {
-		SessionID     string          `json:"sessionId"`
-		Modes         acpSessionModes `json:"modes"`
-		ConfigOptions json.RawMessage `json:"configOptions"`
-	}
-	if err = json.Unmarshal(result, &payload); err != nil {
-		return fmt.Errorf("decode session/new response failed: %w", err)
-	}
-	if strings.TrimSpace(payload.SessionID) == "" {
-		return errors.New("session/new returned empty sessionId")
-	}
-	s.setSessionID(payload.SessionID)
-	logACPModes("session/new", payload.SessionID, payload.Modes)
-	logACPConfigOptions("session/new", payload.SessionID, payload.ConfigOptions)
-	return nil
-}
-
-func (s *acpProcessSession) RunPrompt(ctx context.Context, prompt []acpContentBlock) (string, error) {
-	sessionID := s.CurrentSessionID()
-	if sessionID == "" {
-		return "", errors.New("acp session id is empty")
-	}
-
-	s.promptMu.Lock()
-	s.promptBuilder = &strings.Builder{}
-	s.promptMu.Unlock()
-	defer func() {
-		s.promptMu.Lock()
-		s.promptBuilder = nil
-		s.promptMu.Unlock()
-	}()
-
-	stopCancelHook := context.AfterFunc(ctx, func() {
-		if err := s.transport.notify("session/cancel", map[string]any{"sessionId": sessionID}); err != nil {
-			log.Printf("acp session/cancel failed: session_id=%s err=%v", sanitizeACPLogValue(sessionID), err)
-		} else {
-			log.Printf("acp session/cancel sent: session_id=%s", sanitizeACPLogValue(sessionID))
-		}
-	})
-	defer func() {
-		if ctx.Err() == nil {
-			stopCancelHook()
-		}
-	}()
-
-	_, err := s.transport.call(ctx, "session/prompt", map[string]any{
-		"sessionId": sessionID,
-		"prompt":    prompt,
-	})
-	if err != nil {
-		return "", fmt.Errorf("acp session/prompt failed: %w", err)
-	}
-
-	s.promptMu.Lock()
-	reply := ""
-	if s.promptBuilder != nil {
-		reply = strings.TrimSpace(s.promptBuilder.String())
-	}
-	s.promptMu.Unlock()
-	return reply, nil
-}
-
-func (s *acpProcessSession) AgentCapabilities() acpAgentCapabilities {
-	s.sessionMu.RLock()
-	defer s.sessionMu.RUnlock()
-	return s.caps
-}
-
-func buildACPPromptBlocks(prefixTextBlocks []string, message InboundMessage, capabilities acpPromptCapabilities) ([]acpContentBlock, error) {
-	blocks := make([]acpContentBlock, 0, len(prefixTextBlocks)+1)
-	for _, text := range prefixTextBlocks {
-		if trimmed := strings.TrimSpace(text); trimmed != "" {
-			blocks = append(blocks, acpContentBlock{
-				"type": "text",
-				"text": trimmed,
-			})
-		}
-	}
-	prompt, _ := buildTurnPrompt(message)
-	if trimmedPrompt := strings.TrimSpace(prompt); trimmedPrompt != "" {
-		blocks = append(blocks, acpContentBlock{
-			"type": "text",
-			"text": trimmedPrompt,
+		adapted = append(adapted, acpHTTPToolAdapter{
+			token:  token,
+			tool:   tool,
+			runner: r,
 		})
 	}
+	return adapted
+}
 
-	attachments := collectACPPromptAttachments(message)
-	for _, attachment := range attachments {
+type acpHTTPToolAdapter struct {
+	token  string
+	tool   Tool
+	runner *ACPRunner
+}
+
+func (t acpHTTPToolAdapter) Name() string {
+	return t.tool.Name()
+}
+
+func (t acpHTTPToolAdapter) Description() string {
+	return t.tool.Description()
+}
+
+func (t acpHTTPToolAdapter) InputSchema() any {
+	return t.tool.InputSchema()
+}
+
+func (t acpHTTPToolAdapter) OutputSchema() any {
+	return t.tool.OutputSchema()
+}
+
+func (t acpHTTPToolAdapter) Call(ctx context.Context, arguments json.RawMessage) (any, error) {
+	if len(arguments) == 0 {
+		arguments = json.RawMessage("{}")
+	}
+	turnReq, ok := t.runner.activeTurnForToken(t.token)
+	if !ok {
+		return nil, errors.New("tool call failed: active turn context not found")
+	}
+	return t.tool.Call(ContextWithTurnRequest(ctx, turnReq), arguments)
+}
+
+func buildACPPromptBlocks(prefixTextBlocks []string, message InboundMessage, capabilities acp.PromptCapabilities) ([]acp.ContentBlock, error) {
+	blocks := make([]acp.ContentBlock, 0, len(prefixTextBlocks)+1)
+	prompt := buildTurnPromptResult(message)
+	textParts := make([]string, 0, len(prefixTextBlocks)+1)
+	if len(prefixTextBlocks) != 0 {
+		systemBlock := acp.SystemBlock(prefixTextBlocks...)
+		if text := strings.TrimSpace(stringValueFromACPContentBlock(systemBlock, "text")); text != "" {
+			textParts = append(textParts, text)
+		}
+	}
+	if trimmedPrompt := strings.TrimSpace(prompt.Text); trimmedPrompt != "" {
+		textParts = append(textParts, trimmedPrompt)
+	}
+	if len(textParts) != 0 {
+		blocks = append(blocks, acp.TextBlock(strings.Join(textParts, "\n\n")))
+	}
+
+	for _, attachment := range prompt.Attachments {
 		block, err := buildACPAttachmentBlock(attachment, capabilities)
 		if err != nil {
 			return nil, err
@@ -852,21 +523,23 @@ func buildACPPromptBlocks(prefixTextBlocks []string, message InboundMessage, cap
 	}
 
 	if len(blocks) == 0 {
-		blocks = append(blocks, acpContentBlock{
-			"type": "text",
-			"text": "",
-		})
+		blocks = append(blocks, acp.TextBlock(""))
 	}
 	return blocks, nil
 }
 
-func buildACPAttachmentBlock(attachment acpAttachmentRef, capabilities acpPromptCapabilities) (acpContentBlock, error) {
+func stringValueFromACPContentBlock(block acp.ContentBlock, key string) string {
+	value, _ := block[key].(string)
+	return value
+}
+
+func buildACPAttachmentBlock(attachment promptAttachmentRef, capabilities acp.PromptCapabilities) (acp.ContentBlock, error) {
 	path := strings.TrimSpace(attachment.Path)
 	if path == "" {
 		return nil, nil
 	}
 
-	if attachment.Kind == acpAttachmentImage && capabilities.Image {
+	if attachment.Kind == promptAttachmentImage && capabilities.Image {
 		return buildACPImageBlock(path)
 	}
 	if capabilities.EmbeddedContext {
@@ -875,7 +548,7 @@ func buildACPAttachmentBlock(attachment acpAttachmentRef, capabilities acpPrompt
 	return buildACPResourceLinkBlock(path)
 }
 
-func buildACPImageBlock(path string) (acpContentBlock, error) {
+func buildACPImageBlock(path string) (acp.ContentBlock, error) {
 	//nolint:gosec // Attachment paths come from normalized local files prepared by the host application for the current turn.
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -887,40 +560,25 @@ func buildACPImageBlock(path string) (acpContentBlock, error) {
 		return nil, fmt.Errorf("image attachment %q has unsupported MIME type %q", path, mimeType)
 	}
 
-	block := acpContentBlock{
-		"type":     "image",
-		"mimeType": mimeType,
-		"data":     base64.StdEncoding.EncodeToString(data),
-	}
-	if uri := acpFileURI(path); uri != "" {
-		block["uri"] = uri
-	}
-	return block, nil
+	return acp.ImageBlock(mimeType, base64.StdEncoding.EncodeToString(data), acpFileURI(path)), nil
 }
 
-func buildACPResourceLinkBlock(path string) (acpContentBlock, error) {
+func buildACPResourceLinkBlock(path string) (acp.ContentBlock, error) {
 	cleanPath, uri := acpPathAndURI(path)
 	if uri == "" {
 		return nil, fmt.Errorf("build file uri for %q failed", path)
 	}
 
-	block := acpContentBlock{
-		"type": "resource_link",
-		"uri":  uri,
-		"name": filepath.Base(cleanPath),
-	}
-	if mimeType := detectACPMIMEType(cleanPath, nil); mimeType != "" {
-		block["mimeType"] = mimeType
-	}
-
+	mimeType := detectACPMIMEType(cleanPath, nil)
+	size := int64(0)
 	info, err := os.Stat(cleanPath)
 	if err == nil && info != nil && !info.IsDir() {
-		block["size"] = info.Size()
+		size = info.Size()
 	}
-	return block, nil
+	return acp.ResourceLinkBlock(uri, filepath.Base(cleanPath), mimeType, size), nil
 }
 
-func buildACPEmbeddedResourceBlock(path string) (acpContentBlock, error) {
+func buildACPEmbeddedResourceBlock(path string) (acp.ContentBlock, error) {
 	cleanPath, uri := acpPathAndURI(path)
 	if uri == "" {
 		return nil, fmt.Errorf("build file uri for %q failed", path)
@@ -945,29 +603,7 @@ func buildACPEmbeddedResourceBlock(path string) (acpContentBlock, error) {
 		return buildACPResourceLinkBlock(path)
 	}
 
-	return acpContentBlock{
-		"type": "resource",
-		"resource": map[string]any{
-			"uri":      uri,
-			"mimeType": mimeType,
-			"text":     string(content),
-		},
-	}, nil
-}
-
-func supportsACPAuthMethod(authMethods []struct {
-	ID string `json:"id"`
-}, authMethod string) bool {
-	authMethod = strings.TrimSpace(authMethod)
-	if authMethod == "" {
-		return true
-	}
-	for _, candidate := range authMethods {
-		if strings.TrimSpace(candidate.ID) == authMethod {
-			return true
-		}
-	}
-	return false
+	return acp.EmbeddedResourceBlock(uri, mimeType, string(content)), nil
 }
 
 func supportsACPEmbeddedText(mimeType string) bool {
@@ -987,117 +623,6 @@ func supportsACPEmbeddedText(mimeType string) bool {
 	default:
 		return false
 	}
-}
-
-func sanitizeACPLogValue(value string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, value)
-}
-
-func logACPModes(method string, sessionID string, modes acpSessionModes) {
-	currentModeID := sanitizeACPLogValue(modes.CurrentModeID)
-	if len(modes.AvailableModes) == 0 {
-		log.Printf(
-			"acp %s completed without available modes: session_id=%s current_mode_id=%s",
-			method,
-			sanitizeACPLogValue(sessionID),
-			currentModeID,
-		)
-		return
-	}
-
-	parts := make([]string, 0, len(modes.AvailableModes))
-	for _, mode := range modes.AvailableModes {
-		modeID := sanitizeACPLogValue(mode.ID)
-		modeLabel := sanitizeACPLogValue(mode.Label)
-		if modeLabel == "" {
-			parts = append(parts, modeID)
-			continue
-		}
-		parts = append(parts, modeID+"("+modeLabel+")")
-	}
-	log.Printf(
-		"acp %s modes: session_id=%s current_mode_id=%s available_modes=%s",
-		method,
-		sanitizeACPLogValue(sessionID),
-		currentModeID,
-		strings.Join(parts, ", "),
-	)
-}
-
-func logACPConfigOptions(method string, sessionID string, configOptions json.RawMessage) {
-	trimmed := strings.TrimSpace(string(configOptions))
-	if trimmed == "" || trimmed == "null" {
-		log.Printf(
-			"acp %s completed without config options: session_id=%s",
-			method,
-			sanitizeACPLogValue(sessionID),
-		)
-		return
-	}
-
-	log.Printf(
-		"acp %s config options: session_id=%s config_options=%s",
-		method,
-		sanitizeACPLogValue(sessionID),
-		sanitizeACPLogValue(trimmed),
-	)
-}
-
-func collectACPPromptAttachments(message InboundMessage) []acpAttachmentRef {
-	seen := make(map[string]struct{})
-	attachments := make([]acpAttachmentRef, 0)
-	appendUnique := func(kind acpAttachmentKind, paths []string) {
-		for _, path := range paths {
-			path = strings.TrimSpace(path)
-			if path == "" {
-				continue
-			}
-			key := string(kind) + "\x00" + path
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			attachments = append(attachments, acpAttachmentRef{Kind: kind, Path: path})
-		}
-	}
-
-	var walkReferenced func(ReferencedMessage)
-	var walkInbound func(InboundMessage)
-
-	walkReferenced = func(current ReferencedMessage) {
-		appendUnique(acpAttachmentImage, allImagePaths(current.ImagePath, current.ImagePaths))
-		appendUnique(acpAttachmentFile, allFilePaths(current.FilePath, current.FilePaths))
-		appendUnique(acpAttachmentVideo, allVideoPaths(current.VideoPath, current.VideoPaths))
-		for _, forwarded := range current.ForwardedMessages {
-			walkReferenced(forwarded)
-		}
-	}
-
-	walkInbound = func(current InboundMessage) {
-		appendUnique(acpAttachmentImage, allImagePaths(current.ImagePath, current.ImagePaths))
-		appendUnique(acpAttachmentFile, allFilePaths(current.FilePath, current.FilePaths))
-		appendUnique(acpAttachmentVideo, allVideoPaths(current.VideoPath, current.VideoPaths))
-		if current.QuotedMessage != nil {
-			walkReferenced(*current.QuotedMessage)
-		}
-		for _, historical := range current.HistoricalMessages() {
-			walkInbound(historical)
-		}
-		for _, merged := range current.MergedMessages() {
-			walkInbound(merged)
-		}
-		for _, forwarded := range current.ForwardedMessages {
-			walkReferenced(forwarded)
-		}
-	}
-
-	walkInbound(message)
-	return attachments
 }
 
 func detectACPMIMEType(path string, content []byte) string {
@@ -1132,537 +657,6 @@ func acpFileURI(path string) string {
 	return uri
 }
 
-func (s *acpProcessSession) CurrentSessionID() string {
-	s.sessionMu.RLock()
-	defer s.sessionMu.RUnlock()
-	return s.sessionID
-}
-
-func (s *acpProcessSession) setSessionID(sessionID string) {
-	s.sessionMu.Lock()
-	s.sessionID = strings.TrimSpace(sessionID)
-	s.sessionMu.Unlock()
-}
-
-func (s *acpProcessSession) Close() error {
-	if s == nil || s.closed.Swap(true) {
-		return nil
-	}
-
-	s.cancel()
-	if s.stdin != nil {
-		_ = s.stdin.Close()
-	}
-
-	var shutdownErr error
-	if terminateErr := signalACPProcessGroup(s.cmd, syscall.SIGTERM); terminateErr != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("terminate process group: %w", terminateErr))
-	}
-
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return shutdownErr
-	case <-time.After(acpProcessTerminateTimeout):
-	}
-
-	if killErr := signalACPProcessGroup(s.cmd, syscall.SIGKILL); killErr != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("kill process group: %w", killErr))
-	}
-
-	<-done
-	return shutdownErr
-}
-
-func (s *acpProcessSession) handleNotification(method string, params json.RawMessage) {
-	if method != "session/update" {
-		return
-	}
-
-	var envelope struct {
-		SessionID string          `json:"sessionId"`
-		Update    json.RawMessage `json:"update"`
-	}
-	if err := json.Unmarshal(params, &envelope); err != nil || len(envelope.Update) == 0 {
-		return
-	}
-	if strings.TrimSpace(envelope.SessionID) != "" {
-		s.setSessionID(envelope.SessionID)
-	}
-
-	var header struct {
-		SessionUpdate string `json:"sessionUpdate"`
-		Content       struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(envelope.Update, &header); err != nil {
-		return
-	}
-	if header.SessionUpdate != "agent_thought_chunk" && header.SessionUpdate != "agent_message_chunk" {
-		log.Printf(
-			"acp session/update received: session_id=%s session_update=%s content_type=%s text_len=%d",
-			strconv.Quote(sanitizeACPLogValue(envelope.SessionID)),
-			strconv.Quote(sanitizeACPLogValue(header.SessionUpdate)),
-			strconv.Quote(sanitizeACPLogValue(header.Content.Type)),
-			len(header.Content.Text),
-		)
-	}
-	if header.SessionUpdate != "agent_message_chunk" || strings.TrimSpace(header.Content.Text) == "" {
-		return
-	}
-
-	s.promptMu.Lock()
-	if s.promptBuilder != nil {
-		s.promptBuilder.WriteString(header.Content.Text)
-	}
-	s.promptMu.Unlock()
-}
-
-func (s *acpProcessSession) handleRequest(method string, id json.RawMessage, params json.RawMessage) {
-	if method != "session/request_permission" {
-		_ = s.transport.respondError(id, -32601, "method not implemented")
-		return
-	}
-
-	var request struct {
-		Options []permissionOption `json:"options"`
-	}
-	if err := json.Unmarshal(params, &request); err != nil {
-		_ = s.transport.respondError(id, -32602, "invalid params")
-		return
-	}
-
-	optionID := pickPermissionOptionID(true, request.Options)
-	_ = s.transport.respondSuccess(id, buildPermissionResult(true, optionID))
-}
-
-func mergeACPEnv(base []string, extra []string) []string {
-	if len(extra) == 0 {
-		return append([]string(nil), base...)
-	}
-
-	values := make(map[string]string, len(base)+len(extra))
-	order := make([]string, 0, len(base)+len(extra))
-	for _, item := range append(append([]string(nil), base...), extra...) {
-		name, value, ok := strings.Cut(item, "=")
-		if !ok {
-			continue
-		}
-		if _, exists := values[name]; !exists {
-			order = append(order, name)
-		}
-		values[name] = value
-	}
-
-	merged := make([]string, 0, len(order))
-	for _, name := range order {
-		merged = append(merged, name+"="+values[name])
-	}
-	return merged
-}
-
-func signalACPProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-
-	err := syscall.Kill(-cmd.Process.Pid, signal)
-	if err == nil || errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return err
-}
-
-func ignoreExpectedACPExit(err error) error {
-	if err == nil {
-		return nil
-	}
-
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ProcessState == nil {
-		return err
-	}
-
-	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !waitStatus.Signaled() {
-		return err
-	}
-
-	switch waitStatus.Signal() {
-	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
-		return nil
-	default:
-		return err
-	}
-}
-
-type acpRPCTransport struct {
-	input     *bufio.Reader
-	output    io.Writer
-	encoder   *json.Encoder
-	writeMu   sync.Mutex
-	nextID    atomic.Int64
-	pendingMu sync.Mutex
-	pending   map[string]chan acpRPCOutcome
-	onNotify  func(string, json.RawMessage)
-	onRequest func(string, json.RawMessage, json.RawMessage)
-}
-
-type acpRPCOutcome struct {
-	result json.RawMessage
-	err    *acpRPCError
-}
-
-type acpRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-func (e *acpRPCError) Error() string {
-	if e == nil {
-		return "json-rpc error"
-	}
-	return fmt.Sprintf("json-rpc %d: %s", e.Code, e.Message)
-}
-
-func newACPRPCTransport(input io.Reader, output io.Writer, onNotify func(string, json.RawMessage), onRequest func(string, json.RawMessage, json.RawMessage)) *acpRPCTransport {
-	return &acpRPCTransport{
-		input:     bufio.NewReader(input),
-		output:    output,
-		encoder:   json.NewEncoder(output),
-		pending:   make(map[string]chan acpRPCOutcome),
-		onNotify:  onNotify,
-		onRequest: onRequest,
-	}
-}
-
-func (t *acpRPCTransport) readLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		line, err := t.input.ReadBytes('\n')
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Printf("acp read loop stopped: err=%v", err)
-			}
-			t.cancelAll(err)
-			return
-		}
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		t.dispatch(line)
-	}
-}
-
-func (t *acpRPCTransport) dispatch(line []byte) {
-	var envelope struct {
-		ID     json.RawMessage `json:"id"`
-		Method string          `json:"method"`
-		Params json.RawMessage `json:"params"`
-		Result json.RawMessage `json:"result"`
-		Error  *acpRPCError    `json:"error"`
-	}
-	if err := json.Unmarshal(line, &envelope); err != nil {
-		return
-	}
-	if envelope.Method != "" {
-		if len(bytes.TrimSpace(envelope.ID)) == 0 || bytes.Equal(bytes.TrimSpace(envelope.ID), []byte("null")) {
-			if t.onNotify != nil {
-				t.onNotify(envelope.Method, envelope.Params)
-			}
-			return
-		}
-		if t.onRequest != nil {
-			t.onRequest(envelope.Method, envelope.ID, envelope.Params)
-		}
-		return
-	}
-	if len(bytes.TrimSpace(envelope.ID)) != 0 {
-		t.completePending(envelope.ID, envelope.Result, envelope.Error)
-	}
-}
-
-func (t *acpRPCTransport) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	id := t.nextID.Add(1)
-	key := strconv.FormatInt(id, 10)
-	wait := make(chan acpRPCOutcome, 1)
-	t.pendingMu.Lock()
-	t.pending[key] = wait
-	t.pendingMu.Unlock()
-
-	request := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
-	}
-	if err := t.writeJSON(request); err != nil {
-		t.pendingMu.Lock()
-		delete(t.pending, key)
-		t.pendingMu.Unlock()
-		return nil, err
-	}
-
-	select {
-	case <-ctx.Done():
-		t.pendingMu.Lock()
-		delete(t.pending, key)
-		t.pendingMu.Unlock()
-		return nil, ctx.Err()
-	case outcome := <-wait:
-		if outcome.err != nil {
-			return nil, outcome.err
-		}
-		return outcome.result, nil
-	}
-}
-
-func (t *acpRPCTransport) notify(method string, params any) error {
-	return t.writeJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-		"params":  params,
-	})
-}
-
-func (t *acpRPCTransport) completePending(id json.RawMessage, result json.RawMessage, rpcErr *acpRPCError) {
-	key := strings.Trim(string(bytes.TrimSpace(id)), "\"")
-	t.pendingMu.Lock()
-	wait, ok := t.pending[key]
-	delete(t.pending, key)
-	t.pendingMu.Unlock()
-	if !ok {
-		return
-	}
-	wait <- acpRPCOutcome{result: result, err: rpcErr}
-}
-
-func (t *acpRPCTransport) cancelAll(err error) {
-	message := "transport closed"
-	if err != nil {
-		message = err.Error()
-	}
-	t.pendingMu.Lock()
-	defer t.pendingMu.Unlock()
-	for key, wait := range t.pending {
-		wait <- acpRPCOutcome{err: &acpRPCError{Code: defaultACPReadLoopErrorCode, Message: message}}
-		delete(t.pending, key)
-	}
-}
-
-func (t *acpRPCTransport) respondSuccess(id json.RawMessage, result any) error {
-	return t.writeJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"result":  result,
-	})
-}
-
-func (t *acpRPCTransport) respondError(id json.RawMessage, code int, message string) error {
-	return t.writeJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"error": map[string]any{
-			"code":    code,
-			"message": message,
-		},
-	})
-}
-
-func (t *acpRPCTransport) writeJSON(payload any) error {
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	return t.encoder.Encode(payload)
-}
-
-type acpToolHTTPServer struct {
-	listener           net.Listener
-	server             *http.Server
-	url                string
-	closeOnce          sync.Once
-	isAuthorized       func(string) bool
-	resolveTurnRequest func(string) (TurnRequest, bool)
-	tools              func() []Tool
-}
-
-type acpToolHTTPServerOptions struct {
-	IsAuthorized       func(string) bool
-	ResolveTurnRequest func(string) (TurnRequest, bool)
-	Tools              func() []Tool
-}
-
-type acpToolTokenContextKey struct{}
-
-func newACPToolHTTPServer(ctx context.Context, options acpToolHTTPServerOptions) (*acpToolHTTPServer, error) {
-	if options.IsAuthorized == nil {
-		return nil, errors.New("acp tool server authorization callback is nil")
-	}
-	if options.ResolveTurnRequest == nil {
-		return nil, errors.New("acp tool server turn resolver is nil")
-	}
-	if options.Tools == nil {
-		return nil, errors.New("acp tool server tool provider is nil")
-	}
-
-	var listenConfig net.ListenConfig
-	listener, err := listenConfig.Listen(ctx, "tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, fmt.Errorf("listen on tool server failed: %w", err)
-	}
-
-	server := &acpToolHTTPServer{
-		listener:           listener,
-		isAuthorized:       options.IsAuthorized,
-		resolveTurnRequest: options.ResolveTurnRequest,
-		tools:              options.Tools,
-	}
-
-	handler := mcp.NewStreamableHTTPHandler(func(request *http.Request) *mcp.Server {
-		return server.newRequestServer(request)
-	}, &mcp.StreamableHTTPOptions{
-		Stateless:    true,
-		JSONResponse: true,
-	})
-	server.server = &http.Server{
-		Handler: server.wrapAuth(handler),
-		BaseContext: func(net.Listener) context.Context {
-			return ctx
-		},
-		ReadHeaderTimeout: defaultHTTPReadHeaderTimeout,
-	}
-	server.url = "http://" + listener.Addr().String() + "/mcp"
-
-	go func() {
-		if serveErr := server.server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			log.Printf("acp tool server stopped: err=%v", serveErr)
-		}
-	}()
-	return server, nil
-}
-
-func (s *acpToolHTTPServer) ServerConfig(token string) acpMCPServer {
-	return acpMCPServer{
-		Name: defaultACPToolServerName,
-		Type: "http",
-		URL:  s.url,
-		Headers: []acpMCPHeader{
-			{Name: "Authorization", Value: "Bearer " + token},
-			{Name: "Accept", Value: "application/json, text/event-stream"},
-		},
-	}
-}
-
-func (s *acpToolHTTPServer) wrapAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/mcp" {
-			http.NotFound(w, r)
-			return
-		}
-		token, ok := bearerACPToken(r.Header.Get("Authorization"))
-		if !ok || !s.isAuthorized(token) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if accept := r.Header.Get("Accept"); accept != "" && !strings.Contains(accept, "application/json") {
-			http.Error(w, "accept must contain application/json", http.StatusBadRequest)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), acpToolTokenContextKey{}, token)))
-	})
-}
-
-func bearerACPToken(authorization string) (string, bool) {
-	authorization = strings.TrimSpace(authorization)
-	if !strings.HasPrefix(authorization, "Bearer ") {
-		return "", false
-	}
-	token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
-	if token == "" {
-		return "", false
-	}
-	return token, true
-}
-
-func (s *acpToolHTTPServer) newRequestServer(_ *http.Request) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{
-		Name:    defaultACPToolServerName,
-		Version: "1.0.0",
-	}, nil)
-	for _, tool := range s.tools() {
-		if tool == nil {
-			continue
-		}
-		server.AddTool(&mcp.Tool{
-			Name:         tool.Name(),
-			Description:  tool.Description(),
-			InputSchema:  normalizeACPToolSchema(tool.InputSchema()),
-			OutputSchema: normalizeACPToolSchema(tool.OutputSchema()),
-		}, s.handleToolCall(tool))
-	}
-	return server
-}
-
-func (s *acpToolHTTPServer) handleToolCall(tool Tool) mcp.ToolHandler {
-	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		token, _ := ctx.Value(acpToolTokenContextKey{}).(string)
-		turnReq, ok := s.resolveTurnRequest(token)
-		if !ok {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{Text: "tool call failed: active turn context not found"},
-				},
-				IsError: true,
-			}, nil
-		}
-
-		arguments := req.Params.Arguments
-		if len(arguments) == 0 {
-			arguments = []byte("{}")
-		}
-
-		result, toolErr := tool.Call(ContextWithTurnRequest(ctx, turnReq), arguments)
-		if toolErr != nil {
-			//nolint:nilerr // MCP tool execution errors are returned in-band via CallToolResult.
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{Text: toolErr.Error()},
-				},
-				IsError: true,
-			}, nil
-		}
-
-		text, err := formatClaudeMCPToolResult(result)
-		if err != nil {
-			return nil, err
-		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: text},
-			},
-		}, nil
-	}
-}
-
-func normalizeACPToolSchema(schema any) any {
-	if schema == nil {
-		return json.RawMessage(`{"type":"object","properties":{}}`)
-	}
-	return schema
-}
-
 func randomACPToken() (string, error) {
 	var token [24]byte
 	_, err := rand.Read(token[:])
@@ -1670,71 +664,4 @@ func randomACPToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(token[:]), nil
-}
-
-func (s *acpToolHTTPServer) Close() error {
-	if s == nil {
-		return nil
-	}
-
-	var err error
-	s.closeOnce.Do(func() {
-		if s.server != nil {
-			err = s.server.Close()
-		}
-	})
-	return err
-}
-
-type permissionOption struct {
-	OptionID string `json:"optionId"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-}
-
-func pickPermissionOptionID(allow bool, options []permissionOption) string {
-	if len(options) == 0 {
-		return ""
-	}
-	if allow {
-		for _, option := range options {
-			if strings.Contains(strings.ToLower(option.Kind), "allow") {
-				return option.OptionID
-			}
-		}
-		for _, option := range options {
-			if strings.Contains(strings.ToLower(option.Name), "allow") {
-				return option.OptionID
-			}
-		}
-		return options[0].OptionID
-	}
-	for _, option := range options {
-		if strings.Contains(strings.ToLower(option.Kind), "reject") || strings.Contains(strings.ToLower(option.Kind), "deny") {
-			return option.OptionID
-		}
-	}
-	for _, option := range options {
-		if strings.Contains(strings.ToLower(option.Name), "reject") || strings.Contains(strings.ToLower(option.Name), "deny") {
-			return option.OptionID
-		}
-	}
-	return options[len(options)-1].OptionID
-}
-
-func buildPermissionResult(allow bool, optionID string) map[string]any {
-	if !allow && optionID == "" {
-		return map[string]any{
-			"outcome": map[string]any{
-				//nolint:misspell // ACP permission result uses the protocol spelling "cancelled".
-				"outcome": "cancelled",
-			},
-		}
-	}
-	return map[string]any{
-		"outcome": map[string]any{
-			"outcome":  "selected",
-			"optionId": optionID,
-		},
-	}
 }

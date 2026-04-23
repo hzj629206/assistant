@@ -12,8 +12,8 @@ func main() {
 	daemon.Run(newACPRunner)
 }
 
-func newACPRunner(_ context.Context, cfg config.Config) (agent.Runner, error) {
-	return agent.NewACPRunner(agent.ACPRunnerOptions{
+func newACPRunner(ctx context.Context, cfg config.Config) (agent.Runner, error) {
+	return agent.NewACPRunner(ctx, agent.ACPRunnerOptions{
 		Command:    cfg.ACP.Command,
 		Args:       append([]string(nil), cfg.ACP.Args...),
 		Env:        append([]string(nil), cfg.ACP.Env...),

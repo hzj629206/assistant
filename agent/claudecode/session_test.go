@@ -1,9 +1,11 @@
 package claudecode
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -140,26 +142,165 @@ func TestPersistentProcessSessionHandleResultMessageDeliversStructuredOutput(t *
 	}
 }
 
+func TestPersistentProcessSessionHandleResultMessageFallsBackToAssistantText(t *testing.T) {
+	t.Parallel()
+
+	turn := &turnState{
+		resultCh: make(chan *ClaudeResult, 1),
+	}
+	session := &persistentProcessSession{
+		cmd:         fakeExecCmd(1234),
+		currentTurn: turn,
+	}
+
+	assistantEnvelope := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role": "assistant",
+			"content": []map[string]any{
+				{"type": "text", "text": "part one"},
+				{"type": "thinking", "thinking": "hidden"},
+				{"type": "text", "text": " and part two"},
+			},
+		},
+	}
+	assistantLine, err := json.Marshal(assistantEnvelope)
+	if err != nil {
+		t.Fatalf("Marshal assistant failed: %v", err)
+	}
+	session.handleStreamMessage(assistantEnvelope, string(assistantLine))
+
+	resultEnvelope := map[string]any{
+		"type":       "result",
+		"session_id": "session-fallback",
+		"result":     "",
+	}
+	resultLine, err := json.Marshal(resultEnvelope)
+	if err != nil {
+		t.Fatalf("Marshal result failed: %v", err)
+	}
+
+	session.handleStreamMessage(resultEnvelope, string(resultLine))
+
+	select {
+	case result := <-turn.resultCh:
+		if result.Result != "part one and part two" {
+			t.Fatalf("unexpected fallback reply: %q", result.Result)
+		}
+		if result.SessionID != "session-fallback" {
+			t.Fatalf("unexpected result session id: %s", result.SessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected fallback result message")
+	}
+}
+
+func TestPersistentProcessSessionHandleResultMessagePreservesWhitespaceOnlyResult(t *testing.T) {
+	t.Parallel()
+
+	turn := &turnState{
+		resultCh: make(chan *ClaudeResult, 1),
+	}
+	session := &persistentProcessSession{
+		cmd:         fakeExecCmd(1234),
+		currentTurn: turn,
+	}
+
+	assistantEnvelope := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role": "assistant",
+			"content": []map[string]any{
+				{"type": "text", "text": "fallback text"},
+			},
+		},
+	}
+	assistantLine, err := json.Marshal(assistantEnvelope)
+	if err != nil {
+		t.Fatalf("Marshal assistant failed: %v", err)
+	}
+	session.handleStreamMessage(assistantEnvelope, string(assistantLine))
+
+	resultEnvelope := map[string]any{
+		"type":       "result",
+		"session_id": "session-whitespace",
+		"result":     "\n  \t",
+	}
+	resultLine, err := json.Marshal(resultEnvelope)
+	if err != nil {
+		t.Fatalf("Marshal result failed: %v", err)
+	}
+
+	session.handleStreamMessage(resultEnvelope, string(resultLine))
+
+	select {
+	case result := <-turn.resultCh:
+		if result.Result != "\n  \t" {
+			t.Fatalf("unexpected result: %q", result.Result)
+		}
+		if result.SessionID != "session-whitespace" {
+			t.Fatalf("unexpected result session id: %s", result.SessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected result message")
+	}
+}
+
 func TestPersistentProcessSessionCloseIgnoresUnexpectedExitSentinel(t *testing.T) {
 	t.Parallel()
 
 	exitDone := make(chan struct{})
 	close(exitDone)
-	stderrDone := make(chan struct{})
-	close(stderrDone)
 	scanDone := make(chan struct{})
 	close(scanDone)
 
 	session := &persistentProcessSession{
-		cmd:        fakeExecCmd(12345),
-		waitErr:    ErrProcessExited,
-		exitDone:   exitDone,
-		stderrDone: stderrDone,
-		scanDone:   scanDone,
+		cmd:      fakeExecCmd(12345),
+		waitErr:  ErrProcessExited,
+		exitDone: exitDone,
+		scanDone: scanDone,
 	}
 
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close returned %v, want nil", err)
+	}
+}
+
+func TestPersistentProcessSessionCloseIgnoresCanceledWaitOnShutdown(t *testing.T) {
+	t.Parallel()
+
+	exitDone := make(chan struct{})
+	close(exitDone)
+	scanDone := make(chan struct{})
+	close(scanDone)
+
+	session := &persistentProcessSession{
+		cmd:      fakeExecCmd(12345),
+		waitErr:  context.Canceled,
+		closed:   true,
+		exitDone: exitDone,
+		scanDone: scanDone,
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close returned %v, want nil", err)
+	}
+}
+
+func TestIgnoreExpectedSignalProcessGroupError(t *testing.T) {
+	t.Parallel()
+
+	if !ignoreExpectedSignalProcessGroupError(nil) {
+		t.Fatal("nil error should be ignored")
+	}
+	if !ignoreExpectedSignalProcessGroupError(syscall.EPERM) {
+		t.Fatal("EPERM should be ignored during shutdown")
+	}
+	if !ignoreExpectedSignalProcessGroupError(syscall.ESRCH) {
+		t.Fatal("ESRCH should be ignored during shutdown")
+	}
+	if ignoreExpectedSignalProcessGroupError(syscall.EINVAL) {
+		t.Fatal("EINVAL should not be ignored")
 	}
 }
 

@@ -770,20 +770,20 @@ func (r *CodexRunner) buildTurnInput(req TurnRequest) (codex.Input, error) {
 }
 
 func (r *CodexRunner) buildTurnInputWithContext(req TurnRequest, turnContext codexTurnContext) (codex.Input, error) {
-	prompt, imagePaths := buildTurnPrompt(req.Message)
-	if len(imagePaths) == 0 {
-		return r.injectInitialTurnContext(req, codex.TextInput(prompt), turnContext)
+	prompt := buildTurnPromptResult(req.Message)
+	if len(prompt.ImagePaths) == 0 {
+		return r.injectInitialTurnContext(req, codex.TextInput(prompt.Text), turnContext)
 	}
 
-	items := make([]codex.UserInput, 0, 1+len(imagePaths))
-	if prompt != "" {
+	items := make([]codex.UserInput, 0, 1+len(prompt.ImagePaths))
+	if prompt.Text != "" {
 		items = append(items, codex.UserInput{
 			Type: codex.UserInputText,
-			Text: prompt,
+			Text: prompt.Text,
 		})
 	}
 
-	for _, imagePath := range imagePaths {
+	for _, imagePath := range prompt.ImagePaths {
 		items = append(items, codex.UserInput{
 			Type: codex.UserInputLocalImage,
 			Path: imagePath,
@@ -850,12 +850,96 @@ Return a corrected JSON object that matches the schema exactly. Do not add prose
 `, err, rawResponse)))
 }
 
+type promptAttachmentKind string
+
+const (
+	promptAttachmentImage promptAttachmentKind = "image"
+	promptAttachmentFile  promptAttachmentKind = "file"
+	promptAttachmentVideo promptAttachmentKind = "video"
+)
+
+type promptAttachmentRef struct {
+	Kind promptAttachmentKind
+	Path string
+}
+
+type turnPrompt struct {
+	Text        string
+	ImagePaths  []string
+	Attachments []promptAttachmentRef
+}
+
 func buildTurnPrompt(message InboundMessage) (string, []string) {
+	prompt := buildTurnPromptResult(message)
+	return prompt.Text, prompt.ImagePaths
+}
+
+func buildTurnPromptResult(message InboundMessage) turnPrompt {
+	var prompt string
+	var imagePaths []string
 	if len(message.mergedMessages) > 0 {
-		return buildCompositeTurnPrompt(message)
+		prompt, imagePaths = buildCompositeTurnPrompt(message)
+	} else {
+		prompt, imagePaths = buildSingleTurnPrompt(message, true)
 	}
 
-	return buildSingleTurnPrompt(message, true)
+	return turnPrompt{
+		Text:        prompt,
+		ImagePaths:  imagePaths,
+		Attachments: collectPromptAttachments(message),
+	}
+}
+
+func collectPromptAttachments(message InboundMessage) []promptAttachmentRef {
+	seen := make(map[string]struct{})
+	attachments := make([]promptAttachmentRef, 0)
+	appendUnique := func(kind promptAttachmentKind, paths []string) {
+		for _, path := range paths {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				continue
+			}
+			key := string(kind) + "\x00" + path
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			attachments = append(attachments, promptAttachmentRef{Kind: kind, Path: path})
+		}
+	}
+
+	var walkReferenced func(ReferencedMessage)
+	var walkInbound func(InboundMessage)
+
+	walkReferenced = func(current ReferencedMessage) {
+		appendUnique(promptAttachmentImage, allImagePaths(current.ImagePath, current.ImagePaths))
+		appendUnique(promptAttachmentFile, allFilePaths(current.FilePath, current.FilePaths))
+		appendUnique(promptAttachmentVideo, allVideoPaths(current.VideoPath, current.VideoPaths))
+		for _, forwarded := range current.ForwardedMessages {
+			walkReferenced(forwarded)
+		}
+	}
+
+	walkInbound = func(current InboundMessage) {
+		appendUnique(promptAttachmentImage, allImagePaths(current.ImagePath, current.ImagePaths))
+		appendUnique(promptAttachmentFile, allFilePaths(current.FilePath, current.FilePaths))
+		appendUnique(promptAttachmentVideo, allVideoPaths(current.VideoPath, current.VideoPaths))
+		if current.QuotedMessage != nil {
+			walkReferenced(*current.QuotedMessage)
+		}
+		for _, historical := range current.HistoricalMessages() {
+			walkInbound(historical)
+		}
+		for _, merged := range current.MergedMessages() {
+			walkInbound(merged)
+		}
+		for _, forwarded := range current.ForwardedMessages {
+			walkReferenced(forwarded)
+		}
+	}
+
+	walkInbound(message)
+	return attachments
 }
 
 func buildSingleTurnPrompt(message InboundMessage, includeReplyMention bool) (string, []string) {

@@ -1,13 +1,17 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	appcodex "github.com/pmenglund/codex-sdk-go"
@@ -48,6 +52,85 @@ func (s *fakeAppServerTurnStream) TurnID() string {
 }
 
 func (s *fakeAppServerTurnStream) Close() {}
+
+func TestLogAppServerProcessExitIncludesSignal(t *testing.T) {
+	var output bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+	})
+
+	err := exec.CommandContext(context.Background(), "sh", "-c", "kill -TERM $$").Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	logAppServerProcessExit(fakeExecCmd(43210), err)
+
+	got := output.String()
+	if !strings.Contains(got, "pid=43210") {
+		t.Fatalf("log output missing pid: %q", got)
+	}
+	if !strings.Contains(got, "signal=terminated") {
+		t.Fatalf("log output missing signal: %q", got)
+	}
+}
+
+func TestLogAppServerProcessExitIncludesExitCode(t *testing.T) {
+	var output bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+	})
+
+	err := exec.CommandContext(context.Background(), "sh", "-c", "exit 7").Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	logAppServerProcessExit(fakeExecCmd(43210), err)
+
+	got := output.String()
+	if !strings.Contains(got, "pid=43210") {
+		t.Fatalf("log output missing pid: %q", got)
+	}
+	if !strings.Contains(got, "exit_code=7") {
+		t.Fatalf("log output missing exit code: %q", got)
+	}
+}
+
+func TestIgnoreExpectedAppServerSignalError(t *testing.T) {
+	t.Parallel()
+
+	if !ignoreExpectedAppServerSignalError(nil) {
+		t.Fatal("nil error should be ignored")
+	}
+	if !ignoreExpectedAppServerSignalError(syscall.EPERM) {
+		t.Fatal("EPERM should be ignored during shutdown")
+	}
+	if !ignoreExpectedAppServerSignalError(syscall.ESRCH) {
+		t.Fatal("ESRCH should be ignored during shutdown")
+	}
+	if ignoreExpectedAppServerSignalError(syscall.EINVAL) {
+		t.Fatal("EINVAL should not be ignored")
+	}
+}
+
+func fakeExecCmd(pid int) *exec.Cmd {
+	return &exec.Cmd{
+		Process: &os.Process{
+			Pid: pid,
+		},
+	}
+}
 
 func TestBuildTurnInputsUsesLocalImagePath(t *testing.T) {
 	t.Parallel()

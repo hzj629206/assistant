@@ -2,7 +2,6 @@ package claudecode
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,7 +31,6 @@ type TurnHooks struct {
 type SessionObserver struct {
 	OnProcessSpawn         func(client *ClaudeClient, opts RunOptions, args []string)
 	OnProcessStarted       func(pid int)
-	OnStderrClosed         func(pid int, byteCount int, stderrText string)
 	OnControlRequest       func(pid int, requestID string, subtype string)
 	OnSystemMessage        func(pid int, msg *Message)
 	OnAssistantMessage     func(pid int, roleMessage StreamRoleMessage)
@@ -57,6 +55,7 @@ type turnState struct {
 	initRespCh           chan error
 	resultCh             chan *ClaudeResult
 	errCh                chan error
+	assistantTextParts   []string
 }
 
 type persistentProcessSession struct {
@@ -66,7 +65,6 @@ type persistentProcessSession struct {
 	stdinPipe  io.WriteCloser
 	waitCh     chan error
 	exitDone   chan struct{}
-	stderrDone chan struct{}
 	scanDone   chan struct{}
 	observer   SessionObserver
 	client     *ClaudeClient
@@ -180,12 +178,11 @@ func (s *persistentProcessSession) ensureStarted(ctx context.Context) error {
 		_ = stdinPipe.Close()
 		return NewClaudeError(ErrorCommand, fmt.Sprintf("failed to get stdout pipe: %v", err))
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		_ = stdinPipe.Close()
-		return NewClaudeError(ErrorCommand, fmt.Sprintf("failed to get stderr pipe: %v", err))
+	stderr := s.runOptions.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
 	}
+	cmd.Stderr = stderr
 	if err = cmd.Start(); err != nil {
 		cancel()
 		_ = stdinPipe.Close()
@@ -200,13 +197,11 @@ func (s *persistentProcessSession) ensureStarted(ctx context.Context) error {
 	s.stdinPipe = stdinPipe
 	s.waitCh = make(chan error, 1)
 	s.exitDone = make(chan struct{})
-	s.stderrDone = make(chan struct{})
 	s.scanDone = make(chan struct{})
 
 	go func() {
 		s.waitCh <- cmd.Wait()
 	}()
-	go s.captureStderr(stderr)
 	go s.scanStdout(stdout)
 	go s.watchExit()
 
@@ -323,15 +318,6 @@ func (s *persistentProcessSession) writeJSONLine(payload any) error {
 		return err
 	}
 	return s.writeRaw(append(data, '\n'))
-}
-
-func (s *persistentProcessSession) captureStderr(stderr io.Reader) {
-	defer close(s.stderrDone)
-	stderrBuf := new(bytes.Buffer)
-	_, _ = io.Copy(stderrBuf, stderr)
-	if s.observer.OnStderrClosed != nil {
-		s.observer.OnStderrClosed(s.pid(), stderrBuf.Len(), strings.TrimSpace(stderrBuf.String()))
-	}
 }
 
 func (s *persistentProcessSession) scanStdout(stdout io.Reader) {
@@ -481,6 +467,17 @@ func (s *persistentProcessSession) handleAssistantMessage(msg *Message) {
 	if s.observer.OnAssistantMessage != nil {
 		s.observer.OnAssistantMessage(s.pid(), roleMessage)
 	}
+
+	turn := s.getCurrentTurn()
+	if turn == nil {
+		return
+	}
+	for _, block := range roleMessage.Content {
+		if block.Type != "text" || block.Text == "" {
+			continue
+		}
+		turn.assistantTextParts = append(turn.assistantTextParts, block.Text)
+	}
 }
 
 func (s *persistentProcessSession) handleUserMessage(msg *Message) {
@@ -525,6 +522,9 @@ func (s *persistentProcessSession) handleResultMessage(envelope map[string]any, 
 	}
 	turn := s.currentTurn
 	s.stateMu.Unlock()
+	if turn != nil && result.Result == "" && result.StructuredOutput == nil {
+		result.Result = strings.Join(turn.assistantTextParts, "")
+	}
 	if turn != nil {
 		turn.resultCh <- result
 	}
@@ -594,7 +594,6 @@ func (s *persistentProcessSession) Close() error {
 	stdinPipe := s.stdinPipe
 	cancel := s.cancel
 	exitDone := s.exitDone
-	stderrDone := s.stderrDone
 	scanDone := s.scanDone
 	s.stateMu.Unlock()
 
@@ -623,14 +622,12 @@ func (s *persistentProcessSession) Close() error {
 	}
 	s.stateMu.Lock()
 	err := s.waitErr
+	closed := s.closed
 	s.stateMu.Unlock()
-	if stderrDone != nil {
-		<-stderrDone
-	}
 	if scanDone != nil {
 		<-scanDone
 	}
-	if errors.Is(err, ErrProcessExited) {
+	if errors.Is(err, ErrProcessExited) || (closed && errors.Is(err, context.Canceled)) {
 		err = nil
 	}
 	return errors.Join(err, signalErr)
@@ -702,9 +699,19 @@ func SignalProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
 	}
 
 	err := syscall.Kill(-cmd.Process.Pid, signal)
-	if err == nil || errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+	if ignoreExpectedSignalProcessGroupError(err) {
 		return nil
 	}
 
 	return err
+}
+
+func ignoreExpectedSignalProcessGroupError(err error) bool {
+	if err == nil {
+		return true
+	}
+
+	// macOS can report EPERM while a process group is already tearing down after
+	// the session context canceled the leader. Treat that as an expected shutdown race.
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM)
 }

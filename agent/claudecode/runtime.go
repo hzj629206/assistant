@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -331,9 +332,13 @@ func BuildCLIArgsForInputAndOutput(opts *RunOptions, inputFormat InputFormat, ou
 
 // BuildCLIArgs builds the Claude CLI argv for a run.
 func BuildCLIArgs(opts *RunOptions) []string {
-	args := []string{"--verbose"}
+	args := make([]string, 0, 32)
 	if opts == nil {
 		return args
+	}
+
+	if opts.Verbose {
+		args = append(args, "--verbose")
 	}
 
 	if opts.SystemPrompt != "" {
@@ -348,9 +353,7 @@ func BuildCLIArgs(opts *RunOptions) []string {
 	if len(opts.DisallowedTools) > 0 {
 		args = append(args, "--disallowedTools", strings.Join(opts.DisallowedTools, ","))
 	}
-	if opts.PermissionMode == PermissionModeDefault {
-		args = append(args, "--permission-prompt-tool", "stdio")
-	}
+	args = append(args, "--permission-prompt-tool", "stdio")
 	if opts.PermissionMode != "" {
 		args = append(args, "--permission-mode", string(opts.PermissionMode))
 	}
@@ -401,6 +404,15 @@ func BuildCLIArgs(opts *RunOptions) []string {
 	if opts.ReplayUserMessages {
 		args = append(args, "--replay-user-messages")
 	}
+	if opts.Debug {
+		args = append(args, "--debug")
+	}
+	if opts.DebugToStderr {
+		args = append(args, "--debug-to-stderr")
+	}
+	if opts.EnableAuthStatus {
+		args = append(args, "--enable-auth-status")
+	}
 	if opts.DebugFile != "" {
 		args = append(args, "--debug-file", opts.DebugFile)
 	}
@@ -420,11 +432,17 @@ func BuildCLIArgs(opts *RunOptions) []string {
 	if opts.ExcludeDynamicSystemPromptSections {
 		args = append(args, "--exclude-dynamic-system-prompt-sections")
 	}
+	if opts.MaxThinkingTokens > 0 {
+		args = append(args, "--max-thinking-tokens", strconv.Itoa(opts.MaxThinkingTokens))
+	}
 	if opts.MaxBudgetUSD > 0 {
 		args = append(args, "--max-budget-usd", fmt.Sprintf("%g", opts.MaxBudgetUSD))
 	}
 	if opts.NoSessionPersistence {
 		args = append(args, "--no-session-persistence")
+	}
+	if opts.NoChrome {
+		args = append(args, "--no-chrome")
 	}
 
 	if shouldUseFileArgument(opts.SystemPrompt) {

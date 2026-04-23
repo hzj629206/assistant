@@ -1258,7 +1258,7 @@ func logAppServerProcessExit(cmd *exec.Cmd, err error) {
 		return
 	}
 	if err == nil {
-		log.Printf("app-server runner process exited: pid=%d", cmd.Process.Pid)
+		log.Printf("app-server runner process exited: pid=%d exit_code=0", cmd.Process.Pid)
 		return
 	}
 
@@ -1266,7 +1266,19 @@ func logAppServerProcessExit(cmd *exec.Cmd, err error) {
 	if errors.As(err, &exitErr) && exitErr.ProcessState != nil {
 		waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
 		if ok && waitStatus.Signaled() {
-			log.Printf("app-server runner process exited: pid=%d", cmd.Process.Pid)
+			log.Printf(
+				"app-server runner process exited: pid=%d signal=%s",
+				cmd.Process.Pid,
+				waitStatus.Signal(),
+			)
+			return
+		}
+		if ok && waitStatus.Exited() {
+			log.Printf(
+				"app-server runner process exited: pid=%d exit_code=%d",
+				cmd.Process.Pid,
+				waitStatus.ExitStatus(),
+			)
 			return
 		}
 	}
@@ -1309,10 +1321,17 @@ func signalAppServerProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
 	}
 
 	err := syscall.Kill(-cmd.Process.Pid, signal)
-	if err == nil || errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+	if ignoreExpectedAppServerSignalError(err) {
 		return nil
 	}
 	return err
+}
+
+func ignoreExpectedAppServerSignalError(err error) bool {
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM)
 }
 
 func ignoreExpectedAppServerExit(err error) error {

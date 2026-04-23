@@ -7,6 +7,66 @@ import (
 	"testing"
 )
 
+func TestBuildCLIArgsHonorsVerboseAndClaudeFlags(t *testing.T) {
+	t.Parallel()
+
+	args := BuildCLIArgs(&RunOptions{
+		Verbose:                true,
+		PermissionMode:         PermissionModeAcceptEdits,
+		SettingSources:         []string{"user", "project", "local"},
+		IncludePartialMessages: true,
+		ReplayUserMessages:     true,
+		Debug:                  true,
+		DebugToStderr:          true,
+		EnableAuthStatus:       true,
+		MaxThinkingTokens:      31999,
+		NoChrome:               true,
+	})
+
+	for _, expected := range []string{
+		"--verbose",
+		"--permission-prompt-tool",
+		"stdio",
+		"--permission-mode",
+		string(PermissionModeAcceptEdits),
+		"--setting-sources",
+		"user,project,local",
+		"--include-partial-messages",
+		"--replay-user-messages",
+		"--debug",
+		"--debug-to-stderr",
+		"--enable-auth-status",
+		"--max-thinking-tokens",
+		"31999",
+		"--no-chrome",
+	} {
+		if !slices.Contains(args, expected) {
+			t.Fatalf("expected %q in args, got %q", expected, args)
+		}
+	}
+}
+
+func TestPreprocessOptionsRejectsNegativeMaxThinkingTokens(t *testing.T) {
+	t.Parallel()
+
+	err := PreprocessOptions(&RunOptions{MaxThinkingTokens: -1})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+}
+
+func TestBuildCLIArgsOmitsVerboseByDefault(t *testing.T) {
+	t.Parallel()
+
+	args := BuildCLIArgs(&RunOptions{})
+	if slices.Contains(args, "--verbose") {
+		t.Fatalf("did not expect verbose flag by default, got %q", args)
+	}
+	if !slices.Contains(args, "--permission-prompt-tool") || !slices.Contains(args, "stdio") {
+		t.Fatalf("expected stdio permission prompt tool by default, got %q", args)
+	}
+}
+
 func TestBuildProcessArgsUsesFileFlagsOnlyForExistingFiles(t *testing.T) {
 	t.Parallel()
 

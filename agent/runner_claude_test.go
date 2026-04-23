@@ -37,6 +37,16 @@ func TestNewClaudeCodeRunnerPreservesExplicitPermissionMode(t *testing.T) {
 	}
 }
 
+func TestNewClaudeCodeRunnerDefaultsSettingSources(t *testing.T) {
+	t.Parallel()
+
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	want := []string{"user", "project", "local"}
+	if !slices.Equal(runner.runOptions.SettingSources, want) {
+		t.Fatalf("unexpected setting sources: %q", runner.runOptions.SettingSources)
+	}
+}
+
 func TestNewClaudeCodeRunnerDefaultsWorkingDirectoryToCurrentDirectory(t *testing.T) {
 	t.Parallel()
 
@@ -61,6 +71,34 @@ func TestNewClaudeCodeRunnerPreservesExplicitWorkingDirectory(t *testing.T) {
 	})
 	if runner.runOptions.WorkingDirectory != "/tmp/assistant-claude" {
 		t.Fatalf("unexpected working directory: %q", runner.runOptions.WorkingDirectory)
+	}
+}
+
+func TestClaudeProcessExitLogDetailsIncludesSignal(t *testing.T) {
+	t.Parallel()
+
+	err := exec.CommandContext(context.Background(), "sh", "-c", "kill -TERM $$").Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	got := claudeProcessExitLogDetails(err)
+	if got != "signal=terminated" {
+		t.Fatalf("unexpected signal details: %q", got)
+	}
+}
+
+func TestClaudeProcessExitLogDetailsIncludesExitCode(t *testing.T) {
+	t.Parallel()
+
+	err := exec.CommandContext(context.Background(), "sh", "-c", "exit 7").Run()
+	if err == nil {
+		t.Fatal("Run returned nil, want exit error")
+	}
+
+	got := claudeProcessExitLogDetails(err)
+	if got != "exit_code=7" {
+		t.Fatalf("unexpected exit code details: %q", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"os/exec"
@@ -129,6 +130,9 @@ type RunOptions struct {
 	IncludeHookEvents                  bool
 	IncludePartialMessages             bool
 	ReplayUserMessages                 bool
+	Debug                              bool
+	DebugToStderr                      bool
+	EnableAuthStatus                   bool
 	DebugFile                          string
 	Bare                               bool
 	Brief                              bool
@@ -137,10 +141,12 @@ type RunOptions struct {
 	ExcludeDynamicSystemPromptSections bool
 	PermissionMode                     PermissionMode
 	OutputSchema                       any
+	MaxThinkingTokens                  int
 	MaxBudgetUSD                       float64
 	SessionID                          string
 	ForkSession                        bool
 	NoSessionPersistence               bool
+	NoChrome                           bool
 	MCPConfigs                         []string
 	StrictMCPConfig                    bool
 	AddDirectories                     []string
@@ -148,6 +154,7 @@ type RunOptions struct {
 	Settings                           string
 	Tools                              []string
 	WorkingDirectory                   string
+	Stderr                             io.Writer
 }
 
 // RetryPolicy defines retry behavior for transient Claude failures.
@@ -397,6 +404,9 @@ func PreprocessOptions(opts *RunOptions) error {
 	}
 	if opts.Timeout < 0 {
 		return NewValidationError("Timeout cannot be negative", "Timeout", opts.Timeout)
+	}
+	if opts.MaxThinkingTokens < 0 {
+		return NewValidationError("MaxThinkingTokens cannot be negative", "MaxThinkingTokens", opts.MaxThinkingTokens)
 	}
 	if opts.MaxBudgetUSD < 0 {
 		return NewValidationError("MaxBudgetUSD cannot be negative", "MaxBudgetUSD", opts.MaxBudgetUSD)
