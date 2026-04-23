@@ -16,7 +16,6 @@ import (
 )
 
 const defaultMaxToolIterations = 50
-const defaultModel = "gpt-5.4"
 
 // CodexRunner bridges dispatcher turns to the Codex CLI through codex-sdk-go.
 type CodexRunner struct {
@@ -79,8 +78,10 @@ func NewCodexRunner(options CodexRunnerOptions) *CodexRunner {
 	}
 
 	runner := &CodexRunner{
-		client:      client,
-		startThread: func(options codex.ThreadOptions) codexThread { return client.StartThread(options) },
+		client: client,
+		startThread: func(options codex.ThreadOptions) codexThread {
+			return client.StartThread(options)
+		},
 		resumeThread: func(threadID string, options codex.ThreadOptions) codexThread {
 			return client.ResumeThread(threadID, options)
 		},

@@ -44,14 +44,13 @@ type AppServerRunner struct {
 
 // AppServerRunnerOptions configures an AppServerRunner.
 type AppServerRunnerOptions struct {
-	Client            *appcodex.Codex
-	CodexOptions      appcodex.Options
-	StartOptions      appcodex.ThreadStartOptions
-	ResumeOptions     appcodex.ThreadResumeOptions
-	TurnOptions       appcodex.TurnOptions
-	SystemPrompt      string
-	Tools             []Tool
-	MaxToolIterations int
+	Client        *appcodex.Codex
+	CodexOptions  appcodex.Options
+	StartOptions  appcodex.ThreadStartOptions
+	ResumeOptions appcodex.ThreadResumeOptions
+	TurnOptions   appcodex.TurnOptions
+	SystemPrompt  string
+	Tools         []Tool
 }
 
 type appServerThread interface {
@@ -87,18 +86,9 @@ var (
 const (
 	appServerConfigWebSearchKey      = "web_search"
 	appServerSandboxNetworkAccessKey = "networkAccess"
-	appServerStdioCloseTimeout       = 2 * time.Second
-	appServerStdioTerminateTimeout   = 2 * time.Second
+	appServerStdioCloseTimeout       = 5 * time.Second
+	appServerStdioTerminateTimeout   = 5 * time.Second
 )
-
-var appServerOptOutNotificationMethods = []string{
-	"command/exec/outputDelta",
-	"item/agentMessage/delta",
-	"item/fileChange/outputDelta",
-	"item/plan/delta",
-	"item/reasoning/summaryTextDelta",
-	"item/reasoning/textDelta",
-}
 
 func (p SandboxPolicy) String() string {
 	switch p["type"] {
@@ -111,6 +101,15 @@ func (p SandboxPolicy) String() string {
 	default:
 		return ""
 	}
+}
+
+var appServerOptOutNotificationMethods = []string{
+	"command/exec/outputDelta",
+	"item/agentMessage/delta",
+	"item/fileChange/outputDelta",
+	"item/plan/delta",
+	"item/reasoning/summaryTextDelta",
+	"item/reasoning/textDelta",
 }
 
 // NewAppServerRunner builds a runner backed by the Codex app-server.
@@ -144,6 +143,10 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 		turnOptions.ApprovalPolicy = appcodex.ApprovalPolicyNever
 	}
 
+	if turnOptions.Effort == nil {
+		turnOptions.Effort = appcodex.ReasoningEffortLow
+	}
+
 	startOptions.Config = defaultAppServerConfig(startOptions.Config)
 	resumeOptions.Config = defaultAppServerConfig(resumeOptions.Config)
 
@@ -161,16 +164,13 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	turnOptions.SandboxPolicy = normalizeAppServerSandboxPolicy(turnOptions.SandboxPolicy)
 	startOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(startOptions.SandboxPolicy)
 	resumeOptions.Sandbox = applyWorkspaceWriteNetworkAccess(resumeOptions.Sandbox)
+	turnOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(turnOptions.SandboxPolicy)
+	// threads use string, turns use map.
 	if sandboxPolicy, ok := startOptions.SandboxPolicy.(SandboxPolicy); ok {
 		startOptions.SandboxPolicy = sandboxPolicy.String()
 	}
 	if sandboxPolicy, ok := resumeOptions.Sandbox.(SandboxPolicy); ok {
 		resumeOptions.Sandbox = sandboxPolicy.String()
-	}
-	turnOptions.SandboxPolicy = applyWorkspaceWriteNetworkAccess(turnOptions.SandboxPolicy)
-
-	if turnOptions.Effort == nil {
-		turnOptions.Effort = appcodex.ReasoningEffortLow
 	}
 
 	runner := &AppServerRunner{

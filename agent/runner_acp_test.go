@@ -114,6 +114,48 @@ func TestACPRunnerRunTurnRegistersHTTPToolServerForGlobalTools(t *testing.T) {
 	}
 }
 
+func TestACPRunnerRunTurnAuthorizesMCPTokenDuringSessionStartup(t *testing.T) {
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command: "agent",
+		Args:    []string{"acp"},
+		Tools:   []Tool{uppercaseTool{}},
+	})
+
+	fakeSession := &fakeACPSession{
+		sessionID: "session-new",
+		replyText: "done",
+		caps:      acp.AgentCapabilities{MCP: acp.MCPCapabilities{HTTP: true}},
+	}
+	runner.sessionFactory = func(_ context.Context, options acp.SessionOptions) (acp.Session, error) {
+		if len(options.MCPServers) != 1 {
+			t.Fatalf("expected one MCP server, got %d", len(options.MCPServers))
+		}
+		if len(options.MCPServers[0].Headers) == 0 {
+			t.Fatalf("expected MCP auth header, got %#v", options.MCPServers[0].Headers)
+		}
+		token, ok := strings.CutPrefix(options.MCPServers[0].Headers[0].Value, "Bearer ")
+		if !ok || token == "" {
+			t.Fatalf("unexpected auth header: %#v", options.MCPServers[0].Headers[0])
+		}
+		if !runner.isAuthorizedACPToken(token) {
+			t.Fatal("expected MCP token to be authorized during session startup")
+		}
+		return fakeSession, nil
+	}
+
+	_, err := runner.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1"},
+		Message: InboundMessage{
+			Text:   "hello",
+			Kind:   MessageKindText,
+			Sender: "user",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunTurn failed: %v", err)
+	}
+}
+
 func TestACPRunnerReusesSessionForSameConversation(t *testing.T) {
 	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
 		Command: "agent",

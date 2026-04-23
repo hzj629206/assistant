@@ -19,6 +19,8 @@ import (
 	apprpc "github.com/pmenglund/codex-sdk-go/rpc"
 )
 
+const testDefaultModel = "gpt-5.4"
+
 type fakeAppServerThread struct {
 	id string
 }
@@ -912,7 +914,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			ID:     apprpc.NewIntRequestID(2),
 			Method: "thread/start",
 			Params: appServerMustRaw(t, map[string]any{
-				"model":                 defaultModel,
+				"model":                 testDefaultModel,
 				"cwd":                   cwd,
 				"approvalPolicy":        "never",
 				"developerInstructions": "Global system prompt.",
@@ -956,7 +958,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 				"sandboxPolicy": map[string]any{
 					"type": "readOnly",
 				},
-				"model":  defaultModel,
+				"model":  testDefaultModel,
 				"effort": "medium",
 			}),
 		}),
@@ -1032,11 +1034,11 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			},
 		},
 		StartOptions: appcodex.ThreadStartOptions{
-			Model: defaultModel,
+			Model: testDefaultModel,
 			Cwd:   cwd,
 		},
 		TurnOptions: appcodex.TurnOptions{
-			Model:  defaultModel,
+			Model:  testDefaultModel,
 			Cwd:    cwd,
 			Effort: appcodex.ReasoningEffortMedium,
 		},

@@ -47,6 +47,7 @@ type ACPRunner struct {
 	tools         []Tool
 	sessionsMu    sync.Mutex
 	sessions      map[string]*acpRunnerSession
+	pendingTokens map[string]struct{}
 	activeTurns   map[string]TurnRequest
 	toolServer    *acp.HTTPToolServer
 	closed        bool
@@ -93,6 +94,7 @@ func NewACPRunner(ctx context.Context, options ACPRunnerOptions) *ACPRunner {
 		workDir:            workDir,
 		sessionIdleTimeout: options.SessionIdleTimeout,
 		sessions:           make(map[string]*acpRunnerSession),
+		pendingTokens:      make(map[string]struct{}),
 		activeTurns:        make(map[string]TurnRequest),
 	}
 	if ctx == nil {
@@ -134,6 +136,7 @@ func (r *ACPRunner) Close() error {
 		sessions = append(sessions, session)
 		delete(r.sessions, key)
 	}
+	clear(r.pendingTokens)
 	clear(r.activeTurns)
 	toolServer := r.toolServer
 	r.toolServer = nil
@@ -291,6 +294,16 @@ func (r *ACPRunner) acquireACPSession(ctx context.Context, conversationKey, sess
 	if err != nil {
 		return nil, err
 	}
+	r.sessionsMu.Lock()
+	if r.closed {
+		r.sessionsMu.Unlock()
+		return nil, errors.New("acp runner is closed")
+	}
+	r.pendingTokens[token] = struct{}{}
+	r.sessionsMu.Unlock()
+	defer func() {
+		r.unregisterPendingACPToken(token)
+	}()
 	if needsTools {
 		toolServer, err := r.ensureACPToolServer(context.WithoutCancel(ctx))
 		if err != nil {
@@ -336,6 +349,7 @@ func (r *ACPRunner) acquireACPSession(ctx context.Context, conversationKey, sess
 		_ = session.Close()
 		return existing, nil
 	}
+	delete(r.pendingTokens, token)
 	r.sessions[conversationKey] = managed
 	return managed, nil
 }
@@ -419,12 +433,25 @@ func (r *ACPRunner) ensureACPToolServer(ctx context.Context) (*acp.HTTPToolServe
 func (r *ACPRunner) isAuthorizedACPToken(token string) bool {
 	r.sessionsMu.Lock()
 	defer r.sessionsMu.Unlock()
+	if _, ok := r.pendingTokens[token]; ok {
+		return true
+	}
 	for _, managed := range r.sessions {
 		if managed.token == token {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *ACPRunner) unregisterPendingACPToken(token string) {
+	if r == nil || strings.TrimSpace(token) == "" {
+		return
+	}
+
+	r.sessionsMu.Lock()
+	delete(r.pendingTokens, token)
+	r.sessionsMu.Unlock()
 }
 
 func (r *ACPRunner) activeTurnForToken(token string) (TurnRequest, bool) {
