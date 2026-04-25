@@ -60,6 +60,11 @@ func (s *ConversationStore) PutConversation(ctx context.Context, state Conversat
 	return s.storage.Set(ctx, conversationCacheKey(state.Key), data, s.conversationTTL)
 }
 
+// DeleteConversation removes one persisted conversation state by key.
+func (s *ConversationStore) DeleteConversation(ctx context.Context, key string) error {
+	return s.storage.Del(ctx, conversationCacheKey(key))
+}
+
 // MarkProcessed records one source event id and reports whether it was new.
 func (s *ConversationStore) MarkProcessed(ctx context.Context, eventID string) (bool, error) {
 	if eventID == "" {

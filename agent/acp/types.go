@@ -9,7 +9,9 @@ import (
 // Session provides one reusable ACP subprocess session.
 type Session interface {
 	RunTurn(ctx context.Context, blocks []ContentBlock) (TurnResult, error)
-	CurrentSessionID() string
+	Interrupt(ctx context.Context) error
+	SessionID() string
+	Status() SessionMetadata
 	Capabilities() AgentCapabilities
 	Close() error
 }
@@ -33,6 +35,25 @@ type SessionOptions struct {
 	Stderr          io.Writer
 	Observer        Observer
 	Permission      PermissionHandler
+}
+
+// SessionMetadata contains ACP session state exposed by the protocol.
+type SessionMetadata struct {
+	SessionID     string
+	Modes         SessionModes
+	ConfigOptions json.RawMessage
+}
+
+// SessionMode describes one ACP mode returned by the agent.
+type SessionMode struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// SessionModes describes the ACP mode state returned by the agent.
+type SessionModes struct {
+	CurrentModeID  string        `json:"currentModeId"`
+	AvailableModes []SessionMode `json:"availableModes"`
 }
 
 // MCPServer describes one MCP server passed to the ACP agent.

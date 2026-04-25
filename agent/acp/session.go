@@ -28,6 +28,9 @@ const (
 
 var processHandshakeTimeout = 30 * time.Second
 
+// ErrSessionBusy reports that the ACP session already has an active turn.
+var ErrSessionBusy = errors.New("acp session already has an active turn")
+
 type processSession struct {
 	//nolint:containedctx // This is the session lifecycle root context, not a per-request context.
 	lifecycleCtx context.Context
@@ -41,6 +44,13 @@ type processSession struct {
 	sessionMu sync.RWMutex
 	sessionID string
 	caps      AgentCapabilities
+	status    SessionMetadata
+
+	turnMu     sync.Mutex
+	activeTurn *processActiveTurn
+
+	permissionMu      sync.Mutex
+	pendingPermission map[string]*pendingPermissionRequest
 
 	promptMu      sync.Mutex
 	promptBuilder *strings.Builder
@@ -49,14 +59,25 @@ type processSession struct {
 	wg sync.WaitGroup
 }
 
-type sessionMode struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
+type processActiveTurn struct {
+	sessionID          string
+	done               chan struct{}
+	interruptRequested chan struct{}
+	interruptDone      chan struct{}
+	interruptSent      bool
+	interruptFinished  bool
+	interruptErr       error
+	interrupted        bool
 }
 
-type sessionModes struct {
-	CurrentModeID  string        `json:"currentModeId"`
-	AvailableModes []sessionMode `json:"availableModes"`
+type pendingPermissionRequest struct {
+	id         string
+	rawID      json.RawMessage
+	request    PermissionRequest
+	activeTurn *processActiveTurn
+	cancel     context.CancelFunc
+	done       chan struct{}
+	responded  bool
 }
 
 // StartSession starts one ACP subprocess session.
@@ -256,7 +277,7 @@ func (s *processSession) loadSession(ctx context.Context, sessionID string, work
 	}
 	var payload struct {
 		SessionID     string          `json:"sessionId"`
-		Modes         sessionModes    `json:"modes"`
+		Modes         SessionModes    `json:"modes"`
 		ConfigOptions json.RawMessage `json:"configOptions"`
 	}
 	if len(result) != 0 && !bytes.Equal(bytes.TrimSpace(result), []byte("null")) {
@@ -265,12 +286,12 @@ func (s *processSession) loadSession(ctx context.Context, sessionID string, work
 		}
 	}
 	if strings.TrimSpace(payload.SessionID) != "" {
-		s.setSessionID(payload.SessionID)
+		s.setSessionState(payload.SessionID, payload.Modes, payload.ConfigOptions)
 		logModes("session/load", payload.SessionID, payload.Modes)
 		logConfigOptions("session/load", payload.SessionID, payload.ConfigOptions)
 		return nil
 	}
-	s.setSessionID(sessionID)
+	s.setSessionState(sessionID, payload.Modes, payload.ConfigOptions)
 	logModes("session/load", sessionID, payload.Modes)
 	logConfigOptions("session/load", sessionID, payload.ConfigOptions)
 	return nil
@@ -290,7 +311,7 @@ func (s *processSession) newSession(ctx context.Context, workDir string, mcpServ
 	}
 	var payload struct {
 		SessionID     string          `json:"sessionId"`
-		Modes         sessionModes    `json:"modes"`
+		Modes         SessionModes    `json:"modes"`
 		ConfigOptions json.RawMessage `json:"configOptions"`
 	}
 	if err = json.Unmarshal(result, &payload); err != nil {
@@ -299,17 +320,23 @@ func (s *processSession) newSession(ctx context.Context, workDir string, mcpServ
 	if strings.TrimSpace(payload.SessionID) == "" {
 		return errors.New("session/new returned empty sessionId")
 	}
-	s.setSessionID(payload.SessionID)
+	s.setSessionState(payload.SessionID, payload.Modes, payload.ConfigOptions)
 	logModes("session/new", payload.SessionID, payload.Modes)
 	logConfigOptions("session/new", payload.SessionID, payload.ConfigOptions)
 	return nil
 }
 
 func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (TurnResult, error) {
-	sessionID := s.CurrentSessionID()
+	sessionID := s.SessionID()
 	if sessionID == "" {
 		return TurnResult{}, errors.New("acp session id is empty")
 	}
+
+	activeTurn, err := s.startActiveTurn(sessionID)
+	if err != nil {
+		return TurnResult{}, err
+	}
+	defer s.finishActiveTurn(activeTurn)
 
 	s.promptMu.Lock()
 	s.promptBuilder = &strings.Builder{}
@@ -320,18 +347,7 @@ func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (Tu
 		s.promptMu.Unlock()
 	}()
 
-	stopCancelHook := context.AfterFunc(ctx, func() {
-		if err := s.transport.notify("session/cancel", map[string]any{"sessionId": sessionID}); err != nil {
-			log.Printf("acp session/cancel failed: session_id=%s err=%v", sanitizeLogValue(sessionID), err)
-		} else {
-			log.Printf("acp session/cancel sent: session_id=%s", sanitizeLogValue(sessionID))
-		}
-	})
-	defer func() {
-		if ctx.Err() == nil {
-			stopCancelHook()
-		}
-	}()
+	go s.watchTurnInterrupt(ctx, activeTurn)
 
 	result, err := s.transport.call(ctx, "session/prompt", map[string]any{
 		"sessionId": sessionID,
@@ -340,6 +356,10 @@ func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (Tu
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("acp session/prompt failed: %w", err)
 	}
+	if s.wasTurnInterrupted(activeTurn) {
+		return TurnResult{}, context.Canceled
+	}
+	logACPStopReason(sessionID, result)
 
 	s.promptMu.Lock()
 	reply := ""
@@ -348,10 +368,46 @@ func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (Tu
 	}
 	s.promptMu.Unlock()
 	return TurnResult{
-		SessionID: s.CurrentSessionID(),
+		SessionID: s.SessionID(),
 		ReplyText: reply,
 		RawResult: append(json.RawMessage(nil), result...),
 	}, nil
+}
+
+//nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
+func (s *processSession) Interrupt(ctx context.Context) error {
+	activeTurn := s.currentActiveTurn()
+	if activeTurn == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	done := s.signalTurnInterrupt(activeTurn)
+	if done != nil {
+		select {
+		case <-done:
+		case <-activeTurn.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	s.turnMu.Lock()
+	interruptErr := activeTurn.interruptErr
+	s.turnMu.Unlock()
+	if interruptErr != nil {
+		return interruptErr
+	}
+
+	select {
+	case <-activeTurn.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *processSession) Capabilities() AgentCapabilities {
@@ -360,21 +416,60 @@ func (s *processSession) Capabilities() AgentCapabilities {
 	return s.caps
 }
 
-func (s *processSession) CurrentSessionID() string {
+func (s *processSession) SessionID() string {
 	s.sessionMu.RLock()
 	defer s.sessionMu.RUnlock()
 	return s.sessionID
 }
 
+func (s *processSession) Status() SessionMetadata {
+	if s == nil {
+		return SessionMetadata{}
+	}
+
+	s.sessionMu.RLock()
+	defer s.sessionMu.RUnlock()
+
+	status := s.status
+	status.ConfigOptions = append(json.RawMessage(nil), s.status.ConfigOptions...)
+	status.Modes.AvailableModes = append([]SessionMode(nil), s.status.Modes.AvailableModes...)
+	return status
+}
+
 func (s *processSession) setSessionID(sessionID string) {
 	s.sessionMu.Lock()
 	s.sessionID = strings.TrimSpace(sessionID)
+	s.status.SessionID = s.sessionID
+	s.sessionMu.Unlock()
+}
+
+func (s *processSession) setSessionState(sessionID string, modes SessionModes, configOptions json.RawMessage) {
+	s.sessionMu.Lock()
+	s.sessionID = strings.TrimSpace(sessionID)
+	s.status = SessionMetadata{
+		SessionID: s.sessionID,
+		Modes: SessionModes{
+			CurrentModeID:  strings.TrimSpace(modes.CurrentModeID),
+			AvailableModes: append([]SessionMode(nil), modes.AvailableModes...),
+		},
+		ConfigOptions: append(json.RawMessage(nil), configOptions...),
+	}
 	s.sessionMu.Unlock()
 }
 
 func (s *processSession) Close() error {
 	if s == nil || s.closed.Swap(true) {
 		return nil
+	}
+
+	if activeTurn := s.currentActiveTurn(); activeTurn != nil {
+		done := s.signalTurnInterrupt(activeTurn)
+		if done != nil {
+			select {
+			case <-activeTurn.done:
+			case <-time.After(processTerminateTimeout):
+			}
+		}
 	}
 
 	s.cancel()
@@ -405,6 +500,168 @@ func (s *processSession) Close() error {
 
 	<-done
 	return shutdownErr
+}
+
+func (s *processSession) startActiveTurn(sessionID string) (*processActiveTurn, error) {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.activeTurn != nil {
+		return nil, ErrSessionBusy
+	}
+	activeTurn := &processActiveTurn{
+		sessionID:          strings.TrimSpace(sessionID),
+		done:               make(chan struct{}),
+		interruptRequested: make(chan struct{}),
+	}
+	s.activeTurn = activeTurn
+	return activeTurn, nil
+}
+
+func (s *processSession) finishActiveTurn(activeTurn *processActiveTurn) {
+	if activeTurn == nil {
+		return
+	}
+	s.cancelPendingPermissions(activeTurn)
+	s.turnMu.Lock()
+	if s.activeTurn == activeTurn {
+		s.activeTurn = nil
+	}
+	s.turnMu.Unlock()
+	close(activeTurn.done)
+}
+
+func (s *processSession) currentActiveTurn() *processActiveTurn {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.activeTurn == nil {
+		return nil
+	}
+	return s.activeTurn
+}
+
+func (s *processSession) signalTurnInterrupt(activeTurn *processActiveTurn) <-chan struct{} {
+	if activeTurn == nil {
+		return nil
+	}
+
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if activeTurn.interruptRequested != nil {
+		select {
+		case <-activeTurn.interruptRequested:
+		default:
+			close(activeTurn.interruptRequested)
+		}
+	}
+	activeTurn.interrupted = true
+	if activeTurn.interruptDone == nil {
+		activeTurn.interruptDone = make(chan struct{})
+	}
+	return activeTurn.interruptDone
+}
+
+func (s *processSession) requestTurnInterrupt(activeTurn *processActiveTurn) (<-chan struct{}, bool) {
+	if activeTurn == nil {
+		return nil, false
+	}
+
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if activeTurn.interruptDone == nil {
+		activeTurn.interruptDone = make(chan struct{})
+	}
+	if activeTurn.interruptSent {
+		return activeTurn.interruptDone, false
+	}
+	activeTurn.interruptSent = true
+	return activeTurn.interruptDone, true
+}
+
+func (s *processSession) finishTurnInterrupt(activeTurn *processActiveTurn, err error) {
+	if activeTurn == nil {
+		return
+	}
+
+	s.turnMu.Lock()
+	if activeTurn.interruptFinished {
+		s.turnMu.Unlock()
+		return
+	}
+	activeTurn.interrupted = true
+	activeTurn.interruptErr = err
+	activeTurn.interruptFinished = true
+	done := activeTurn.interruptDone
+	s.turnMu.Unlock()
+
+	if done != nil {
+		close(done)
+	}
+}
+
+func (s *processSession) wasTurnInterrupted(activeTurn *processActiveTurn) bool {
+	if activeTurn == nil {
+		return false
+	}
+
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	return activeTurn.interrupted
+}
+
+func (s *processSession) watchTurnInterrupt(ctx context.Context, activeTurn *processActiveTurn) {
+	if activeTurn == nil {
+		return
+	}
+
+	select {
+	case <-activeTurn.interruptRequested:
+	case <-activeTurn.done:
+		return
+	case <-ctx.Done():
+		s.signalTurnInterrupt(activeTurn)
+	}
+
+	done, shouldSend := s.requestTurnInterrupt(activeTurn)
+	if shouldSend {
+		err := s.transport.notify("session/cancel", map[string]any{"sessionId": activeTurn.sessionID})
+		if err != nil {
+			log.Printf("acp session/cancel failed: session_id=%s err=%v", sanitizeLogValue(activeTurn.sessionID), err)
+		} else {
+			log.Printf("acp session/cancel sent: session_id=%s", sanitizeLogValue(activeTurn.sessionID))
+		}
+		s.cancelPendingPermissions(activeTurn)
+		s.finishTurnInterrupt(activeTurn, err)
+		return
+	}
+	if done == nil {
+		return
+	}
+}
+
+func logACPStopReason(sessionID string, result json.RawMessage) {
+	if len(result) == 0 {
+		log.Printf("acp session/prompt completed: session_id=%s stop_reason=%s raw_result=%s", sanitizeLogValue(sessionID), sanitizeLogValue(""), sanitizeLogValue(""))
+		return
+	}
+
+	var payload struct {
+		StopReason string `json:"stopReason"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		log.Printf(
+			"acp session/prompt completed: session_id=%s raw_result_decode_err=%v raw_result=%s",
+			sanitizeLogValue(sessionID),
+			err,
+			sanitizeLogValue(string(result)),
+		)
+		return
+	}
+	log.Printf(
+		"acp session/prompt completed: session_id=%s stop_reason=%s raw_result=%s",
+		sanitizeLogValue(sessionID),
+		sanitizeLogValue(payload.StopReason),
+		sanitizeLogValue(string(result)),
+	)
 }
 
 func (s *processSession) handleNotification(method string, params json.RawMessage) {
@@ -481,7 +738,7 @@ func (s *processSession) handleRequest(method string, id json.RawMessage, params
 
 	permissionRequest := PermissionRequest{
 		Method:    method,
-		SessionID: s.CurrentSessionID(),
+		SessionID: s.SessionID(),
 		Options:   request.Options,
 		Raw:       append(json.RawMessage(nil), params...),
 	}
@@ -489,15 +746,145 @@ func (s *processSession) handleRequest(method string, id json.RawMessage, params
 		s.observer.OnPermissionRequest(permissionRequest)
 	}
 
-	decision, err := s.permission(s.lifecycleCtx, permissionRequest)
+	activeTurn := s.currentActiveTurn()
+	permissionCtx := s.lifecycleCtx
+	cancel := func() {}
+	if activeTurn != nil {
+		permissionCtx, cancel = context.WithCancel(s.lifecycleCtx)
+	}
+	pending := s.registerPendingPermission(id, permissionRequest, activeTurn, cancel)
+	if pending == nil {
+		cancel()
+		_ = s.transport.respondSuccess(id, buildPermissionResult(PermissionDecision{}))
+		return
+	}
+	defer s.unregisterPendingPermission(pending)
+
+	if s.wasTurnInterrupted(pending.activeTurn) {
+		s.respondPendingPermissionCancelled(pending)
+		return
+	}
+
+	decision, err := s.permission(permissionCtx, permissionRequest)
+	if errors.Is(err, context.Canceled) && s.wasTurnInterrupted(pending.activeTurn) {
+		s.respondPendingPermissionCancelled(pending)
+		return
+	}
 	if err != nil {
-		_ = s.transport.respondError(id, -32603, err.Error())
+		if s.tryFinishPendingPermission(pending) {
+			_ = s.transport.respondError(id, -32603, err.Error())
+		}
 		return
 	}
 	if s.observer.OnPermissionResult != nil {
 		s.observer.OnPermissionResult(permissionRequest, decision)
 	}
-	_ = s.transport.respondSuccess(id, buildPermissionResult(decision))
+	if s.tryFinishPendingPermission(pending) {
+		_ = s.transport.respondSuccess(id, buildPermissionResult(decision))
+	}
+}
+
+func (s *processSession) registerPendingPermission(id json.RawMessage, request PermissionRequest, activeTurn *processActiveTurn, cancel context.CancelFunc) *pendingPermissionRequest {
+	key := strings.Trim(string(bytes.TrimSpace(id)), "\"")
+	if key == "" {
+		return nil
+	}
+
+	if activeTurn == nil {
+		return &pendingPermissionRequest{
+			id:      key,
+			rawID:   append(json.RawMessage(nil), id...),
+			request: request,
+			cancel:  cancel,
+			done:    make(chan struct{}),
+		}
+	}
+
+	pending := &pendingPermissionRequest{
+		id:         key,
+		rawID:      append(json.RawMessage(nil), id...),
+		request:    request,
+		activeTurn: activeTurn,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+	}
+
+	s.permissionMu.Lock()
+	if s.pendingPermission == nil {
+		s.pendingPermission = make(map[string]*pendingPermissionRequest)
+	}
+	s.pendingPermission[key] = pending
+	s.permissionMu.Unlock()
+	return pending
+}
+
+func (s *processSession) unregisterPendingPermission(pending *pendingPermissionRequest) {
+	if pending == nil {
+		return
+	}
+
+	s.permissionMu.Lock()
+	current, ok := s.pendingPermission[pending.id]
+	if ok && current == pending {
+		delete(s.pendingPermission, pending.id)
+	}
+	s.permissionMu.Unlock()
+}
+
+func (s *processSession) tryFinishPendingPermission(pending *pendingPermissionRequest) bool {
+	if pending == nil {
+		return false
+	}
+
+	s.permissionMu.Lock()
+	if pending.responded {
+		s.permissionMu.Unlock()
+		return false
+	}
+	pending.responded = true
+	cancel := pending.cancel
+	done := pending.done
+	s.permissionMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		close(done)
+	}
+	return true
+}
+
+func (s *processSession) respondPendingPermissionCancelled(pending *pendingPermissionRequest) {
+	if pending == nil {
+		return
+	}
+	if !s.tryFinishPendingPermission(pending) {
+		return
+	}
+	if s.observer.OnPermissionResult != nil {
+		s.observer.OnPermissionResult(pending.request, PermissionDecision{})
+	}
+	_ = s.transport.respondSuccess(pending.rawID, buildPermissionResult(PermissionDecision{}))
+}
+
+func (s *processSession) cancelPendingPermissions(activeTurn *processActiveTurn) {
+	if activeTurn == nil {
+		return
+	}
+
+	s.permissionMu.Lock()
+	pending := make([]*pendingPermissionRequest, 0, len(s.pendingPermission))
+	for _, request := range s.pendingPermission {
+		if request.activeTurn == activeTurn {
+			pending = append(pending, request)
+		}
+	}
+	s.permissionMu.Unlock()
+
+	for _, request := range pending {
+		s.respondPendingPermissionCancelled(request)
+	}
 }
 
 func supportsAuthMethod(authMethods []struct {
@@ -524,7 +911,7 @@ func sanitizeLogValue(value string) string {
 	}, value)
 }
 
-func logModes(method string, sessionID string, modes sessionModes) {
+func logModes(method string, sessionID string, modes SessionModes) {
 	currentModeID := sanitizeLogValue(modes.CurrentModeID)
 	if len(modes.AvailableModes) == 0 {
 		log.Printf("acp %s completed without available modes: session_id=%s current_mode_id=%s", method, sanitizeLogValue(sessionID), currentModeID)

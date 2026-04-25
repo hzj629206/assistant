@@ -19,10 +19,11 @@ type testRunnerResponder struct {
 type unmarshalableTool struct{}
 
 type fakeCodexThread struct {
-	id      string
-	turns   []codex.Turn
-	inputs  []codex.Input
-	options []codex.TurnOptions
+	id            string
+	turns         []codex.Turn
+	inputs        []codex.Input
+	options       []codex.TurnOptions
+	runStreamedFn func(codex.Input, codex.TurnOptions) (*codex.StreamedTurn, error)
 }
 
 type uppercaseTool struct{}
@@ -42,6 +43,9 @@ func (t *fakeCodexThread) ID() string {
 func (t *fakeCodexThread) RunStreamed(input codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
 	t.inputs = append(t.inputs, input)
 	t.options = append(t.options, options)
+	if t.runStreamedFn != nil {
+		return t.runStreamedFn(input, options)
+	}
 	if len(t.turns) == 0 {
 		return nil, errors.New("unexpected turn")
 	}
@@ -910,8 +914,96 @@ func TestRunTurnReturnsErrorForNilRunner(t *testing.T) {
 	t.Parallel()
 
 	var runner *CodexRunner
-	_, err := runner.RunTurn(context.Background(), TurnRequest{})
-	if err == nil || err.Error() != "run codex turn failed: runner is nil" {
+	_, err := runner.StartSession(context.Background(), SessionOptions{})
+	if err == nil || err.Error() != "start codex session failed: runner is nil" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCodexStartSessionStartsThreadImmediately(t *testing.T) {
+	t.Parallel()
+
+	thread := &fakeCodexThread{id: "thread-new"}
+	startCalls := 0
+	runner := &CodexRunner{
+		startThread: func(codex.ThreadOptions) codexThread {
+			startCalls++
+			return thread
+		},
+	}
+
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("start session failed: %v", err)
+	}
+	if got := startCalls; got != 1 {
+		t.Fatalf("unexpected start call count: %d", got)
+	}
+	if session.ID() != "thread-new" {
+		t.Fatalf("unexpected session id: %s", session.ID())
+	}
+}
+
+func TestCodexStartSessionResumesThreadImmediately(t *testing.T) {
+	t.Parallel()
+
+	thread := &fakeCodexThread{id: "thread-existing"}
+	resumeCalls := 0
+	var resumedThreadID string
+	runner := &CodexRunner{
+		resumeThread: func(threadID string, _ codex.ThreadOptions) codexThread {
+			resumeCalls++
+			resumedThreadID = threadID
+			return thread
+		},
+	}
+
+	session, err := runner.StartSession(context.Background(), SessionOptions{
+		ConversationKey: "conversation-1",
+		ResumeSessionID: "thread-existing",
+	})
+	if err != nil {
+		t.Fatalf("start session failed: %v", err)
+	}
+	if got := resumeCalls; got != 1 {
+		t.Fatalf("unexpected resume call count: %d", got)
+	}
+	if resumedThreadID != "thread-existing" {
+		t.Fatalf("unexpected resumed thread id: %s", resumedThreadID)
+	}
+	if session.ID() != "thread-existing" {
+		t.Fatalf("unexpected session id: %s", session.ID())
+	}
+}
+
+func TestCodexSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T) {
+	t.Parallel()
+
+	session := &codexRunnerSession{
+		runner:          &CodexRunner{},
+		conversationKey: "conversation-1",
+		threadID:        "thread-live",
+	}
+
+	_, err := session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key:            "conversation-2",
+			RunnerThreadID: "thread-live",
+		},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `conversation key mismatch: session="conversation-1" request="conversation-2"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key:            "conversation-1",
+			RunnerThreadID: "thread-other",
+		},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `runner thread id mismatch: session="thread-live" request="thread-other"`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -925,13 +1017,17 @@ func TestRunTurnStartsThreadAndReturnsReply(t *testing.T) {
 			FinalResponse: "hello back",
 		}},
 	}
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runner := &CodexRunner{
 		startThread: func(codex.ThreadOptions) codexThread {
 			return thread
 		},
+		lifecycleCtx: lifecycleCtx,
+		cancel:       cancel,
 	}
 
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
+	result, err := runTurnWithRunner(t, runner, TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "hello",
@@ -967,7 +1063,7 @@ func TestRunTurnResumesExistingThreadAndFallsBackToConversationID(t *testing.T) 
 		},
 	}
 
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
+	result, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{
 			RunnerThreadID: "thread-existing",
 		},
@@ -1012,7 +1108,7 @@ func TestRunTurnUsesToolLoopWhenToolsRegistered(t *testing.T) {
 	}
 	runner.RegisterTools(uppercaseTool{})
 
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
+	result, err := runTurnWithRunner(t, runner, TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "uppercase hello",
@@ -1062,7 +1158,8 @@ func TestRunToolLoopExecutesToolAndReturnsFinalResponse(t *testing.T) {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
-	reply, err := runner.runToolLoop(context.Background(), req, thread, input)
+	session := &codexRunnerSession{runner: runner}
+	reply, err := session.runToolLoop(context.Background(), req, thread, input)
 	if err != nil {
 		t.Fatalf("run tool loop failed: %v", err)
 	}
@@ -1115,7 +1212,8 @@ func TestRunToolLoopRecoversFromUnknownTool(t *testing.T) {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
-	reply, err := runner.runToolLoop(context.Background(), req, thread, input)
+	session := &codexRunnerSession{runner: runner}
+	reply, err := session.runToolLoop(context.Background(), req, thread, input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1157,7 +1255,8 @@ func TestRunToolLoopSupportsSilentCompletion(t *testing.T) {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
-	reply, err := runner.runToolLoop(context.Background(), req, thread, input)
+	session := &codexRunnerSession{runner: runner}
+	reply, err := session.runToolLoop(context.Background(), req, thread, input)
 	if err != nil {
 		t.Fatalf("run tool loop failed: %v", err)
 	}
@@ -1195,7 +1294,8 @@ func TestRunToolLoopRecoversFromInvalidJSON(t *testing.T) {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
-	reply, err := runner.runToolLoop(context.Background(), req, thread, input)
+	session := &codexRunnerSession{runner: runner}
+	reply, err := session.runToolLoop(context.Background(), req, thread, input)
 	if err != nil {
 		t.Fatalf("run tool loop failed: %v", err)
 	}
@@ -1256,7 +1356,7 @@ func TestRunTurnWrapsBuildInputError(t *testing.T) {
 	}
 	runner.RegisterTools(unmarshalableTool{})
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "hello",
@@ -1276,7 +1376,7 @@ func TestRunTurnWrapsThreadExecutionError(t *testing.T) {
 		},
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "hello",
@@ -1310,7 +1410,8 @@ func TestCollectStreamedTurnSetsTypingStatusOnCompletedItems(t *testing.T) {
 		Done: closedDone(nil),
 	}
 
-	turn, err := runner.collectStreamedTurn(TurnRequest{
+	session := &codexRunnerSession{runner: runner}
+	turn, err := session.collectStreamedTurn(TurnRequest{
 		Conversation: ConversationState{Key: "private:e_1:msg-1"},
 		Message: InboundMessage{
 			Responder: responder,
@@ -1340,7 +1441,8 @@ func TestCollectStreamedTurnReturnsTurnFailure(t *testing.T) {
 		Done: closedDone(nil),
 	}
 
-	_, err := runner.collectStreamedTurn(TurnRequest{}, streamed)
+	session := &codexRunnerSession{runner: runner}
+	_, err := session.collectStreamedTurn(TurnRequest{}, streamed)
 	if err == nil || err.Error() != "boom" {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1355,9 +1457,341 @@ func TestCollectStreamedTurnReturnsStreamError(t *testing.T) {
 		Done:   closedDone(errors.New("stream failed")),
 	}
 
-	_, err := runner.collectStreamedTurn(TurnRequest{}, streamed)
+	session := &codexRunnerSession{runner: runner}
+	_, err := session.collectStreamedTurn(TurnRequest{}, streamed)
 	if err == nil || err.Error() != "stream failed" {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterruptWaitsForActiveCodexSessionTurn(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	thread := &fakeCodexThread{
+		id: "thread-interrupt",
+		runStreamedFn: func(_ codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
+			close(started)
+
+			events := make(chan codex.ThreadEvent)
+			done := make(chan error, 1)
+			go func() {
+				<-options.Context.Done()
+				<-release
+				close(events)
+				done <- options.Context.Err()
+				close(done)
+			}()
+
+			return &codex.StreamedTurn{
+				Events: events,
+				Done:   done,
+			}, nil
+		},
+	}
+	runner := &CodexRunner{
+		startThread: func(codex.ThreadOptions) codexThread {
+			return thread
+		},
+	}
+	session := &codexRunnerSession{
+		runner:          runner,
+		conversationKey: "conv-interrupt",
+		threadID:        "thread-interrupt",
+		thread:          thread,
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conv-interrupt"},
+			Message: InboundMessage{
+				Kind: MessageKindText,
+				Text: "hello",
+			},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	select {
+	case err := <-interruptDone:
+		t.Fatalf("interrupt returned before turn finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run codex turn failed: context canceled" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestInterruptedCodexSessionTurnDoesNotReturnSuccessfulResult(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	thread := &fakeCodexThread{
+		id: "thread-interrupt-success",
+		runStreamedFn: func(_ codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
+			close(started)
+
+			events := make(chan codex.ThreadEvent)
+			done := make(chan error, 1)
+			go func() {
+				<-options.Context.Done()
+				<-release
+				events <- codex.ThreadEvent{
+					Type: "item.completed",
+					Item: &codex.AgentMessageItem{
+						ID:   "agent-message",
+						Type: "agent_message",
+						Text: "partial reply",
+					},
+				}
+				events <- codex.ThreadEvent{Type: "turn.completed"}
+				close(events)
+				done <- nil
+				close(done)
+			}()
+
+			return &codex.StreamedTurn{
+				Events: events,
+				Done:   done,
+			}, nil
+		},
+	}
+	session := &codexRunnerSession{
+		runner:          &CodexRunner{},
+		conversationKey: "conv-interrupt-success",
+		threadID:        "thread-interrupt-success",
+		thread:          thread,
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conv-interrupt-success"},
+			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	close(release)
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run codex turn failed: context canceled" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestInterruptReturnsNilWithoutActiveCodexSessionTurn(t *testing.T) {
+	t.Parallel()
+
+	runner := &CodexRunner{
+		startThread: func(codex.ThreadOptions) codexThread {
+			return &fakeCodexThread{id: "thread-idle"}
+		},
+	}
+
+	err := interruptWithRunner(t, runner, ConversationState{Key: "conv-idle"})
+	if err != nil {
+		t.Fatalf("expected nil interrupt on idle session, got %v", err)
+	}
+}
+
+func TestSessionCloseCancelsActiveCodexSessionTurn(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	thread := &fakeCodexThread{
+		id: "thread-close",
+		runStreamedFn: func(_ codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
+			close(started)
+
+			events := make(chan codex.ThreadEvent)
+			done := make(chan error, 1)
+			go func() {
+				<-options.Context.Done()
+				<-release
+				close(events)
+				done <- options.Context.Err()
+				close(done)
+			}()
+
+			return &codex.StreamedTurn{
+				Events: events,
+				Done:   done,
+			}, nil
+		},
+	}
+	runner := &CodexRunner{
+		startThread: func(codex.ThreadOptions) codexThread {
+			return thread
+		},
+	}
+	session := &codexRunnerSession{
+		runner:          runner,
+		conversationKey: "conv-close",
+		threadID:        "thread-close",
+		thread:          thread,
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conv-close"},
+			Message: InboundMessage{
+				Kind: MessageKindText,
+				Text: "hello",
+			},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- session.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close failed: %v", err)
+		}
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run codex turn failed: context canceled" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestClosedCodexSessionRejectsRunTurn(t *testing.T) {
+	t.Parallel()
+
+	session := &codexRunnerSession{
+		runner: &CodexRunner{},
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	_, err := session.RunTurn(context.Background(), TurnRequest{})
+	if err == nil || err.Error() != "run codex turn failed: session is closed" {
+		t.Fatalf("unexpected run turn error: %v", err)
+	}
+}
+
+func TestCodexSessionRejectsConcurrentRunTurn(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	thread := &fakeCodexThread{
+		id: "thread-busy",
+		runStreamedFn: func(_ codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
+			close(started)
+			events := make(chan codex.ThreadEvent)
+			done := make(chan error, 1)
+			go func() {
+				<-options.Context.Done()
+				<-release
+				close(events)
+				done <- options.Context.Err()
+				close(done)
+			}()
+			return &codex.StreamedTurn{Events: events, Done: done}, nil
+		},
+	}
+	session := &codexRunnerSession{
+		runner:          &CodexRunner{},
+		conversationKey: "conv-busy",
+		threadID:        "thread-busy",
+		thread:          thread,
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conv-busy"},
+			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	_, err := session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-busy"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
+	})
+	if !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	}
+
+	close(release)
+	if err = session.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	select {
+	case <-runErrCh:
+	case <-time.After(time.Second):
+		t.Fatal("first run turn did not finish")
 	}
 }
 

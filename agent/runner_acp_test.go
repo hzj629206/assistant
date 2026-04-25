@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,11 +18,17 @@ type fakeACPSession struct {
 	replyText    string
 	rawResult    json.RawMessage
 	caps         acp.AgentCapabilities
+	status       acp.SessionMetadata
 	promptBlocks [][]acp.ContentBlock
 	closed       bool
+	runTurn      func(context.Context, []acp.ContentBlock) (acp.TurnResult, error)
+	interrupt    func(context.Context) error
 }
 
-func (s *fakeACPSession) RunTurn(_ context.Context, blocks []acp.ContentBlock) (acp.TurnResult, error) {
+func (s *fakeACPSession) RunTurn(ctx context.Context, blocks []acp.ContentBlock) (acp.TurnResult, error) {
+	if s.runTurn != nil {
+		return s.runTurn(ctx, blocks)
+	}
 	copied := make([]acp.ContentBlock, len(blocks))
 	copy(copied, blocks)
 	s.promptBlocks = append(s.promptBlocks, copied)
@@ -32,12 +39,29 @@ func (s *fakeACPSession) RunTurn(_ context.Context, blocks []acp.ContentBlock) (
 	}, nil
 }
 
-func (s *fakeACPSession) CurrentSessionID() string {
+func (s *fakeACPSession) SessionID() string {
 	return s.sessionID
+}
+
+func (s *fakeACPSession) Status() acp.SessionMetadata {
+	status := s.status
+	status.ConfigOptions = append(json.RawMessage(nil), s.status.ConfigOptions...)
+	status.Modes.AvailableModes = append([]acp.SessionMode(nil), s.status.Modes.AvailableModes...)
+	if status.SessionID == "" {
+		status.SessionID = s.sessionID
+	}
+	return status
 }
 
 func (s *fakeACPSession) Capabilities() acp.AgentCapabilities {
 	return s.caps
+}
+
+func (s *fakeACPSession) Interrupt(ctx context.Context) error {
+	if s.interrupt != nil {
+		return s.interrupt(ctx)
+	}
+	return nil
 }
 
 func (s *fakeACPSession) Close() error {
@@ -64,7 +88,7 @@ func TestACPRunnerRunTurnRegistersHTTPToolServerForGlobalTools(t *testing.T) {
 		return fakeSession, nil
 	}
 
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
+	result, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message: InboundMessage{
 			Text:   "hello",
@@ -143,7 +167,7 @@ func TestACPRunnerRunTurnAuthorizesMCPTokenDuringSessionStartup(t *testing.T) {
 		return fakeSession, nil
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message: InboundMessage{
 			Text:   "hello",
@@ -156,35 +180,32 @@ func TestACPRunnerRunTurnAuthorizesMCPTokenDuringSessionStartup(t *testing.T) {
 	}
 }
 
-func TestACPRunnerReusesSessionForSameConversation(t *testing.T) {
+func TestACPRunnerRunTurnResumesExistingSession(t *testing.T) {
 	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
 		Command: "agent",
 		Args:    []string{"acp"},
 	})
-	runner.sessionIdleTimeout = time.Minute
 
 	createCount := 0
-	firstSession := &fakeACPSession{
-		sessionID: "session-live",
-		replyText: "ok",
-		caps:      acp.AgentCapabilities{MCP: acp.MCPCapabilities{HTTP: true}},
-	}
+	resumeIDs := make([]string, 0, 2)
 	runner.sessionFactory = func(_ context.Context, options acp.SessionOptions) (acp.Session, error) {
 		createCount++
-		if createCount > 1 {
-			t.Fatalf("unexpected session recreation with options: %#v", options)
-		}
-		return firstSession, nil
+		resumeIDs = append(resumeIDs, options.ResumeSessionID)
+		return &fakeACPSession{
+			sessionID: "session-live",
+			replyText: "ok",
+			caps:      acp.AgentCapabilities{MCP: acp.MCPCapabilities{HTTP: true}},
+		}, nil
 	}
 
-	first, err := runner.RunTurn(context.Background(), TurnRequest{
+	first, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
 	})
 	if err != nil {
 		t.Fatalf("first RunTurn failed: %v", err)
 	}
-	second, err := runner.RunTurn(context.Background(), TurnRequest{
+	second, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: first.RunnerThreadID},
 		Message:      InboundMessage{Text: "again", Kind: MessageKindText, Sender: "user"},
 	})
@@ -192,14 +213,53 @@ func TestACPRunnerReusesSessionForSameConversation(t *testing.T) {
 		t.Fatalf("second RunTurn failed: %v", err)
 	}
 
-	if createCount != 1 {
+	if createCount != 2 {
 		t.Fatalf("unexpected session create count: %d", createCount)
+	}
+	if len(resumeIDs) != 2 || resumeIDs[0] != "" || resumeIDs[1] != "session-live" {
+		t.Fatalf("unexpected resume ids: %#v", resumeIDs)
 	}
 	if second.RunnerThreadID != "session-live" {
 		t.Fatalf("unexpected reused session id: %q", second.RunnerThreadID)
 	}
-	if firstSession.closed {
-		t.Fatal("expected reused session to remain open")
+}
+
+func TestACPRunnerSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T) {
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command: "agent",
+		Args:    []string{"acp"},
+	})
+	runner.sessionFactory = func(_ context.Context, _ acp.SessionOptions) (acp.Session, error) {
+		return &fakeACPSession{
+			sessionID: "session-live",
+			replyText: "ok",
+		}, nil
+	}
+	session := startTestSession(t, runner, ConversationState{
+		Key:            "conversation-1",
+		RunnerThreadID: "session-live",
+	})
+
+	_, err := session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key:            "conversation-2",
+			RunnerThreadID: "session-live",
+		},
+		Message: InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `conversation key mismatch: session="conversation-1" request="conversation-2"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key:            "conversation-1",
+			RunnerThreadID: "session-other",
+		},
+		Message: InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `runner thread id mismatch: session="session-live" request="session-other"`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -220,7 +280,7 @@ func TestACPRunnerSessionFactoryContextOutlivesOneTurn(t *testing.T) {
 		}, nil
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-ctx"},
 		Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
 	})
@@ -272,7 +332,7 @@ func TestACPRunnerIgnoresParentContextCancellationForSessionLifecycle(t *testing
 
 	cancelParent()
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-parent-cancel"},
 		Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
 	})
@@ -304,28 +364,322 @@ func TestACPRunnerIgnoresParentContextCancellationForSessionLifecycle(t *testing
 	}
 }
 
-func TestACPRunnerCloseClosesManagedSessions(t *testing.T) {
+func TestACPRunnerSessionCloseClosesUnderlyingSession(t *testing.T) {
 	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
 		Command: "agent",
 		Args:    []string{"acp"},
 	})
 
-	firstSession := &fakeACPSession{sessionID: "session-1"}
-	secondSession := &fakeACPSession{sessionID: "session-2"}
-	runner.sessions["conversation-1"] = &acpRunnerSession{session: firstSession}
-	runner.sessions["conversation-2"] = &acpRunnerSession{session: secondSession}
+	fakeSession := &fakeACPSession{sessionID: "session-1"}
+	session := &acpRunnerSession{
+		runner:          runner,
+		conversationKey: "conversation-1",
+		sessionID:       "session-1",
+		session:         fakeSession,
+	}
 
-	if err := runner.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
+	if err := session.Close(); err != nil {
+		t.Fatalf("session Close failed: %v", err)
 	}
-	if !firstSession.closed || !secondSession.closed {
-		t.Fatal("expected Close to close all managed sessions")
+	if !fakeSession.closed {
+		t.Fatal("expected session Close to close the underlying session")
 	}
-	if len(runner.sessions) != 0 {
-		t.Fatalf("expected sessions to be cleared, got %d", len(runner.sessions))
+}
+
+func TestACPRunnerSessionStatusIncludesACPMetadata(t *testing.T) {
+	t.Parallel()
+
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command:    "agent",
+		Args:       []string{"acp"},
+		WorkingDir: "/workspace",
+	})
+
+	session := &acpRunnerSession{
+		runner:          runner,
+		conversationKey: "conversation-1",
+		sessionID:       "session-1",
+		session: &fakeACPSession{
+			sessionID: "session-1",
+			status: acp.SessionMetadata{
+				SessionID: "session-1",
+				Modes: acp.SessionModes{
+					CurrentModeID: "workspace-write",
+					AvailableModes: []acp.SessionMode{
+						{ID: "workspace-write", Label: "Workspace Write"},
+						{ID: "read-only", Label: "Read Only"},
+					},
+				},
+				ConfigOptions: json.RawMessage(`{"model":"gpt-5.4","effort":"medium"}`),
+			},
+		},
 	}
-	if err := runner.Close(); err != nil {
-		t.Fatalf("second Close failed: %v", err)
+
+	status, err := session.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status failed: %v", err)
+	}
+	if status.Agent != "acp" {
+		t.Fatalf("unexpected agent: %q", status.Agent)
+	}
+	if len(status.WorkingDirectories) != 1 || status.WorkingDirectories[0] != "/workspace" {
+		t.Fatalf("unexpected working directories: %#v", status.WorkingDirectories)
+	}
+	if status.Modes.CurrentModeID != "workspace-write" {
+		t.Fatalf("unexpected current mode: %q", status.Modes.CurrentModeID)
+	}
+	if len(status.Modes.AvailableModes) != 2 {
+		t.Fatalf("unexpected available modes: %#v", status.Modes.AvailableModes)
+	}
+	if len(status.ConfigOptions) != 2 {
+		t.Fatalf("unexpected config options: %#v", status.ConfigOptions)
+	}
+	seen := make(map[string]string, len(status.ConfigOptions))
+	for _, option := range status.ConfigOptions {
+		seen[option.Name] = option.CurrentValue
+	}
+	if seen["model"] != "gpt-5.4" {
+		t.Fatalf("unexpected model config option: %#v", status.ConfigOptions)
+	}
+	if seen["effort"] != "medium" {
+		t.Fatalf("unexpected effort config option: %#v", status.ConfigOptions)
+	}
+}
+
+func TestACPRunnerSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
+	t.Parallel()
+
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command: "agent",
+		Args:    []string{"acp"},
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	interruptCalled := make(chan struct{}, 1)
+	runner.sessionFactory = func(_ context.Context, _ acp.SessionOptions) (acp.Session, error) {
+		return &fakeACPSession{
+			sessionID: "session-live",
+			runTurn: func(context.Context, []acp.ContentBlock) (acp.TurnResult, error) {
+				close(started)
+				<-release
+				close(finished)
+				return acp.TurnResult{}, errors.New("interrupted")
+			},
+			interrupt: func(context.Context) error {
+				interruptCalled <- struct{}{}
+				<-finished
+				return nil
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conversation-1"},
+			Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	select {
+	case err := <-interruptDone:
+		t.Fatalf("interrupt returned before turn finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run acp turn failed: interrupted" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestACPRunnerSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T) {
+	t.Parallel()
+
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command: "agent",
+		Args:    []string{"acp"},
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	interruptCalled := make(chan struct{}, 1)
+	runner.sessionFactory = func(_ context.Context, _ acp.SessionOptions) (acp.Session, error) {
+		return &fakeACPSession{
+			sessionID: "session-live",
+			runTurn: func(context.Context, []acp.ContentBlock) (acp.TurnResult, error) {
+				close(started)
+				<-release
+				close(finished)
+				return acp.TurnResult{SessionID: "session-live", ReplyText: "partial reply"}, nil
+			},
+			interrupt: func(context.Context) error {
+				interruptCalled <- struct{}{}
+				<-finished
+				return nil
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conversation-1"},
+			Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	select {
+	case <-interruptCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected interrupt to be called")
+	}
+
+	close(release)
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run acp turn failed: context canceled" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestACPRunnerInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
+	t.Parallel()
+
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command: "agent",
+		Args:    []string{"acp"},
+	})
+	runner.sessionFactory = func(_ context.Context, _ acp.SessionOptions) (acp.Session, error) {
+		return &fakeACPSession{
+			sessionID: "session-idle",
+			replyText: "ok",
+		}, nil
+	}
+
+	err := interruptWithRunner(t, runner, ConversationState{Key: "conversation-idle"})
+	if err != nil {
+		t.Fatalf("expected nil interrupt on idle session, got %v", err)
+	}
+}
+
+func TestACPRunnerSessionCloseWaitsForActiveTurnCompletion(t *testing.T) {
+	t.Skip("runner close is a thin delegation layer; wait semantics are covered by agent/acp session tests")
+}
+
+func TestACPRunnerSessionRejectsConcurrentRunTurn(t *testing.T) {
+	t.Parallel()
+
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command: "agent",
+		Args:    []string{"acp"},
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runner.sessionFactory = func(_ context.Context, _ acp.SessionOptions) (acp.Session, error) {
+		return &fakeACPSession{
+			sessionID: "session-live",
+			runTurn: func(context.Context, []acp.ContentBlock) (acp.TurnResult, error) {
+				select {
+				case <-started:
+					return acp.TurnResult{}, acp.ErrSessionBusy
+				default:
+					close(started)
+				}
+				<-release
+				return acp.TurnResult{}, errors.New("interrupted")
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-busy"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conversation-busy"},
+			Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-busy"},
+		Message:      InboundMessage{Text: "again", Kind: MessageKindText, Sender: "user"},
+	})
+	if !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	}
+
+	close(release)
+
+	select {
+	case err = <-runErrCh:
+		if err == nil || err.Error() != "run acp turn failed: interrupted" {
+			t.Fatalf("unexpected first run error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first run turn did not finish")
 	}
 }
 
@@ -347,7 +701,7 @@ func TestACPRunnerRunTurnDoesNotRepeatSystemPromptOnResume(t *testing.T) {
 		return fakeSession, nil
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: "session-existing"},
 		Message: InboundMessage{
 			Text:   "hello",
@@ -365,6 +719,66 @@ func TestACPRunnerRunTurnDoesNotRepeatSystemPromptOnResume(t *testing.T) {
 	text := textFromACPBlock(t, fakeSession.promptBlocks[0][0])
 	if text != "Current message context:\n- time: unknown\n- sender: `user`\n\nhello" {
 		t.Fatalf("unexpected resumed prompt: %q", text)
+	}
+}
+
+func TestACPRunnerRunTurnDoesNotRepeatSystemPromptWithinSameSession(t *testing.T) {
+	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
+		Command:      "agent",
+		Args:         []string{"acp"},
+		SystemPrompt: "System rule",
+	})
+
+	fakeSession := &fakeACPSession{
+		sessionID: "session-new",
+		replyText: "done",
+	}
+	runner.sessionFactory = func(_ context.Context, options acp.SessionOptions) (acp.Session, error) {
+		if options.ResumeSessionID != "" {
+			t.Fatalf("unexpected resume session: %q", options.ResumeSessionID)
+		}
+		return fakeSession, nil
+	}
+
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1"},
+		Message: InboundMessage{
+			Text:   "hello",
+			Kind:   MessageKindText,
+			Sender: "user",
+		},
+	})
+	if err != nil {
+		t.Fatalf("first RunTurn failed: %v", err)
+	}
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: "session-new"},
+		Message: InboundMessage{
+			Text:   "continue",
+			Kind:   MessageKindText,
+			Sender: "user",
+		},
+	})
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
+	}
+
+	if len(fakeSession.promptBlocks) != 2 {
+		t.Fatalf("expected two prompts, got %d", len(fakeSession.promptBlocks))
+	}
+	firstText := textFromACPBlock(t, fakeSession.promptBlocks[0][0])
+	if !strings.Contains(firstText, "System rule") {
+		t.Fatalf("expected first prompt to include system prompt, got %q", firstText)
+	}
+	secondText := textFromACPBlock(t, fakeSession.promptBlocks[1][0])
+	if strings.Contains(secondText, "System rule") {
+		t.Fatalf("expected second prompt to omit system prompt, got %q", secondText)
 	}
 }
 
@@ -390,7 +804,7 @@ func TestACPRunnerRunTurnUsesImageBlocksWhenAgentSupportsImages(t *testing.T) {
 		return fakeSession, nil
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-image"},
 		Message: InboundMessage{
 			Kind:      MessageKindImage,
@@ -518,7 +932,7 @@ func TestBuildACPPromptBlocksUsesEmbeddedResourceForTextFiles(t *testing.T) {
 	}
 }
 
-func TestACPRunnerRunTurnFailsWhenAgentDoesNotAdvertiseHTTPMCP(t *testing.T) {
+func TestACPRunnerStartSessionFailsWhenAgentDoesNotAdvertiseHTTPMCP(t *testing.T) {
 	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
 		Command: "agent",
 		Args:    []string{"acp"},
@@ -536,16 +950,11 @@ func TestACPRunnerRunTurnFailsWhenAgentDoesNotAdvertiseHTTPMCP(t *testing.T) {
 		return fakeSession, nil
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
-		Conversation: ConversationState{Key: "conversation-tools"},
-		Message: InboundMessage{
-			Text:   "hello",
-			Kind:   MessageKindText,
-			Sender: "user",
-		},
+	_, err := runner.StartSession(context.Background(), SessionOptions{
+		ConversationKey: "conversation-tools",
 	})
 	if err == nil {
-		t.Fatal("expected RunTurn to fail")
+		t.Fatal("expected StartSession to fail")
 	}
 	if !strings.Contains(err.Error(), "HTTP MCP support") {
 		t.Fatalf("unexpected error: %v", err)

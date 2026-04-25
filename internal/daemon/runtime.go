@@ -96,22 +96,3 @@ func (p *process) shutdownHTTP(ctx context.Context) error {
 
 	return shutdownErr
 }
-
-func (p *process) closeRunner() error {
-	type closer interface {
-		Close() error
-	}
-
-	if p == nil || p.runner == nil {
-		return nil
-	}
-
-	runner := p.runner
-	p.runner = nil
-
-	typed, ok := runner.(closer)
-	if !ok {
-		return nil
-	}
-	return typed.Close()
-}

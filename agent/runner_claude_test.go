@@ -112,10 +112,10 @@ func TestClaudeCodeRunnerRunTurnStartsConversationAndStoresSessionID(t *testing.
 			Model: "claude-sonnet-4-5",
 		},
 	})
-	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudecode.Session, error) {
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
 		options = append(options, opts)
 		return &fakeClaudePersistentSession{
-			runTurn: func(_ context.Context, blocks []map[string]any, _ claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+			runTurn: func(_ context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
 				prompt := readClaudeStreamInput(blocks)
 				prompts = append(prompts, prompt)
 				return &claudecode.ClaudeResult{
@@ -128,7 +128,7 @@ func TestClaudeCodeRunnerRunTurnStartsConversationAndStoresSessionID(t *testing.
 	}
 	runner.RegisterSystemPrompt("Global system prompt.")
 
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
+	result, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message: InboundMessage{
 			Kind:       MessageKindText,
@@ -162,6 +162,9 @@ func TestClaudeCodeRunnerRunTurnStartsConversationAndStoresSessionID(t *testing.
 	if options[0].ResumeID != "" {
 		t.Fatalf("unexpected resume id: %s", options[0].ResumeID)
 	}
+	if err = claudecode.ValidateSessionID(options[0].SessionID); err != nil {
+		t.Fatalf("expected generated session id, got %q (%v)", options[0].SessionID, err)
+	}
 	if !strings.Contains(options[0].AppendPrompt, "claudecode-append-system-prompt-") {
 		t.Fatalf("expected append prompt file path, got:\n%s", options[0].AppendPrompt)
 	}
@@ -177,17 +180,80 @@ func TestClaudeCodeRunnerRunTurnStartsConversationAndStoresSessionID(t *testing.
 	}
 }
 
-func TestClaudeCodeRunnerRunTurnResumesExistingSession(t *testing.T) {
+func TestClaudeCodeRunnerStartSessionExposesGeneratedSessionID(t *testing.T) {
+	t.Parallel()
+
+	var createdOptions claudecode.RunOptions
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
+		createdOptions = opts
+		return &fakeClaudePersistentSession{
+			currentSessionID: opts.SessionID,
+			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "ok",
+					SessionID: opts.SessionID,
+				}, nil
+			},
+		}, nil
+	}
+
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	if err = claudecode.ValidateSessionID(createdOptions.SessionID); err != nil {
+		t.Fatalf("expected generated session id, got %q (%v)", createdOptions.SessionID, err)
+	}
+	if session.ID() != createdOptions.SessionID {
+		t.Fatalf("unexpected session id: got %q want %q", session.ID(), createdOptions.SessionID)
+	}
+}
+
+func TestClaudeCodeSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T) {
+	t.Parallel()
+
+	session := &claudeRunnerSession{
+		runner:          &ClaudeCodeRunner{},
+		conversationKey: "conversation-1",
+		sessionID:       "session-live",
+	}
+
+	_, err := session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key:            "conversation-2",
+			RunnerThreadID: "session-live",
+		},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `conversation key mismatch: session="conversation-1" request="conversation-2"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{
+			Key:            "conversation-1",
+			RunnerThreadID: "session-other",
+		},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `runner thread id mismatch: session="session-live" request="session-other"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClaudeCodeRunnerRunTurnWrapperStartsFreshSessionUsingResumeID(t *testing.T) {
 	t.Parallel()
 
 	var prompt string
 	var options []claudecode.RunOptions
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
-	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudecode.Session, error) {
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
 		options = append(options, opts)
 		return &fakeClaudePersistentSession{
 			currentSessionID: "session-existing",
-			runTurn: func(_ context.Context, blocks []map[string]any, _ claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+			runTurn: func(_ context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
 				prompt = readClaudeStreamInput(blocks)
 				return &claudecode.ClaudeResult{
 					Type:      "result",
@@ -199,7 +265,7 @@ func TestClaudeCodeRunnerRunTurnResumesExistingSession(t *testing.T) {
 	}
 	runner.RegisterSystemPrompt("Global system prompt.")
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-1",
 			RunnerThreadID: "session-existing",
@@ -241,12 +307,12 @@ func TestClaudeCodeRunnerRunTurnUsesStdioPermissionPromptInDefaultMode(t *testin
 			PermissionMode: claudecode.PermissionModeDefault,
 		},
 	})
-	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudecode.Session, error) {
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions, hooks claudecode.SessionHooks) (claudecode.Session, error) {
 		argsSnapshot = claudecode.BuildCLIArgs(&opts)
+		controlSeen = hooks.HandleControlRequest != nil
 		return &fakeClaudePersistentSession{
-			runTurn: func(_ context.Context, blocks []map[string]any, hooks claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+			runTurn: func(_ context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
 				_ = readClaudeStreamInput(blocks)
-				controlSeen = hooks.HandleControlRequest != nil
 				return &claudecode.ClaudeResult{
 					Type:      "result",
 					Result:    "ok",
@@ -256,7 +322,7 @@ func TestClaudeCodeRunnerRunTurnUsesStdioPermissionPromptInDefaultMode(t *testin
 		}, nil
 	}
 
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
+	_, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message: InboundMessage{
 			Kind:       MessageKindText,
@@ -289,17 +355,17 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 	)
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
 	runner.RegisterTools(uppercaseTool{})
-	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions) (claudecode.Session, error) {
+	runner.sessionFactory = func(_ context.Context, _ string, opts claudecode.RunOptions, hooks claudecode.SessionHooks) (claudecode.Session, error) {
 		if len(opts.MCPConfigs) != 1 {
 			t.Fatalf("unexpected mcp config count: %d", len(opts.MCPConfigs))
 		}
 		mcpConfig = opts.MCPConfigs[0]
+		if hooks.HandleControlRequest == nil {
+			t.Fatal("expected control server with tools")
+		}
 		return &fakeClaudePersistentSession{
-			runTurn: func(_ context.Context, blocks []map[string]any, hooks claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+			runTurn: func(_ context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
 				prompt = readClaudeStreamInput(blocks)
-				if hooks.ShouldInitialize == nil || !hooks.ShouldInitialize() || hooks.HandleControlRequest == nil {
-					t.Fatal("expected control server with tools")
-				}
 
 				listResponse, err := hooks.HandleControlRequest(map[string]any{
 					"subtype":     "mcp_message",
@@ -349,7 +415,7 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 		}, nil
 	}
 
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
+	result, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message: InboundMessage{
 			Kind:       MessageKindText,
@@ -386,110 +452,17 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeRunnerRetriesRetryableError(t *testing.T) {
-	t.Parallel()
-
-	attempts := 0
-	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{
-		RetryPolicy: &claudecode.RetryPolicy{
-			MaxRetries:    1,
-			BaseDelay:     time.Millisecond,
-			MaxDelay:      time.Millisecond,
-			BackoffFactor: 1,
-		},
-	})
-	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudecode.Session, error) {
-		return &fakeClaudePersistentSession{
-			runTurn: func(_ context.Context, _ []map[string]any, _ claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
-				attempts++
-				if attempts == 1 {
-					return nil, &claudecode.ClaudeError{
-						Type:    claudecode.ErrorNetwork,
-						Message: "temporary network issue",
-					}
-				}
-				return &claudecode.ClaudeResult{
-					Type:      "result",
-					Result:    "assistant reply",
-					SessionID: "session-new",
-				}, nil
-			},
-		}, nil
-	}
-
-	result, err := runner.RunTurn(context.Background(), TurnRequest{
-		Conversation: ConversationState{Key: "conversation-1"},
-		Message: InboundMessage{
-			Kind:       MessageKindText,
-			Sender:     "alice",
-			SentAtUnix: 1000,
-			Text:       "hello",
-		},
-	})
-	if err != nil {
-		t.Fatalf("RunTurn failed: %v", err)
-	}
-	if attempts != 2 {
-		t.Fatalf("unexpected attempt count: %d", attempts)
-	}
-	if result.ReplyText != "assistant reply" {
-		t.Fatalf("unexpected reply: %s", result.ReplyText)
-	}
-}
-
-func TestClaudeCodeRunnerDoesNotRetryNonRetryableError(t *testing.T) {
-	t.Parallel()
-
-	attempts := 0
-	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{
-		RetryPolicy: &claudecode.RetryPolicy{
-			MaxRetries:    3,
-			BaseDelay:     time.Millisecond,
-			MaxDelay:      time.Millisecond,
-			BackoffFactor: 1,
-		},
-	})
-	expectedErr := &claudecode.ClaudeError{
-		Type:    claudecode.ErrorAuthentication,
-		Message: "invalid credentials",
-	}
-	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudecode.Session, error) {
-		return &fakeClaudePersistentSession{
-			runTurn: func(_ context.Context, _ []map[string]any, _ claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
-				attempts++
-				return nil, expectedErr
-			},
-		}, nil
-	}
-
-	_, err := runner.RunTurn(context.Background(), TurnRequest{
-		Conversation: ConversationState{Key: "conversation-1"},
-		Message: InboundMessage{
-			Kind:       MessageKindText,
-			Sender:     "alice",
-			SentAtUnix: 1000,
-			Text:       "hello",
-		},
-	})
-	if !errors.Is(err, expectedErr) {
-		t.Fatalf("expected wrapped authentication error, got: %v", err)
-	}
-	if attempts != 1 {
-		t.Fatalf("unexpected attempt count: %d", attempts)
-	}
-}
-
-func TestClaudeCodeRunnerReusesLiveSessionForSameConversation(t *testing.T) {
+func TestClaudeCodeSessionReusesPersistentProcessWithinSession(t *testing.T) {
 	t.Parallel()
 
 	createCount := 0
 	runCount := 0
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
-	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudecode.Session, error) {
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
 		createCount++
 		return &fakeClaudePersistentSession{
 			currentSessionID: "session-live",
-			runTurn: func(_ context.Context, _ []map[string]any, _ claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
 				runCount++
 				return &claudecode.ClaudeResult{
 					Type:      "result",
@@ -499,15 +472,19 @@ func TestClaudeCodeRunnerReusesLiveSessionForSameConversation(t *testing.T) {
 			},
 		}, nil
 	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
 
-	first, err := runner.RunTurn(context.Background(), TurnRequest{
+	first, err := session.RunTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("first RunTurn failed: %v", err)
 	}
-	_, err = runner.RunTurn(context.Background(), TurnRequest{
+	_, err = session.RunTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: first.RunnerThreadID},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
 	})
@@ -523,41 +500,37 @@ func TestClaudeCodeRunnerReusesLiveSessionForSameConversation(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeRunnerExpiresIdleSession(t *testing.T) {
+func TestClaudeCodeRunnerRunTurnResumesExistingSession(t *testing.T) {
 	t.Parallel()
 
 	createCount := 0
-	closeCount := 0
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{
-		SessionIdleTimeout: 20 * time.Millisecond,
+		RunOptions: claudecode.RunOptions{},
 	})
-	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions) (claudecode.Session, error) {
+	resumeIDs := make([]string, 0, 2)
+	runner.sessionFactory = func(_ context.Context, _ string, options claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
 		createCount++
+		resumeIDs = append(resumeIDs, options.ResumeID)
 		return &fakeClaudePersistentSession{
 			currentSessionID: "session-live",
-			runTurn: func(_ context.Context, _ []map[string]any, _ claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
 				return &claudecode.ClaudeResult{
 					Type:      "result",
 					Result:    "ok",
 					SessionID: "session-live",
 				}, nil
 			},
-			closeFunc: func() error {
-				closeCount++
-				return nil
-			},
 		}, nil
 	}
 
-	first, err := runner.RunTurn(context.Background(), TurnRequest{
+	first, err := runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("first RunTurn failed: %v", err)
 	}
-	time.Sleep(80 * time.Millisecond)
-	_, err = runner.RunTurn(context.Background(), TurnRequest{
+	_, err = runTurnWithRunner(t, runner, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: first.RunnerThreadID},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
 	})
@@ -568,8 +541,272 @@ func TestClaudeCodeRunnerExpiresIdleSession(t *testing.T) {
 	if createCount != 2 {
 		t.Fatalf("unexpected session create count: %d", createCount)
 	}
-	if closeCount == 0 {
-		t.Fatal("expected idle session to be closed")
+	if len(resumeIDs) != 2 || resumeIDs[0] != "" || resumeIDs[1] != "session-live" {
+		t.Fatalf("unexpected resume ids: %#v", resumeIDs)
+	}
+}
+
+func TestClaudeCodeSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	interruptCalled := make(chan struct{}, 1)
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
+				close(started)
+				<-release
+				return nil, errors.New("interrupted")
+			},
+			interruptCurrentTurn: func(context.Context) error {
+				interruptCalled <- struct{}{}
+				<-release
+				return nil
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conversation-1"},
+			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	select {
+	case err := <-interruptDone:
+		t.Fatalf("interrupt returned before turn finished: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	select {
+	case <-interruptCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected protocol interrupt to be called")
+	}
+
+	close(release)
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run claude code turn failed: interrupted" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestClaudeCodeSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	interruptCalled := make(chan struct{}, 1)
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
+				close(started)
+				<-release
+				return &claudecode.ClaudeResult{SessionID: "session-live", Result: "partial reply"}, nil
+			},
+			interruptCurrentTurn: func(context.Context) error {
+				interruptCalled <- struct{}{}
+				<-release
+				return nil
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conversation-1"},
+			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	select {
+	case <-interruptCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected protocol interrupt to be called")
+	}
+
+	close(release)
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if err == nil || err.Error() != "run claude code turn failed: context canceled" {
+			t.Fatalf("unexpected run turn error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestClaudeCodeRunnerInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
+	t.Parallel()
+
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+
+	err := interruptWithRunner(t, runner, ConversationState{Key: "conversation-idle"})
+	if err != nil {
+		t.Fatalf("expected nil interrupt on idle session, got %v", err)
+	}
+}
+
+func TestClaudeCodeRunnerRunTurnMapsClaudeSessionBusyError(t *testing.T) {
+	t.Parallel()
+
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			runTurn: func(context.Context, []map[string]any) (*claudecode.ClaudeResult, error) {
+				return nil, claudecode.ErrSessionBusy
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-1"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	}
+}
+
+func TestClaudeCodeSessionCloseClosesUnderlyingSession(t *testing.T) {
+	t.Parallel()
+
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	closed := false
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			closeFunc: func() error {
+				closed = true
+				return nil
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-close"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	if err = session.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if !closed {
+		t.Fatal("expected underlying session to be closed")
+	}
+}
+
+func TestClaudeCodeSessionRejectsConcurrentRunTurn(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
+		return &fakeClaudePersistentSession{
+			currentSessionID: "session-live",
+			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
+				select {
+				case <-started:
+					return nil, claudecode.ErrSessionBusy
+				default:
+					close(started)
+				}
+				<-release
+				return nil, errors.New("interrupted")
+			},
+		}, nil
+	}
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-busy"})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), TurnRequest{
+			Conversation: ConversationState{Key: "conversation-busy"},
+			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+		})
+		runErrCh <- err
+	}()
+
+	<-started
+
+	_, err = session.RunTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-busy"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
+	})
+	if !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	}
+
+	close(release)
+
+	select {
+	case <-runErrCh:
+	case <-time.After(time.Second):
+		t.Fatal("first run turn did not finish")
 	}
 }
 
@@ -777,24 +1014,32 @@ func TestClaudeCodeRunnerApplyArgumentFilesRollsBackNewFilesOnFailure(t *testing
 }
 
 type fakeClaudePersistentSession struct {
-	runTurn          func(context.Context, []map[string]any, claudecode.TurnHooks) (*claudecode.ClaudeResult, error)
-	closeFunc        func() error
-	currentSessionID string
+	runTurn              func(context.Context, []map[string]any) (*claudecode.ClaudeResult, error)
+	interruptCurrentTurn func(context.Context) error
+	closeFunc            func() error
+	currentSessionID     string
 }
 
-func (s *fakeClaudePersistentSession) RunTurn(ctx context.Context, blocks []map[string]any, hooks claudecode.TurnHooks) (*claudecode.ClaudeResult, error) {
+func (s *fakeClaudePersistentSession) RunTurn(ctx context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
 	if s.runTurn == nil {
 		return nil, errors.New("runTurn is nil")
 	}
-	result, err := s.runTurn(ctx, blocks, hooks)
+	result, err := s.runTurn(ctx, blocks)
 	if result != nil && strings.TrimSpace(result.SessionID) != "" {
 		s.currentSessionID = strings.TrimSpace(result.SessionID)
 	}
 	return result, err
 }
 
-func (s *fakeClaudePersistentSession) CurrentSessionID() string {
+func (s *fakeClaudePersistentSession) SessionID() string {
 	return s.currentSessionID
+}
+
+func (s *fakeClaudePersistentSession) Interrupt(ctx context.Context) error {
+	if s.interruptCurrentTurn == nil {
+		return nil
+	}
+	return s.interruptCurrentTurn(ctx)
 }
 
 func (s *fakeClaudePersistentSession) Close() error {

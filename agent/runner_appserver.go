@@ -1,21 +1,14 @@
 package agent
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"log/slog"
 	"maps"
 	"os"
-	"os/exec"
-	"runtime/debug"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	appcodex "github.com/pmenglund/codex-sdk-go"
@@ -28,18 +21,23 @@ type AppServerRunner struct {
 	closeFn             func() error
 	rpcClient           *apprpc.Client
 	rpcClientFactory    func(context.Context, apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error)
+	interruptTurnFn     func(context.Context, string, string) error
+	unsubscribeThreadFn func(context.Context, string) error
 	canRecoverRPCClient bool
 	closed              bool
-	startThread         func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error)
-	resumeThread        func(context.Context, appcodex.ThreadResumeOptions) (appServerThread, error)
-	runThreadTurnFn     func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error)
-	startOptions        appcodex.ThreadStartOptions
-	resumeOptions       appcodex.ThreadResumeOptions
-	turnOptions         appcodex.TurnOptions
-	mu                  sync.RWMutex
-	systemPrompts       []string
-	tools               []Tool
-	activeTurns         map[string]appServerActiveTurn
+	//nolint:containedctx // This is the runner lifecycle root context shared by managed app-server sessions.
+	lifecycleCtx    context.Context
+	cancel          context.CancelFunc
+	startThread     func(context.Context, appcodex.ThreadStartOptions) (appServerThread, error)
+	resumeThread    func(context.Context, appcodex.ThreadResumeOptions) (appServerThread, error)
+	runThreadTurnFn func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error)
+	startOptions    appcodex.ThreadStartOptions
+	resumeOptions   appcodex.ThreadResumeOptions
+	turnOptions     appcodex.TurnOptions
+	mu              sync.RWMutex
+	systemPrompts   []string
+	tools           []Tool
+	sessions        map[string]*appServerSession
 }
 
 // AppServerRunnerOptions configures an AppServerRunner.
@@ -67,11 +65,6 @@ type appServerTurnStream interface {
 type appServerTurnContext struct {
 	prompts []string
 	tools   []Tool
-}
-
-type appServerActiveTurn struct {
-	req   TurnRequest
-	tools []Tool
 }
 
 // SandboxPolicy is the app-server sandbox policy payload used by this project.
@@ -177,9 +170,10 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 		startOptions:        startOptions,
 		resumeOptions:       resumeOptions,
 		turnOptions:         turnOptions,
-		activeTurns:         make(map[string]appServerActiveTurn),
+		sessions:            make(map[string]*appServerSession),
 		canRecoverRPCClient: options.Client == nil && options.CodexOptions.Transport == nil,
 	}
+	runner.lifecycleCtx, runner.cancel = context.WithCancel(context.Background())
 	runner.rpcClientFactory = func(ctx context.Context, handler apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
 		return newAppServerRPCClient(ctx, options.CodexOptions, options.Client, handler)
 	}
@@ -198,6 +192,54 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 
 func defaultAppServerSandboxPolicy() SandboxPolicy {
 	return SandboxPolicyReadOnly
+}
+
+// StartSession creates or resumes one dispatcher-managed app-server session.
+func (r *AppServerRunner) StartSession(ctx context.Context, options SessionOptions) (Session, error) {
+	if r == nil {
+		return nil, errors.New("start app-server session failed: runner is nil")
+	}
+	r.mu.RLock()
+	closed := r.closed
+	r.mu.RUnlock()
+	if closed {
+		return nil, errors.New("start app-server session failed: runner is closed")
+	}
+	err := r.ensureRPCClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start app-server session failed: %w", err)
+	}
+
+	conversationKey := strings.TrimSpace(options.ConversationKey)
+	sessionID := strings.TrimSpace(options.ResumeSessionID)
+	thread, err := r.createAppServerThread(ctx, sessionID)
+	if err != nil {
+		r.invalidateRPCClientIfRecoverable(err)
+		return nil, fmt.Errorf("start app-server session failed: %w", err)
+	}
+	if thread == nil {
+		return nil, errors.New("start app-server session failed: thread is nil")
+	}
+
+	threadID := strings.TrimSpace(thread.ID())
+	if threadID == "" {
+		threadID = sessionID
+	}
+
+	session := &appServerSession{
+		runner:          r,
+		conversationKey: conversationKey,
+		threadID:        threadID,
+		thread:          thread,
+	}
+	r.registerSession(conversationKey, session)
+	log.Printf(
+		"app-server session thread ready: conversation=%s requested_thread=%s actual_thread=%s",
+		conversationKey,
+		sessionID,
+		threadID,
+	)
+	return session, nil
 }
 
 func defaultAppServerConfig(config map[string]any) map[string]any {
@@ -304,17 +346,27 @@ func (r *AppServerRunner) Close() error {
 		return nil
 	}
 	r.closed = true
+	cancel := r.cancel
+	r.cancel = nil
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	r.mu.Lock()
 	closeFn := r.closeFn
 	r.closeFn = nil
 	r.rpcClient = nil
 	r.startThread = nil
 	r.resumeThread = nil
+	r.interruptTurnFn = nil
+	r.unsubscribeThreadFn = nil
 	r.mu.Unlock()
-	if closeFn == nil {
-		log.Printf("app-server runner closed")
-		return nil
+
+	var err error
+	if closeFn != nil {
+		err = errors.Join(err, closeFn())
 	}
-	err := closeFn()
+
 	if err != nil {
 		log.Printf("app-server runner closed: err=%v", err)
 	} else {
@@ -371,110 +423,14 @@ func (r *AppServerRunner) globalTools() []Tool {
 	return append([]Tool(nil), r.tools...)
 }
 
-// RunTurn runs one Codex turn and returns the updated thread mapping and final reply text.
-func (r *AppServerRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
-	if r == nil {
-		return TurnResult{}, errors.New("run app-server turn failed: runner is nil")
-	}
-	if err := r.ensureRPCClient(ctx); err != nil {
-		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
-	}
-
-	turnContext := appServerTurnContext{
-		prompts: r.globalPrompts(),
-		tools:   r.globalTools(),
-	}
-
-	var (
-		thread       appServerThread
-		err          error
-		threadAction = "start"
-	)
-	if req.Conversation.RunnerThreadID != "" {
-		threadAction = "resume"
-		options := r.resumeOptions
-		options.ThreadID = req.Conversation.RunnerThreadID
-		thread, err = r.resumeThread(ctx, options)
-		if err != nil {
-			r.invalidateRPCClientIfRecoverable(err)
-			log.Printf(
-				"app-server runner resume thread failed: conversation=%s thread_id=%s model=%s cwd=%s sandbox=%s approval=%s err=%v",
-				req.Conversation.Key,
-				options.ThreadID,
-				options.Model,
-				options.Cwd,
-				describeAppServerSandboxPolicy(options.Sandbox),
-				describeAppServerApprovalPolicy(options.ApprovalPolicy),
-				err,
-			)
-		}
-	} else {
-		options := r.startOptions
-		options.DeveloperInstructions = joinAppServerDeveloperInstructions(options.DeveloperInstructions, turnContext.prompts)
-		if r.rpcClient != nil {
-			thread, err = r.startRPCThreadWithTools(ctx, options, turnContext.tools)
-		} else {
-			thread, err = r.startThread(ctx, options)
-		}
-		if err != nil {
-			r.invalidateRPCClientIfRecoverable(err)
-			log.Printf(
-				"app-server runner start thread failed: conversation=%s model=%s cwd=%s sandbox=%s approval=%s err=%v",
-				req.Conversation.Key,
-				r.startOptions.Model,
-				r.startOptions.Cwd,
-				describeAppServerSandboxPolicy(r.startOptions.SandboxPolicy),
-				describeAppServerApprovalPolicy(r.startOptions.ApprovalPolicy),
-				err,
-			)
-		}
-	}
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
-	}
-	if thread == nil {
-		return TurnResult{}, errors.New("run app-server turn failed: thread is nil")
-	}
-	log.Printf(
-		"app-server runner thread ready: conversation=%s action=%s requested_thread=%s actual_thread=%s",
-		req.Conversation.Key,
-		threadAction,
-		req.Conversation.RunnerThreadID,
-		thread.ID(),
-	)
-
-	inputs := r.buildTurnInputs(req)
-	stopTyping := startTyping(ctx, req.Message.Responder)
-	defer stopTyping()
-
-	log.Printf("app-server runner executing turn: conversation=%s mode=direct", req.Conversation.Key)
-	r.setActiveTurn(thread.ID(), "", req, turnContext.tools)
-	defer r.clearActiveTurn(thread.ID(), "")
-
-	turn, runErr := r.runThreadTurn(ctx, req, thread, inputs, &r.turnOptions)
-	if runErr != nil {
-		r.invalidateRPCClientIfRecoverable(runErr)
-		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", runErr)
-	}
-	replyText := turn.FinalResponse
-
-	threadID := thread.ID()
-	if threadID == "" {
-		threadID = req.Conversation.RunnerThreadID
-	}
-
-	return TurnResult{
-		RunnerThreadID: threadID,
-		ReplyText:      replyText,
-	}, nil
-}
-
 func (r *AppServerRunner) bindRPCClient(client *apprpc.Client, closeFn func() error) {
 	r.rpcClient = client
 	r.closeFn = closeFn
 	if client == nil {
 		r.startThread = nil
 		r.resumeThread = nil
+		r.interruptTurnFn = nil
+		r.unsubscribeThreadFn = nil
 		return
 	}
 	r.startThread = func(ctx context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
@@ -482,6 +438,12 @@ func (r *AppServerRunner) bindRPCClient(client *apprpc.Client, closeFn func() er
 	}
 	r.resumeThread = func(ctx context.Context, options appcodex.ThreadResumeOptions) (appServerThread, error) {
 		return r.resumeRPCThread(ctx, options)
+	}
+	r.interruptTurnFn = func(ctx context.Context, threadID string, turnID string) error {
+		return r.interruptRPCThreadTurn(ctx, threadID, turnID)
+	}
+	r.unsubscribeThreadFn = func(ctx context.Context, threadID string) error {
+		return r.unsubscribeRPCThread(ctx, threadID)
 	}
 }
 
@@ -550,6 +512,35 @@ func joinAppServerDeveloperInstructions(base string, prompts []string) string {
 	return strings.TrimSpace(joinPromptBlocks(base, joinPromptBlocks(prompts...)))
 }
 
+func (r *AppServerRunner) createAppServerThread(ctx context.Context, threadID string) (appServerThread, error) {
+	if r == nil {
+		return nil, errors.New("app-server runner is nil")
+	}
+
+	runCtx, releaseRunCtx := joinRunnerContext(ctx, r.lifecycleCtx)
+	defer releaseRunCtx()
+
+	trimmedThreadID := strings.TrimSpace(threadID)
+	if trimmedThreadID != "" {
+		if r.resumeThread == nil {
+			return nil, errors.New("resume thread is unavailable")
+		}
+		options := r.resumeOptions
+		options.ThreadID = trimmedThreadID
+		return r.resumeThread(runCtx, options)
+	}
+
+	if r.startThread == nil {
+		return nil, errors.New("start thread is unavailable")
+	}
+	options := r.startOptions
+	options.DeveloperInstructions = joinAppServerDeveloperInstructions(options.DeveloperInstructions, r.globalPrompts())
+	if r.rpcClient != nil {
+		return r.startRPCThreadWithTools(runCtx, options, r.globalTools())
+	}
+	return r.startThread(runCtx, options)
+}
+
 func (r *AppServerRunner) globalPrompts() []string {
 	if r == nil {
 		return nil
@@ -559,1218 +550,4 @@ func (r *AppServerRunner) globalPrompts() []string {
 	defer r.mu.RUnlock()
 
 	return append([]string(nil), r.systemPrompts...)
-}
-
-func (r *AppServerRunner) runThreadTurn(ctx context.Context, req TurnRequest, thread appServerThread, inputs []appcodex.Input, options *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
-	if r.runThreadTurnFn != nil {
-		turn, err := r.runThreadTurnFn(ctx, req, thread, inputs, options)
-		if err != nil {
-			log.Printf(
-				"app-server runner turn failed: conversation=%s thread_id=%s model=%s cwd=%s sandbox=%s approval=%s input_count=%d err=%v",
-				req.Conversation.Key,
-				thread.ID(),
-				options.Model,
-				options.Cwd,
-				describeAppServerSandboxPolicy(options.SandboxPolicy),
-				describeAppServerApprovalPolicy(options.ApprovalPolicy),
-				len(inputs),
-				err,
-			)
-		}
-		return turn, err
-	}
-
-	log.Printf("app-server runner started streamed turn: conversation=%s thread_id=%s", req.Conversation.Key, thread.ID())
-
-	stream, err := thread.RunStreamed(ctx, inputs, options)
-	if err != nil {
-		if options != nil {
-			log.Printf(
-				"app-server runner start streamed turn failed: conversation=%s thread_id=%s model=%s cwd=%s sandbox=%s approval=%s input_count=%d err=%v",
-				req.Conversation.Key,
-				thread.ID(),
-				options.Model,
-				options.Cwd,
-				describeAppServerSandboxPolicy(options.SandboxPolicy),
-				describeAppServerApprovalPolicy(options.ApprovalPolicy),
-				len(inputs),
-				err,
-			)
-		} else {
-			log.Printf(
-				"app-server runner start streamed turn failed: conversation=%s thread_id=%s input_count=%d err=%v",
-				req.Conversation.Key,
-				thread.ID(),
-				len(inputs),
-				err,
-			)
-		}
-		return nil, err
-	}
-	defer stream.Close()
-
-	if streamTurnID := stream.TurnID(); streamTurnID != "" {
-		existing, _ := r.activeTurn(thread.ID(), "")
-		r.setActiveTurn(thread.ID(), streamTurnID, req, existing.tools)
-		defer r.clearActiveTurn(thread.ID(), streamTurnID)
-	}
-
-	return r.collectStreamedTurn(ctx, req, stream)
-}
-
-func (r *AppServerRunner) collectStreamedTurn(ctx context.Context, req TurnRequest, stream appServerTurnStream) (*appcodex.TurnResult, error) {
-	if stream == nil {
-		return nil, errors.New("streamed turn is nil")
-	}
-
-	result := &appcodex.TurnResult{}
-	for {
-		note, err := stream.Next(ctx)
-		if err != nil {
-			log.Printf(
-				"app-server runner streamed turn read failed: conversation=%s err=%v",
-				req.Conversation.Key,
-				err,
-			)
-			return nil, err
-		}
-		result.Notifications = append(result.Notifications, note)
-
-		switch note.Method {
-		case "item/completed":
-			item, text := parseAppServerItem(note)
-			if len(item) != 0 {
-				result.Items = append(result.Items, item)
-			}
-			if text != "" {
-				result.FinalResponse = text
-			}
-		case "turn/started":
-			result.TurnID = parseAppServerTurnID(note)
-		case "turn/completed":
-			result.TurnID = parseAppServerTurnID(note)
-			if turnErr := parseAppServerTurnError(note); turnErr != nil {
-				log.Printf(
-					"app-server runner completed turn with error: conversation=%s turn_id=%s err=%v",
-					req.Conversation.Key,
-					result.TurnID,
-					turnErr,
-				)
-				return nil, turnErr
-			}
-			log.Printf(
-				"app-server runner completed streamed turn: conversation=%s items=%d final_response_len=%d",
-				req.Conversation.Key,
-				len(result.Items),
-				len(result.FinalResponse),
-			)
-			return result, nil
-		case "turn/failed":
-			if turnErr := parseAppServerTurnError(note); turnErr != nil {
-				log.Printf(
-					"app-server runner turn notification failed: conversation=%s turn_id=%s method=%s err=%v",
-					req.Conversation.Key,
-					result.TurnID,
-					note.Method,
-					turnErr,
-				)
-				return nil, turnErr
-			}
-			log.Printf(
-				"app-server runner turn notification failed without detail: conversation=%s turn_id=%s method=%s",
-				req.Conversation.Key,
-				result.TurnID,
-				note.Method,
-			)
-			return nil, errors.New("app-server turn failed")
-		case "error":
-			if shouldRetryAppServerTurn(note) {
-				log.Printf(
-					"app-server runner turn notification requested retry: conversation=%s turn_id=%s",
-					req.Conversation.Key,
-					result.TurnID,
-				)
-				continue
-			}
-			if turnErr := parseAppServerTurnError(note); turnErr != nil {
-				log.Printf(
-					"app-server runner turn notification failed: conversation=%s turn_id=%s method=%s err=%v",
-					req.Conversation.Key,
-					result.TurnID,
-					note.Method,
-					turnErr,
-				)
-				return nil, turnErr
-			}
-			log.Printf(
-				"app-server runner turn notification failed without detail: conversation=%s turn_id=%s method=%s",
-				req.Conversation.Key,
-				result.TurnID,
-				note.Method,
-			)
-			return nil, errors.New("app-server turn failed")
-		}
-	}
-}
-
-func (r *AppServerRunner) buildTurnInputs(req TurnRequest) []appcodex.Input {
-	prompt, imagePaths := buildTurnPrompt(req.Message)
-	inputs := make([]appcodex.Input, 0, 1+len(imagePaths))
-
-	if prompt != "" {
-		inputs = append(inputs, appcodex.TextInput(prompt))
-	}
-	for _, imagePath := range imagePaths {
-		inputs = append(inputs, appcodex.LocalImageInput(imagePath))
-	}
-	if len(inputs) == 0 {
-		inputs = append(inputs, appcodex.TextInput(""))
-	}
-
-	return inputs
-}
-
-func (r *AppServerRunner) setActiveTurn(threadID, turnID string, req TurnRequest, tools []Tool) {
-	if r == nil || threadID == "" {
-		return
-	}
-
-	r.mu.Lock()
-	if r.activeTurns == nil {
-		r.activeTurns = make(map[string]appServerActiveTurn)
-	}
-	r.activeTurns[appServerActiveTurnKey(threadID, turnID)] = appServerActiveTurn{
-		req:   req,
-		tools: append([]Tool(nil), tools...),
-	}
-	r.mu.Unlock()
-}
-
-func (r *AppServerRunner) clearActiveTurn(threadID, turnID string) {
-	if r == nil || threadID == "" {
-		return
-	}
-
-	r.mu.Lock()
-	delete(r.activeTurns, appServerActiveTurnKey(threadID, turnID))
-	r.mu.Unlock()
-}
-
-func (r *AppServerRunner) activeTurn(threadID, turnID string) (appServerActiveTurn, bool) {
-	if r == nil || threadID == "" {
-		return appServerActiveTurn{}, false
-	}
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	if turnID != "" {
-		req, ok := r.activeTurns[appServerActiveTurnKey(threadID, turnID)]
-		if ok {
-			return req, true
-		}
-	}
-
-	req, ok := r.activeTurns[appServerActiveTurnKey(threadID, "")]
-	return req, ok
-}
-
-func appServerActiveTurnKey(threadID, turnID string) string {
-	return threadID + "\x00" + turnID
-}
-
-type appServerTurnNotification struct {
-	WillRetry *bool               `json:"willRetry,omitempty"`
-	ThreadID  string              `json:"threadId,omitempty"`
-	TurnID    string              `json:"turnId,omitempty"`
-	Turn      *appServerTurnState `json:"turn,omitempty"`
-	Item      json.RawMessage     `json:"item,omitempty"`
-	Error     *appServerTurnError `json:"error,omitempty"`
-}
-
-type appServerTurnState struct {
-	ID     string              `json:"id,omitempty"`
-	Status string              `json:"status,omitempty"`
-	Error  *appServerTurnError `json:"error,omitempty"`
-}
-
-type appServerTurnError struct {
-	Message string `json:"message,omitempty"`
-}
-
-func parseAppServerTurnID(note apprpc.Notification) string {
-	payload, err := parseAppServerTurnNotification(note)
-	if err != nil || payload.Turn == nil {
-		return ""
-	}
-
-	return payload.Turn.ID
-}
-
-func parseAppServerTurnError(note apprpc.Notification) error {
-	payload, err := parseAppServerTurnNotification(note)
-	if err != nil {
-		return err
-	}
-	if payload.Turn != nil && payload.Turn.Error != nil && payload.Turn.Error.Message != "" {
-		return errors.New(payload.Turn.Error.Message)
-	}
-	if payload.Error != nil && payload.Error.Message != "" {
-		return errors.New(payload.Error.Message)
-	}
-	if payload.Turn != nil && payload.Turn.Status == "failed" {
-		return errors.New("turn failed")
-	}
-
-	return nil
-}
-
-func shouldRetryAppServerTurn(note apprpc.Notification) bool {
-	payload, err := parseAppServerTurnNotification(note)
-	if err != nil || payload.WillRetry == nil {
-		return false
-	}
-
-	return *payload.WillRetry
-}
-
-func parseAppServerItem(note apprpc.Notification) (json.RawMessage, string) {
-	payload, err := parseAppServerTurnNotification(note)
-	if err != nil || len(payload.Item) == 0 {
-		return nil, ""
-	}
-
-	text, _ := extractAppServerTextFromItem(payload.Item)
-	return payload.Item, text
-}
-
-func parseAppServerTurnNotification(note apprpc.Notification) (appServerTurnNotification, error) {
-	var payload appServerTurnNotification
-	if len(note.Raw) == 0 {
-		return payload, nil
-	}
-	if err := note.UnmarshalParams(&payload); err != nil {
-		return payload, err
-	}
-
-	return payload, nil
-}
-
-func extractAppServerTextFromItem(raw json.RawMessage) (string, bool) {
-	if len(raw) == 0 {
-		return "", false
-	}
-
-	var direct struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &direct); err == nil && direct.Text != "" {
-		return direct.Text, true
-	}
-
-	var wrapper map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &wrapper); err != nil || len(wrapper) != 1 {
-		return "", false
-	}
-	for _, inner := range wrapper {
-		var nested struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(inner, &nested); err == nil && nested.Text != "" {
-			return nested.Text, true
-		}
-	}
-
-	return "", false
-}
-
-func stringPtr(value string) *string {
-	return &value
-}
-
-func marshalAppServerJSONValue(field string, value any) (json.RawMessage, error) {
-	if value == nil {
-		return nil, nil
-	}
-	raw, ok := value.(json.RawMessage)
-	if ok {
-		if len(raw) == 0 {
-			return nil, nil
-		}
-		var decoded any
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			return nil, fmt.Errorf("%s must be valid JSON: %w", field, err)
-		}
-		return raw, nil
-	}
-
-	data, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s failed: %w", field, err)
-	}
-	return data, nil
-}
-
-type appServerThreadStartParams struct {
-	Model                 *string                `json:"model,omitempty"`
-	Cwd                   *string                `json:"cwd,omitempty"`
-	ApprovalPolicy        json.RawMessage        `json:"approvalPolicy,omitempty"`
-	Sandbox               json.RawMessage        `json:"sandbox,omitempty"`
-	Config                *map[string]any        `json:"config,omitempty"`
-	BaseInstructions      *string                `json:"baseInstructions,omitempty"`
-	DeveloperInstructions *string                `json:"developerInstructions,omitempty"`
-	DynamicTools          []appServerDynamicTool `json:"dynamicTools,omitempty"`
-}
-
-type appServerThreadResumeParams struct {
-	ThreadID              string          `json:"threadId"`
-	Model                 *string         `json:"model,omitempty"`
-	ModelProvider         *string         `json:"modelProvider,omitempty"`
-	Cwd                   *string         `json:"cwd,omitempty"`
-	ApprovalPolicy        json.RawMessage `json:"approvalPolicy,omitempty"`
-	Sandbox               json.RawMessage `json:"sandbox,omitempty"`
-	Config                *map[string]any `json:"config,omitempty"`
-	BaseInstructions      *string         `json:"baseInstructions,omitempty"`
-	DeveloperInstructions *string         `json:"developerInstructions,omitempty"`
-}
-
-type appServerDynamicTool struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	InputSchema any    `json:"inputSchema"`
-}
-
-func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools []Tool) (appServerThreadStartParams, error) {
-	params := appServerThreadStartParams{}
-	if options.Model != "" {
-		params.Model = stringPtr(options.Model)
-	}
-	if options.Cwd != "" {
-		params.Cwd = stringPtr(options.Cwd)
-	}
-	if raw, err := marshalAppServerJSONValue("approvalPolicy", options.ApprovalPolicy); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.ApprovalPolicy = raw
-	}
-	if raw, err := marshalAppServerJSONValue("sandbox", options.SandboxPolicy); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.Sandbox = raw
-	}
-	if options.Config != nil {
-		config := options.Config
-		params.Config = &config
-	}
-	if options.BaseInstructions != "" {
-		params.BaseInstructions = stringPtr(options.BaseInstructions)
-	}
-	if options.DeveloperInstructions != "" {
-		params.DeveloperInstructions = stringPtr(options.DeveloperInstructions)
-	}
-	if len(tools) != 0 {
-		params.DynamicTools = make([]appServerDynamicTool, 0, len(tools))
-		for _, tool := range tools {
-			params.DynamicTools = append(params.DynamicTools, appServerDynamicTool{
-				Name:        tool.Name(),
-				Description: tool.Description(),
-				InputSchema: tool.InputSchema(),
-			})
-		}
-	}
-	if options.ExperimentalRawEvents {
-		return params, errors.New("experimental raw events are no longer supported by the current app-server protocol")
-	}
-	return params, nil
-}
-
-func buildAppServerThreadResumeParams(options appcodex.ThreadResumeOptions) (appServerThreadResumeParams, error) {
-	params := appServerThreadResumeParams{ThreadID: options.ThreadID}
-	if len(options.History) > 0 {
-		return params, errors.New("thread resume history is no longer supported by the current app-server protocol")
-	}
-	if options.Path != "" {
-		return params, errors.New("thread resume path is no longer supported by the current app-server protocol")
-	}
-	if options.Model != "" {
-		params.Model = stringPtr(options.Model)
-	}
-	if options.ModelProvider != "" {
-		params.ModelProvider = stringPtr(options.ModelProvider)
-	}
-	if options.Cwd != "" {
-		params.Cwd = stringPtr(options.Cwd)
-	}
-	if raw, err := marshalAppServerJSONValue("approvalPolicy", options.ApprovalPolicy); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.ApprovalPolicy = raw
-	}
-	if raw, err := marshalAppServerJSONValue("sandbox", options.Sandbox); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.Sandbox = raw
-	}
-	if options.Config != nil {
-		config := options.Config
-		params.Config = &config
-	}
-	if options.BaseInstructions != "" {
-		params.BaseInstructions = stringPtr(options.BaseInstructions)
-	}
-	if options.DeveloperInstructions != "" {
-		params.DeveloperInstructions = stringPtr(options.DeveloperInstructions)
-	}
-	return params, nil
-}
-
-func buildAppServerTurnStartParams(threadID string, inputs []appcodex.Input, opts *appcodex.TurnOptions) (appproto.TurnStartParams, error) {
-	params := appproto.TurnStartParams{
-		ThreadID: threadID,
-		Input:    make([]appproto.TurnStartParamsInputElem, 0, len(inputs)),
-	}
-	for _, input := range inputs {
-		params.Input = append(params.Input, input)
-	}
-	if opts == nil {
-		return params, nil
-	}
-
-	if opts.Cwd != "" {
-		params.Cwd = stringPtr(opts.Cwd)
-	}
-	if raw, err := marshalAppServerJSONValue("approvalPolicy", opts.ApprovalPolicy); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.ApprovalPolicy = raw
-	}
-	if raw, err := marshalAppServerJSONValue("sandboxPolicy", opts.SandboxPolicy); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.SandboxPolicy = raw
-	}
-	if opts.Model != "" {
-		params.Model = stringPtr(opts.Model)
-	}
-	if raw, err := marshalAppServerJSONValue("effort", opts.Effort); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.Effort = raw
-	}
-	if raw, err := marshalAppServerJSONValue("summary", opts.Summary); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.Summary = raw
-	}
-	if raw, err := marshalAppServerJSONValue("outputSchema", opts.OutputSchema); err != nil {
-		return params, err
-	} else if len(raw) != 0 {
-		params.OutputSchema = raw
-	}
-	if opts.CollaborationMode != nil {
-		return params, errors.New("collaboration mode is no longer supported by the current app-server protocol")
-	}
-
-	return params, nil
-}
-
-func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existing *appcodex.Codex, handler apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
-	if existing != nil {
-		rpcClient := existing.Client()
-		if rpcClient != nil {
-			rpcClient.SetRequestHandler(handler)
-		}
-		return rpcClient, existing.Close, false, nil
-	}
-
-	logger := resolveAppServerLogger(options.Logger)
-	transport := options.Transport
-	if transport == nil {
-		spawn := options.Spawn
-		if spawn.CodexPath == "" {
-			spawn.CodexPath = "codex"
-		}
-		args := []string{"app-server"}
-		for _, override := range spawn.ConfigOverrides {
-			args = append(args, "--config", override)
-		}
-		args = append(args, spawn.ExtraArgs...)
-
-		logger.Info("assistant starting app-server", "path", spawn.CodexPath, "args", strings.Join(args, " "))
-
-		if spawn.Stderr == nil {
-			spawn.Stderr = apprpc.DefaultStderr()
-		}
-		var err error
-		transport, err = spawnAppServerStdio(context.WithoutCancel(ctx), spawn.CodexPath, args, spawn.Stderr)
-		if err != nil {
-			return nil, nil, false, err
-		}
-	}
-
-	rpcClient := apprpc.NewClient(transport, apprpc.ClientOptions{
-		Logger:         logger,
-		RequestHandler: handler,
-	})
-
-	initializeParams := appproto.InitializeParams{
-		ClientInfo: appproto.ClientInfo{
-			Name:    "assistant-appserver-runner",
-			Title:   stringPtr("Assistant AppServer Runner"),
-			Version: appServerRunnerVersion(),
-		},
-		Capabilities: appproto.InitializeCapabilities{
-			ExperimentalApi:           true,
-			OptOutNotificationMethods: append([]string(nil), appServerOptOutNotificationMethods...),
-		},
-	}
-	if options.ClientInfo.Name != "" {
-		initializeParams.ClientInfo = options.ClientInfo
-	}
-
-	var initResponse any
-	if err := rpcClient.Call(ctx, "initialize", initializeParams, &initResponse); err != nil {
-		_ = rpcClient.Close()
-		return nil, nil, false, err
-	}
-	if err := rpcClient.Notify(ctx, "initialized", nil); err != nil {
-		_ = rpcClient.Close()
-		return nil, nil, false, err
-	}
-
-	return rpcClient, rpcClient.Close, true, nil
-}
-
-type appServerStdioTransport struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	mu     sync.Mutex
-}
-
-func spawnAppServerStdio(ctx context.Context, binary string, args []string, stderr io.Writer) (*appServerStdioTransport, error) {
-	if binary == "" {
-		return nil, errors.New("codex binary path is empty")
-	}
-
-	//nolint:gosec // The binary path and args come from trusted local runner configuration.
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Stderr = stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	return &appServerStdioTransport{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdout),
-	}, nil
-}
-
-func (t *appServerStdioTransport) ReadLine() (string, error) {
-	line, err := t.stdout.ReadString('\n')
-	if err != nil {
-		if errors.Is(err, io.EOF) && line != "" {
-			return strings.TrimRight(line, "\n"), nil
-		}
-		return "", err
-	}
-	return strings.TrimRight(line, "\n"), nil
-}
-
-func (t *appServerStdioTransport) WriteLine(line string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if !strings.HasSuffix(line, "\n") {
-		line += "\n"
-	}
-
-	_, err := io.WriteString(t.stdin, line)
-	return err
-}
-
-func (t *appServerStdioTransport) Close() error {
-	var shutdownErr error
-
-	if t.stdin != nil {
-		if err := t.stdin.Close(); err != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close stdin: %w", err))
-		}
-	}
-	if t.cmd == nil {
-		return shutdownErr
-	}
-
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- t.cmd.Wait()
-	}()
-
-	err, exited := waitProcess(waitCh, appServerStdioCloseTimeout)
-	if exited {
-		logAppServerProcessExit(t.cmd, err)
-		return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
-	}
-
-	if terminateErr := signalAppServerProcessGroup(t.cmd, syscall.SIGTERM); terminateErr != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("terminate process group: %w", terminateErr))
-	}
-
-	err, exited = waitProcess(waitCh, appServerStdioTerminateTimeout)
-	if exited {
-		logAppServerProcessExit(t.cmd, err)
-		return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
-	}
-
-	if killErr := signalAppServerProcessGroup(t.cmd, syscall.SIGKILL); killErr != nil {
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("kill process group: %w", killErr))
-	}
-
-	err = <-waitCh
-	logAppServerProcessExit(t.cmd, err)
-	return errors.Join(shutdownErr, ignoreExpectedAppServerExit(err))
-}
-
-func waitProcess(waitCh <-chan error, timeout time.Duration) (error, bool) {
-	select {
-	case err := <-waitCh:
-		return err, true
-	case <-time.After(timeout):
-		return nil, false
-	}
-}
-
-func logAppServerProcessExit(cmd *exec.Cmd, err error) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	if err == nil {
-		log.Printf("app-server runner process exited: pid=%d exit_code=0", cmd.Process.Pid)
-		return
-	}
-
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ProcessState != nil {
-		waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
-		if ok && waitStatus.Signaled() {
-			log.Printf(
-				"app-server runner process exited: pid=%d signal=%s",
-				cmd.Process.Pid,
-				waitStatus.Signal(),
-			)
-			return
-		}
-		if ok && waitStatus.Exited() {
-			log.Printf(
-				"app-server runner process exited: pid=%d exit_code=%d",
-				cmd.Process.Pid,
-				waitStatus.ExitStatus(),
-			)
-			return
-		}
-	}
-
-	log.Printf("app-server runner process wait returned: pid=%d err=%v", cmd.Process.Pid, err)
-}
-
-func shouldRecoverAppServerRPCClient(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
-		return true
-	}
-
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	switch {
-	case strings.Contains(message, "connection closed"):
-		return true
-	case strings.Contains(message, "client closed"):
-		return true
-	case strings.Contains(message, "closed pipe"):
-		return true
-	case strings.Contains(message, "broken pipe"):
-		return true
-	case strings.Contains(message, "use of closed network connection"):
-		return true
-	case strings.Contains(message, "file already closed"):
-		return true
-	case strings.Contains(message, "eof"):
-		return true
-	default:
-		return false
-	}
-}
-
-func signalAppServerProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-
-	err := syscall.Kill(-cmd.Process.Pid, signal)
-	if ignoreExpectedAppServerSignalError(err) {
-		return nil
-	}
-	return err
-}
-
-func ignoreExpectedAppServerSignalError(err error) bool {
-	if err == nil {
-		return true
-	}
-	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM)
-}
-
-func ignoreExpectedAppServerExit(err error) error {
-	if err == nil {
-		return nil
-	}
-
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		return fmt.Errorf("wait for process: %w", err)
-	}
-
-	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok {
-		return fmt.Errorf("wait for process: %w", err)
-	}
-	if !waitStatus.Signaled() {
-		return fmt.Errorf("wait for process: %w", err)
-	}
-
-	switch waitStatus.Signal() {
-	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
-		return nil
-	default:
-		return fmt.Errorf("wait for process: %w", err)
-	}
-}
-
-func resolveAppServerLogger(logger *slog.Logger) *slog.Logger {
-	if logger != nil {
-		return logger
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, nil))
-}
-
-func appServerRunnerVersion() string {
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
-		return info.Main.Version
-	}
-	return "dev"
-}
-
-func (r *AppServerRunner) startRPCThread(ctx context.Context, options appcodex.ThreadStartOptions) (appServerThread, error) {
-	return r.startRPCThreadWithTools(ctx, options, r.globalTools())
-}
-
-func (r *AppServerRunner) startRPCThreadWithTools(ctx context.Context, options appcodex.ThreadStartOptions, tools []Tool) (appServerThread, error) {
-	if r == nil || r.rpcClient == nil {
-		return nil, errors.New("rpc client is not initialized")
-	}
-
-	params, err := buildAppServerThreadStartParams(options, tools)
-	if err != nil {
-		return nil, err
-	}
-	var response appproto.ThreadStartResponse
-	if err := r.rpcClient.Call(ctx, "thread/start", params, &response); err != nil {
-		return nil, err
-	}
-
-	threadID := response.ThreadID
-	if threadID == "" && response.Thread != nil {
-		threadID = response.Thread.ID
-	}
-	if threadID == "" {
-		return nil, errors.New("thread id not found in thread/start response")
-	}
-
-	return &rpcAppServerThread{client: r.rpcClient, id: threadID}, nil
-}
-
-func (r *AppServerRunner) resumeRPCThread(ctx context.Context, options appcodex.ThreadResumeOptions) (appServerThread, error) {
-	if r == nil || r.rpcClient == nil {
-		return nil, errors.New("rpc client is not initialized")
-	}
-
-	params, err := buildAppServerThreadResumeParams(options)
-	if err != nil {
-		return nil, err
-	}
-	var response appproto.ThreadResumeResponse
-	if err := r.rpcClient.Call(ctx, "thread/resume", params, &response); err != nil {
-		return nil, err
-	}
-
-	threadID := response.ThreadID
-	if threadID == "" && response.Thread != nil {
-		threadID = response.Thread.ID
-	}
-	if threadID == "" {
-		return nil, errors.New("thread id not found in thread/resume response")
-	}
-
-	return &rpcAppServerThread{client: r.rpcClient, id: threadID}, nil
-}
-
-type rpcAppServerThread struct {
-	client *apprpc.Client
-	id     string
-}
-
-type appServerTurnStartResponse struct {
-	TurnID string              `json:"turnId,omitempty"`
-	Turn   *appServerTurnState `json:"turn,omitempty"`
-}
-
-func (t *rpcAppServerThread) ID() string {
-	if t == nil {
-		return ""
-	}
-	return t.id
-}
-
-func (t *rpcAppServerThread) RunStreamed(ctx context.Context, inputs []appcodex.Input, opts *appcodex.TurnOptions) (appServerTurnStream, error) {
-	if t == nil || t.client == nil {
-		return nil, errors.New("thread client is not initialized")
-	}
-
-	iter := t.client.SubscribeNotifications(0)
-	params, err := buildAppServerTurnStartParams(t.id, inputs, opts)
-	if err != nil {
-		iter.Close()
-		return nil, err
-	}
-	var response appServerTurnStartResponse
-	if err := t.client.Call(ctx, "turn/start", params, &response); err != nil {
-		iter.Close()
-		return nil, err
-	}
-	turnID := response.TurnID
-	if turnID == "" && response.Turn != nil {
-		turnID = response.Turn.ID
-	}
-
-	return &rpcAppServerTurnStream{iter: iter, threadID: t.id, turnID: turnID}, nil
-}
-
-type rpcAppServerTurnStream struct {
-	iter     *apprpc.NotificationIterator
-	threadID string
-	turnID   string
-}
-
-func (s *rpcAppServerTurnStream) Next(ctx context.Context) (apprpc.Notification, error) {
-	if s == nil || s.iter == nil {
-		return apprpc.Notification{}, errors.New("turn stream is not initialized")
-	}
-
-	for {
-		note, err := s.iter.Next(ctx)
-		if err != nil {
-			return note, err
-		}
-		if matchesAppServerTurn(note, s.threadID, s.turnID) {
-			return note, nil
-		}
-	}
-}
-
-func (s *rpcAppServerTurnStream) TurnID() string {
-	if s == nil {
-		return ""
-	}
-	return s.turnID
-}
-
-func (s *rpcAppServerTurnStream) Close() {
-	if s == nil || s.iter == nil {
-		return
-	}
-	s.iter.Close()
-}
-
-func matchesAppServerTurn(note apprpc.Notification, threadID, turnID string) bool {
-	payload, err := parseAppServerTurnNotification(note)
-	if err != nil {
-		return false
-	}
-
-	if threadID != "" && payload.ThreadID != "" && payload.ThreadID != threadID {
-		return false
-	}
-
-	if turnID == "" {
-		return threadID == "" || payload.ThreadID == "" || payload.ThreadID == threadID
-	}
-
-	noteTurnID := payload.TurnID
-	if noteTurnID == "" && payload.Turn != nil {
-		noteTurnID = payload.Turn.ID
-	}
-	if noteTurnID == "" {
-		return strings.HasPrefix(note.Method, "item/") && (payload.ThreadID == "" || payload.ThreadID == threadID)
-	}
-
-	return noteTurnID == turnID
-}
-
-func (*AppServerRunner) AccountChatgptAuthTokensRefresh(context.Context, appproto.ChatgptAuthTokensRefreshParams) (*appproto.ChatgptAuthTokensRefreshResponse, error) {
-	return nil, errors.New("chatgpt auth token refresh is not configured")
-}
-
-func (*AppServerRunner) ApplyPatchApproval(_ context.Context, params appproto.ApplyPatchApprovalParams) (*appproto.ApplyPatchApprovalResponse, error) {
-	logAppServerRequest("auto-approved apply patch request", params)
-	response := appproto.SanitizedApplyPatchApprovalResponseJSON{Decision: "approved"}
-	return &response, nil
-}
-
-func (*AppServerRunner) ExecCommandApproval(_ context.Context, params appproto.ExecCommandApprovalParams) (*appproto.ExecCommandApprovalResponse, error) {
-	logAppServerRequest("auto-approved exec command request", params)
-	response := appproto.SanitizedExecCommandApprovalResponseJSON{Decision: "approved"}
-	return &response, nil
-}
-
-func (*AppServerRunner) ItemCommandExecutionRequestApproval(_ context.Context, params appproto.CommandExecutionRequestApprovalParams) (*appproto.CommandExecutionRequestApprovalResponse, error) {
-	logAppServerRequest("auto-approved command execution request", params)
-	response := appproto.CommandExecutionRequestApprovalResponse{
-		Decision: "accept",
-	}
-	return &response, nil
-}
-
-func (*AppServerRunner) ItemFileChangeRequestApproval(_ context.Context, params appproto.FileChangeRequestApprovalParams) (*appproto.FileChangeRequestApprovalResponse, error) {
-	logAppServerRequest("auto-approved file change request", params)
-	response := appproto.SanitizedFileChangeRequestApprovalResponseJSON{Decision: "accept"}
-	return &response, nil
-}
-
-func (*AppServerRunner) ItemPermissionsRequestApproval(_ context.Context, params appproto.PermissionsRequestApprovalParams) (*appproto.PermissionsRequestApprovalResponse, error) {
-	logAppServerRequest("auto-approved permissions request", params)
-	response := appproto.PermissionsRequestApprovalResponse{
-		Permissions: params.Permissions,
-	}
-	return &response, nil
-}
-
-func (*AppServerRunner) ItemToolRequestUserInput(context.Context, appproto.ToolRequestUserInputParams) (*appproto.ToolRequestUserInputResponse, error) {
-	return nil, errors.New("tool user input is not configured")
-}
-
-func (*AppServerRunner) McpServerElicitationRequest(_ context.Context, params appproto.McpServerElicitationRequestParams) (*appproto.McpServerElicitationRequestResponse, error) {
-	if shouldAutoAcceptMCPToolApproval(params) {
-		logAppServerRequest("auto-accepted MCP tool approval elicitation request", params)
-		response := appproto.McpServerElicitationRequestResponse(
-			appproto.SanitizedMCPServerElicitationRequestResponseJSON{
-				Action:  appproto.MCPServerElicitationActionAccept,
-				Content: map[string]any{},
-			},
-		)
-		return &response, nil
-	}
-
-	logAppServerRequest("declined MCP elicitation request because no interactive elicitation handler is configured", params)
-	response := appproto.McpServerElicitationRequestResponse(
-		appproto.SanitizedMCPServerElicitationRequestResponseJSON{
-			Action: appproto.MCPServerElicitationActionDecline,
-		},
-	)
-	return &response, nil
-}
-
-func logAppServerRequest(message string, params any) {
-	payload, err := json.Marshal(params)
-	if err != nil {
-		log.Printf("app-server runner %s: marshal_params_err=%v", message, err)
-		return
-	}
-	log.Printf("app-server runner %s: params=%s", message, string(payload))
-}
-
-func shouldAutoAcceptMCPToolApproval(params any) bool {
-	root, ok := params.(map[string]any)
-	if !ok {
-		return false
-	}
-
-	meta, ok := root["_meta"].(map[string]any)
-	if !ok {
-		return false
-	}
-	approvalKind, ok := meta["codex_approval_kind"].(string)
-	if !ok || approvalKind != "mcp_tool_call" {
-		return false
-	}
-
-	requestedSchema, ok := root["requestedSchema"].(map[string]any)
-	if !ok {
-		return false
-	}
-	properties, ok := requestedSchema["properties"].(map[string]any)
-	if !ok {
-		return false
-	}
-
-	return len(properties) == 0
-}
-
-type appServerDynamicToolCallParams struct {
-	ThreadID  string `json:"threadId"`
-	TurnID    string `json:"turnId"`
-	CallID    string `json:"callId"`
-	Tool      string `json:"tool"`
-	Arguments any    `json:"arguments"`
-}
-
-func (r *AppServerRunner) ItemToolCall(ctx context.Context, params appproto.DynamicToolCallParams) (*appproto.DynamicToolCallResponse, error) {
-	if r == nil {
-		return nil, errors.New("app-server runner is nil")
-	}
-
-	decoded, err := decodeDynamicToolCallParams(params)
-	if err != nil {
-		return nil, err
-	}
-
-	active, ok := r.activeTurn(decoded.ThreadID, decoded.TurnID)
-	if !ok {
-		if decoded.TurnID == "" {
-			return nil, fmt.Errorf("tool call for unknown active thread %q", decoded.ThreadID)
-		}
-		return nil, fmt.Errorf("tool call for unknown active turn %q on thread %q", decoded.TurnID, decoded.ThreadID)
-	}
-	tool, ok := findToolIn(active.tools, decoded.Tool)
-	if !ok {
-		return nil, fmt.Errorf("unknown tool %q", decoded.Tool)
-	}
-
-	input, err := json.Marshal(decoded.Arguments)
-	if err != nil {
-		return nil, fmt.Errorf("encode tool arguments failed: %w", err)
-	}
-	if len(input) == 0 {
-		input = []byte("{}")
-	}
-
-	toolCtx := ContextWithTurnRequest(ctx, active.req)
-	log.Printf(
-		"app-server runner calling dynamic tool: conversation=%s thread_id=%s tool=%s input_bytes=%d",
-		active.req.Conversation.Key,
-		decoded.ThreadID,
-		tool.Name(),
-		len(input),
-	)
-	result, callErr := tool.Call(toolCtx, input)
-	if callErr != nil {
-		log.Printf(
-			"app-server runner dynamic tool failed: conversation=%s thread_id=%s tool=%s err=%v",
-			active.req.Conversation.Key,
-			decoded.ThreadID,
-			tool.Name(),
-			callErr,
-		)
-	} else {
-		log.Printf(
-			"app-server runner dynamic tool completed: conversation=%s thread_id=%s tool=%s",
-			active.req.Conversation.Key,
-			decoded.ThreadID,
-			tool.Name(),
-		)
-	}
-	contentItems, buildErr := buildDynamicToolContentItems(result, callErr)
-	if buildErr != nil {
-		log.Printf(
-			"app-server runner dynamic tool result encoding failed: conversation=%s thread_id=%s tool=%s err=%v",
-			active.req.Conversation.Key,
-			decoded.ThreadID,
-			tool.Name(),
-			buildErr,
-		)
-		return nil, buildErr
-	}
-
-	response := appproto.SanitizedDynamicToolCallResponse{
-		ContentItems: contentItems,
-		Success:      callErr == nil,
-	}
-	return &response, nil
-}
-
-func decodeDynamicToolCallParams(value appproto.DynamicToolCallParams) (appServerDynamicToolCallParams, error) {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return appServerDynamicToolCallParams{}, fmt.Errorf("encode dynamic tool params failed: %w", err)
-	}
-
-	var params appServerDynamicToolCallParams
-	if err := json.Unmarshal(data, &params); err != nil {
-		return appServerDynamicToolCallParams{}, fmt.Errorf("decode dynamic tool params failed: %w", err)
-	}
-	if params.ThreadID == "" {
-		return appServerDynamicToolCallParams{}, errors.New("dynamic tool params missing threadId")
-	}
-	if params.Tool == "" {
-		return appServerDynamicToolCallParams{}, errors.New("dynamic tool params missing tool")
-	}
-	return params, nil
-}
-
-func buildDynamicToolContentItems(result any, callErr error) ([]appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem, error) {
-	if callErr != nil {
-		return dynamicToolErrorContentItems(callErr), nil
-	}
-
-	switch value := result.(type) {
-	case nil:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": "OK",
-		}}, nil
-	case string:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": value,
-		}}, nil
-	case []byte:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": string(value),
-		}}, nil
-	case json.RawMessage:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": string(value),
-		}}, nil
-	default:
-		payload, err := json.Marshal(value)
-		if err != nil {
-			return nil, fmt.Errorf("encode tool result failed: %w", err)
-		}
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": string(payload),
-		}}, nil
-	}
-}
-
-func dynamicToolErrorContentItems(err error) []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem {
-	return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-		"type": "inputText",
-		"text": err.Error(),
-	}}
 }

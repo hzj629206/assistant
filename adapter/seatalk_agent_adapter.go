@@ -178,6 +178,25 @@ func (a *SeaTalkAgentAdapter) ProcessEvent(ctx context.Context, req seatalk.Even
 		}
 		route.message.Responder = responder
 
+		if command, ok := seatalkSlashCommand(event); ok {
+			if err = a.dispatcher.EnqueueCommand(ctx, agent.CommandRequest{
+				ConversationKey: route.message.ConversationKey,
+				EventID:         route.message.ID,
+				Responder:       responder,
+				Command:         command,
+			}); err != nil {
+				_ = responder.Cleanup(context.Background()) //nolint:contextcheck
+				return nil, err
+			}
+			log.Printf(
+				"seatalk adapter enqueued slash command: event_id=%s conversation=%s command=%s",
+				req.EventID,
+				route.message.ConversationKey,
+				command.Name,
+			)
+			return nil, nil
+		}
+
 		if err = a.dispatcher.Enqueue(ctx, route.message); err != nil {
 			_ = responder.Cleanup(context.Background()) //nolint:contextcheck
 			return nil, err
@@ -336,6 +355,72 @@ func interactiveActionLockKey(event *seatalk.InteractiveMessageClickEvent) strin
 	}
 	hashed := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return seatalkInteractiveActionLockPrefix + hex.EncodeToString(hashed[:])
+}
+
+func seatalkSlashCommand(event seatalk.Event) (agent.SlashCommand, bool) {
+	text, ok := seatalkSlashCommandText(event)
+	if !ok {
+		return agent.SlashCommand{}, false
+	}
+
+	command, ok := agent.ParseSlashCommand(text)
+	if !ok || !command.Validate() {
+		return agent.SlashCommand{}, false
+	}
+	return command, true
+}
+
+func seatalkSlashCommandText(event seatalk.Event) (string, bool) {
+	switch current := event.(type) {
+	case *seatalk.MessageFromBotSubscriberEvent:
+		if current == nil || current.Message.Tag != string(agent.MessageKindText) {
+			return "", false
+		}
+		return strings.TrimSpace(current.Message.Text.Content), true
+	case *seatalk.NewMentionedMessageReceivedFromGroupChatEvent:
+		if current == nil || current.Message.Tag != string(agent.MessageKindText) {
+			return "", false
+		}
+		return normalizeMentionedGroupSlashCommandText(current), true
+	default:
+		return "", false
+	}
+}
+
+func normalizeMentionedGroupSlashCommandText(event *seatalk.NewMentionedMessageReceivedFromGroupChatEvent) string {
+	if event == nil {
+		return ""
+	}
+
+	text := strings.TrimSpace(event.Message.Text.PlainText)
+	if text == "" {
+		return ""
+	}
+
+	for _, mention := range event.Message.Text.MentionedList {
+		if !isBotMention(mention.SeatalkID, mention.EmployeeCode, mention.Email) {
+			continue
+		}
+
+		username := strings.TrimSpace(mention.Username)
+		if username == "" {
+			continue
+		}
+		text = strings.ReplaceAll(text, "@"+username, " ")
+	}
+
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func isBotMention(seatalkID, employeeCode, email string) bool {
+	seatalkID = strings.TrimSpace(seatalkID)
+	employeeCode = strings.TrimSpace(employeeCode)
+	email = strings.TrimSpace(email)
+
+	if seatalkID == "" || seatalkID == "0" {
+		return false
+	}
+	return employeeCode == "" && email == ""
 }
 
 func (a *SeaTalkAgentAdapter) prepareMessageAssets(ctx context.Context, route *seaTalkRoute, responder *SeaTalkResponder) error {

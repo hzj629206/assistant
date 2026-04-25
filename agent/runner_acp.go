@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -24,7 +23,6 @@ import (
 
 const (
 	defaultACPToolServerName     = "assistant"
-	defaultACPSessionIdleTimeout = 10 * time.Minute
 	defaultACPEmbeddedContextMax = 256 * 1024
 )
 
@@ -32,25 +30,26 @@ const (
 // Global tools are exposed through a runner-scoped streamable HTTP MCP server,
 // while individual tool calls are routed with the active turn context.
 type ACPRunner struct {
-	command            string
-	args               []string
-	env                []string
-	authMethod         string
-	workDir            string
-	sessionIdleTimeout time.Duration
-	sessionFactory     func(context.Context, acp.SessionOptions) (acp.Session, error)
+	command        string
+	args           []string
+	env            []string
+	authMethod     string
+	workDir        string
+	sessionFactory func(context.Context, acp.SessionOptions) (acp.Session, error)
 	//nolint:containedctx // This is the runner lifecycle root context shared by managed ACP sessions.
-	lifecycleCtx  context.Context
-	cancel        context.CancelFunc
-	mu            sync.RWMutex
-	systemPrompts []string
-	tools         []Tool
-	sessionsMu    sync.Mutex
-	sessions      map[string]*acpRunnerSession
-	pendingTokens map[string]struct{}
-	activeTurns   map[string]TurnRequest
-	toolServer    *acp.HTTPToolServer
-	closed        bool
+	lifecycleCtx   context.Context
+	cancel         context.CancelFunc
+	mu             sync.RWMutex
+	systemPrompts  []string
+	tools          []Tool
+	runtimeMu      sync.Mutex
+	toolCallTokens map[string]toolCallTokenState
+	toolServer     *acp.HTTPToolServer
+	closed         bool
+}
+
+type toolCallTokenState struct {
+	req *TurnRequest
 }
 
 // ACPRunnerOptions configures an ACPRunner.
@@ -63,13 +62,6 @@ type ACPRunnerOptions struct {
 	SessionIdleTimeout time.Duration
 	SystemPrompt       string
 	Tools              []Tool
-}
-
-type acpRunnerSession struct {
-	session   acp.Session
-	token     string
-	idleTimer *time.Timer
-	inUse     bool
 }
 
 // NewACPRunner builds a runner backed by an ACP agent CLI.
@@ -87,15 +79,12 @@ func NewACPRunner(ctx context.Context, options ACPRunnerOptions) *ACPRunner {
 	}
 
 	runner := &ACPRunner{
-		command:            command,
-		args:               append([]string(nil), options.Args...),
-		env:                append([]string(nil), options.Env...),
-		authMethod:         strings.TrimSpace(options.AuthMethod),
-		workDir:            workDir,
-		sessionIdleTimeout: options.SessionIdleTimeout,
-		sessions:           make(map[string]*acpRunnerSession),
-		pendingTokens:      make(map[string]struct{}),
-		activeTurns:        make(map[string]TurnRequest),
+		command:        command,
+		args:           append([]string(nil), options.Args...),
+		env:            append([]string(nil), options.Env...),
+		authMethod:     strings.TrimSpace(options.AuthMethod),
+		workDir:        workDir,
+		toolCallTokens: make(map[string]toolCallTokenState),
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -104,9 +93,6 @@ func NewACPRunner(ctx context.Context, options ACPRunnerOptions) *ACPRunner {
 	lifecycleCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	runner.lifecycleCtx = lifecycleCtx
 	runner.cancel = cancel
-	if runner.sessionIdleTimeout <= 0 {
-		runner.sessionIdleTimeout = defaultACPSessionIdleTimeout
-	}
 	runner.sessionFactory = acp.StartSession
 
 	runner.RegisterSystemPrompt(options.SystemPrompt)
@@ -115,50 +101,64 @@ func NewACPRunner(ctx context.Context, options ACPRunnerOptions) *ACPRunner {
 	return runner
 }
 
-// Close shuts down managed ACP sessions and the shared MCP tool server.
+// StartSession creates or resumes one dispatcher-managed ACP session.
+// The dispatcher owns session reuse and lifecycle management.
+func (r *ACPRunner) StartSession(ctx context.Context, options SessionOptions) (Session, error) {
+	if r == nil {
+		return nil, errors.New("start acp session failed: runner is nil")
+	}
+	r.runtimeMu.Lock()
+	if r.closed {
+		r.runtimeMu.Unlock()
+		return nil, errors.New("start acp session failed: runner is closed")
+	}
+	r.runtimeMu.Unlock()
+
+	session, token, err := r.createACPSession(ctx, strings.TrimSpace(options.ResumeSessionID))
+	if err != nil {
+		return nil, fmt.Errorf("start acp session failed: %w", err)
+	}
+	return &acpRunnerSession{
+		runner:                      r,
+		conversationKey:             strings.TrimSpace(options.ConversationKey),
+		sessionID:                   strings.TrimSpace(session.SessionID()),
+		session:                     session,
+		token:                       token,
+		pendingInitialSystemPrompts: strings.TrimSpace(options.ResumeSessionID) == "",
+	}, nil
+}
+
+// Close shuts down shared ACP runner resources and signals active sessions to exit.
 func (r *ACPRunner) Close() error {
 	if r == nil {
 		return nil
 	}
 
-	r.sessionsMu.Lock()
+	r.runtimeMu.Lock()
 	if r.closed {
-		r.sessionsMu.Unlock()
+		r.runtimeMu.Unlock()
 		return nil
 	}
 	r.closed = true
-	sessions := make([]*acpRunnerSession, 0, len(r.sessions))
-	for key, session := range r.sessions {
-		if session.idleTimer != nil {
-			session.idleTimer.Stop()
-			session.idleTimer = nil
-		}
-		sessions = append(sessions, session)
-		delete(r.sessions, key)
-	}
-	clear(r.pendingTokens)
-	clear(r.activeTurns)
+	clear(r.toolCallTokens)
 	toolServer := r.toolServer
 	r.toolServer = nil
 	cancel := r.cancel
 	r.cancel = nil
-	r.sessionsMu.Unlock()
+	r.runtimeMu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
 
 	var closeErr error
-	for _, session := range sessions {
-		closeErr = errors.Join(closeErr, session.session.Close())
-	}
 	if toolServer != nil {
 		closeErr = errors.Join(closeErr, toolServer.Close())
 	}
 	if closeErr != nil {
-		log.Printf("acp runner closed: sessions=%d err=%v", len(sessions), closeErr)
+		log.Printf("acp runner closed: err=%v", closeErr)
 	} else {
-		log.Printf("acp runner closed: sessions=%d", len(sessions))
+		log.Printf("acp runner closed")
 	}
 	return closeErr
 }
@@ -211,205 +211,9 @@ func (r *ACPRunner) globalContext() ([]string, []Tool) {
 	return append([]string(nil), r.systemPrompts...), append([]Tool(nil), r.tools...)
 }
 
-// RunTurn runs one ACP turn and returns the updated ACP session ID and final reply text.
-func (r *ACPRunner) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
-	if r == nil {
-		return TurnResult{}, errors.New("run acp turn failed: runner is nil")
-	}
-
-	prompts, tools := r.globalContext()
-
-	session, err := r.acquireACPSession(ctx, req.Conversation.Key, req.Conversation.RunnerThreadID, len(tools) != 0)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run acp turn failed: acquire session: %w", err)
-	}
-	defer r.releaseACPSession(req.Conversation.Key, session)
-	initialPromptBlocks := []string(nil)
-	if req.Conversation.RunnerThreadID == "" {
-		initialPromptBlocks = prompts
-	}
-	promptBlocks, err := buildACPPromptBlocks(initialPromptBlocks, req.Message, session.session.Capabilities().Prompt)
-	if err != nil {
-		r.discardACPSession(req.Conversation.Key, session, err)
-		return TurnResult{}, fmt.Errorf("run acp turn failed: build prompt blocks: %w", err)
-	}
-	r.setActiveTurn(session.token, req)
-	defer r.clearActiveTurn(session.token)
-
-	log.Printf(
-		"acp runner session ready: conversation=%s requested_session=%s actual_session=%s tool_count=%d",
-		req.Conversation.Key,
-		req.Conversation.RunnerThreadID,
-		session.session.CurrentSessionID(),
-		len(tools),
-	)
-
-	stopTyping := startTyping(ctx, req.Message.Responder)
-	defer stopTyping()
-
-	turnResult, err := session.session.RunTurn(ctx, promptBlocks)
-	if err != nil {
-		r.discardACPSession(req.Conversation.Key, session, err)
-		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", err)
-	}
-
-	return TurnResult{
-		RunnerThreadID: turnResult.SessionID,
-		ReplyText:      turnResult.ReplyText,
-	}, nil
-}
-
-func (r *ACPRunner) acquireACPSession(ctx context.Context, conversationKey, sessionID string, needsTools bool) (*acpRunnerSession, error) {
-	if r == nil {
-		return nil, errors.New("acp runner is nil")
-	}
-
-	r.sessionsMu.Lock()
-	if r.closed {
-		r.sessionsMu.Unlock()
-		return nil, errors.New("acp runner is closed")
-	}
-	existing := r.sessions[conversationKey]
-	if existing != nil {
-		if existing.idleTimer != nil {
-			existing.idleTimer.Stop()
-			existing.idleTimer = nil
-		}
-		existing.inUse = true
-		r.sessionsMu.Unlock()
-		return existing, nil
-	}
-	r.sessionsMu.Unlock()
-
-	sessionOptions := acp.SessionOptions{
-		Command:         r.command,
-		Args:            append([]string(nil), r.args...),
-		Env:             append([]string(nil), r.env...),
-		WorkingDir:      r.workDir,
-		ResumeSessionID: sessionID,
-		AuthMethod:      r.authMethod,
-	}
-
-	token, err := randomACPToken()
-	if err != nil {
-		return nil, err
-	}
-	r.sessionsMu.Lock()
-	if r.closed {
-		r.sessionsMu.Unlock()
-		return nil, errors.New("acp runner is closed")
-	}
-	r.pendingTokens[token] = struct{}{}
-	r.sessionsMu.Unlock()
-	defer func() {
-		r.unregisterPendingACPToken(token)
-	}()
-	if needsTools {
-		toolServer, err := r.ensureACPToolServer(context.WithoutCancel(ctx))
-		if err != nil {
-			return nil, err
-		}
-		sessionOptions.MCPServers = []acp.MCPServer{toolServer.ServerConfig(token)}
-	}
-
-	if r.sessionFactory == nil {
-		return nil, errors.New("acp session factory is nil")
-	}
-	if r.lifecycleCtx == nil {
-		return nil, errors.New("acp runner lifecycle context is nil")
-	}
-	//nolint:contextcheck // ACP sessions intentionally inherit the runner lifecycle context.
-	session, err := r.sessionFactory(r.lifecycleCtx, sessionOptions)
-	if err != nil {
-		return nil, err
-	}
-	if needsTools && !session.Capabilities().MCP.HTTP {
-		_ = session.Close()
-		return nil, errors.New("acp agent does not advertise HTTP MCP support")
-	}
-	managed := &acpRunnerSession{
-		session: session,
-		token:   token,
-		inUse:   true,
-	}
-
-	r.sessionsMu.Lock()
-	defer r.sessionsMu.Unlock()
-	if r.closed {
-		_ = session.Close()
-		return nil, errors.New("acp runner is closed")
-	}
-	existing = r.sessions[conversationKey]
-	if existing != nil {
-		if existing.idleTimer != nil {
-			existing.idleTimer.Stop()
-			existing.idleTimer = nil
-		}
-		existing.inUse = true
-		_ = session.Close()
-		return existing, nil
-	}
-	delete(r.pendingTokens, token)
-	r.sessions[conversationKey] = managed
-	return managed, nil
-}
-
-func (r *ACPRunner) releaseACPSession(conversationKey string, managed *acpRunnerSession) {
-	if r == nil || managed == nil {
-		return
-	}
-	if r.sessionIdleTimeout <= 0 {
-		r.discardACPSession(conversationKey, managed, nil)
-		return
-	}
-
-	r.sessionsMu.Lock()
-	defer r.sessionsMu.Unlock()
-	if r.closed || r.sessions[conversationKey] != managed {
-		return
-	}
-	managed.inUse = false
-	if managed.idleTimer != nil {
-		managed.idleTimer.Stop()
-	}
-	managed.idleTimer = time.AfterFunc(r.sessionIdleTimeout, func() {
-		r.sessionsMu.Lock()
-		if r.sessions[conversationKey] != managed || managed.inUse {
-			r.sessionsMu.Unlock()
-			return
-		}
-		r.sessionsMu.Unlock()
-		log.Printf("acp runner expiring idle session: conversation=%s idle_timeout=%s", conversationKey, r.sessionIdleTimeout)
-		r.discardACPSession(conversationKey, managed, nil)
-	})
-}
-
-func (r *ACPRunner) discardACPSession(conversationKey string, managed *acpRunnerSession, reason error) {
-	if r == nil || managed == nil {
-		return
-	}
-
-	r.sessionsMu.Lock()
-	if r.sessions[conversationKey] == managed {
-		delete(r.sessions, conversationKey)
-	}
-	managed.inUse = false
-	if managed.idleTimer != nil {
-		managed.idleTimer.Stop()
-		managed.idleTimer = nil
-	}
-	delete(r.activeTurns, managed.token)
-	r.sessionsMu.Unlock()
-
-	if reason != nil {
-		log.Printf("acp runner closing session process: conversation=%s err=%v", conversationKey, reason)
-	}
-	_ = managed.session.Close()
-}
-
 func (r *ACPRunner) ensureACPToolServer(ctx context.Context) (*acp.HTTPToolServer, error) {
-	r.sessionsMu.Lock()
-	defer r.sessionsMu.Unlock()
+	r.runtimeMu.Lock()
+	defer r.runtimeMu.Unlock()
 	if r.toolServer != nil {
 		return r.toolServer, nil
 	}
@@ -430,96 +234,61 @@ func (r *ACPRunner) ensureACPToolServer(ctx context.Context) (*acp.HTTPToolServe
 	return server, nil
 }
 
-func (r *ACPRunner) isAuthorizedACPToken(token string) bool {
-	r.sessionsMu.Lock()
-	defer r.sessionsMu.Unlock()
-	if _, ok := r.pendingTokens[token]; ok {
-		return true
-	}
-	for _, managed := range r.sessions {
-		if managed.token == token {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *ACPRunner) unregisterPendingACPToken(token string) {
-	if r == nil || strings.TrimSpace(token) == "" {
-		return
+func (r *ACPRunner) createACPSession(ctx context.Context, resumeSessionID string) (acp.Session, string, error) {
+	if r == nil {
+		return nil, "", errors.New("acp runner is nil")
 	}
 
-	r.sessionsMu.Lock()
-	delete(r.pendingTokens, token)
-	r.sessionsMu.Unlock()
-}
+	sessionOptions := acp.SessionOptions{
+		Command:         r.command,
+		Args:            append([]string(nil), r.args...),
+		Env:             append([]string(nil), r.env...),
+		WorkingDir:      r.workDir,
+		ResumeSessionID: strings.TrimSpace(resumeSessionID),
+		AuthMethod:      r.authMethod,
+	}
 
-func (r *ACPRunner) activeTurnForToken(token string) (TurnRequest, bool) {
-	r.sessionsMu.Lock()
-	defer r.sessionsMu.Unlock()
-	req, ok := r.activeTurns[token]
-	return req, ok
-}
-
-func (r *ACPRunner) setActiveTurn(token string, req TurnRequest) {
-	r.sessionsMu.Lock()
-	r.activeTurns[token] = req
-	r.sessionsMu.Unlock()
-}
-
-func (r *ACPRunner) clearActiveTurn(token string) {
-	r.sessionsMu.Lock()
-	delete(r.activeTurns, token)
-	r.sessionsMu.Unlock()
-}
-
-func (r *ACPRunner) acpHTTPTools(token string) []acp.HTTPTool {
 	_, tools := r.globalContext()
-	adapted := make([]acp.HTTPTool, 0, len(tools))
-	for _, tool := range tools {
-		if tool == nil {
-			continue
+	needsTools := len(tools) != 0
+
+	token, err := randomACPToken()
+	if err != nil {
+		return nil, "", err
+	}
+	r.runtimeMu.Lock()
+	if r.closed {
+		r.runtimeMu.Unlock()
+		return nil, "", errors.New("acp runner is closed")
+	}
+	r.reserveToolCallToken(token)
+	r.runtimeMu.Unlock()
+	defer r.releaseReservedToolCallToken(token)
+
+	if needsTools {
+		toolServer, serverErr := r.ensureACPToolServer(context.WithoutCancel(ctx))
+		if serverErr != nil {
+			return nil, "", serverErr
 		}
-		adapted = append(adapted, acpHTTPToolAdapter{
-			token:  token,
-			tool:   tool,
-			runner: r,
-		})
+		sessionOptions.MCPServers = []acp.MCPServer{toolServer.ServerConfig(token)}
 	}
-	return adapted
-}
 
-type acpHTTPToolAdapter struct {
-	token  string
-	tool   Tool
-	runner *ACPRunner
-}
-
-func (t acpHTTPToolAdapter) Name() string {
-	return t.tool.Name()
-}
-
-func (t acpHTTPToolAdapter) Description() string {
-	return t.tool.Description()
-}
-
-func (t acpHTTPToolAdapter) InputSchema() any {
-	return t.tool.InputSchema()
-}
-
-func (t acpHTTPToolAdapter) OutputSchema() any {
-	return t.tool.OutputSchema()
-}
-
-func (t acpHTTPToolAdapter) Call(ctx context.Context, arguments json.RawMessage) (any, error) {
-	if len(arguments) == 0 {
-		arguments = json.RawMessage("{}")
+	if r.sessionFactory == nil {
+		return nil, "", errors.New("acp session factory is nil")
 	}
-	turnReq, ok := t.runner.activeTurnForToken(t.token)
-	if !ok {
-		return nil, errors.New("tool call failed: active turn context not found")
+	if r.lifecycleCtx == nil {
+		return nil, "", errors.New("acp runner lifecycle context is nil")
 	}
-	return t.tool.Call(ContextWithTurnRequest(ctx, turnReq), arguments)
+
+	//nolint:contextcheck // ACP sessions are intentionally rooted in the runner lifecycle context.
+	session, err := r.sessionFactory(r.lifecycleCtx, sessionOptions)
+	if err != nil {
+		return nil, "", err
+	}
+	if needsTools && !session.Capabilities().MCP.HTTP {
+		_ = session.Close()
+		return nil, "", errors.New("acp agent does not advertise HTTP MCP support")
+	}
+	return session, token, nil
 }
 
 func buildACPPromptBlocks(prefixTextBlocks []string, message InboundMessage, capabilities acp.PromptCapabilities) ([]acp.ContentBlock, error) {

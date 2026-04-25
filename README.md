@@ -41,7 +41,8 @@ This keeps the application lightweight while allowing the local agent environmen
 
 When the service shuts down, the dispatcher stops accepting new work immediately.
 It drops messages that are still waiting in the in-memory queue, pending batch, or delayed merge window,
-and only keeps already-running turns alive for a short grace period.
+it also drops slash commands that are still queued but have not started yet,
+and only keeps already-running turns or commands alive for a short grace period.
 
 ## Key Features
 
@@ -52,6 +53,7 @@ and only keeps already-running turns alive for a short grace period.
 - Support for text messages, image messages, file messages, video messages, combined-forwarded messages, quoted messages, and interactive cards
 - Interactive-card summaries that preserve card semantics, including button labels, redirect links, and card images
 - Interactive-card callback actions for both tool execution and button-triggered prompt submission
+- Conversation control slash commands, including `/stop` to interrupt the current turn and `/reset` to interrupt the current turn and reset the persisted conversation state
 - Agent support for sending generated data files such as CSV, JSON, and text reports back to users
 - Outbound interactive-card guidance for complex task progress updates and structured presentation of complex results
 - Shared agent layer for normalized message processing and conversation state management

@@ -119,10 +119,11 @@ func (m InboundMessage) MergedMessages() []InboundMessage {
 
 // ConversationState stores the mapping between a source conversation and a runner thread.
 type ConversationState struct {
-	Key            string    `json:"key"`
-	RunnerThreadID string    `json:"runner_thread_id,omitempty"`
-	LastEventID    string    `json:"last_event_id,omitempty"`
-	LastActivityAt time.Time `json:"last_activity_at"`
+	Key               string    `json:"key"`
+	RunnerThreadID    string    `json:"runner_thread_id,omitempty"`
+	RunnerThreadDirty bool      `json:"runner_thread_dirty,omitempty"`
+	LastEventID       string    `json:"last_event_id,omitempty"`
+	LastActivityAt    time.Time `json:"last_activity_at"`
 }
 
 // TurnRequest contains the state and new user input for one agent turn.

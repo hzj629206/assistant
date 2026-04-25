@@ -1,7 +1,6 @@
 package claudecode
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -33,67 +31,6 @@ type StreamContentBlock struct {
 	Input    map[string]any `json:"input,omitempty"`
 	IsError  bool           `json:"is_error,omitempty"`
 	Content  any            `json:"content,omitempty"`
-}
-
-// CloneRetryPolicy returns an independent copy of the retry policy.
-func CloneRetryPolicy(policy *RetryPolicy) *RetryPolicy {
-	if policy == nil {
-		return nil
-	}
-
-	cloned := *policy
-	return &cloned
-}
-
-// CalculateRetryBackoff computes the retry backoff for a given attempt.
-func CalculateRetryBackoff(policy *RetryPolicy, attempt int) time.Duration {
-	if policy == nil || attempt <= 0 {
-		return 0
-	}
-
-	delay := policy.BaseDelay
-	if delay <= 0 {
-		return 0
-	}
-
-	factor := policy.BackoffFactor
-	if factor <= 0 {
-		factor = 1
-	}
-
-	for step := 1; step < attempt; step++ {
-		nextDelay := time.Duration(float64(delay) * factor)
-		if nextDelay <= 0 {
-			nextDelay = delay
-		}
-		delay = nextDelay
-		if policy.MaxDelay > 0 && delay >= policy.MaxDelay {
-			return policy.MaxDelay
-		}
-	}
-
-	if policy.MaxDelay > 0 && delay > policy.MaxDelay {
-		return policy.MaxDelay
-	}
-
-	return delay
-}
-
-// WaitRetryDelay waits for the requested retry delay or context cancellation.
-func WaitRetryDelay(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		return nil
-	}
-
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // ResolveSessionID returns the latest non-empty Claude session ID.

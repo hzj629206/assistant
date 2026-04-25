@@ -157,24 +157,6 @@ type RunOptions struct {
 	Stderr                             io.Writer
 }
 
-// RetryPolicy defines retry behavior for transient Claude failures.
-type RetryPolicy struct {
-	MaxRetries    int
-	BaseDelay     time.Duration
-	MaxDelay      time.Duration
-	BackoffFactor float64
-}
-
-// DefaultRetryPolicy returns the default retry settings used by the runner.
-func DefaultRetryPolicy() *RetryPolicy {
-	return &RetryPolicy{
-		MaxRetries:    3,
-		BaseDelay:     100 * time.Millisecond,
-		MaxDelay:      5 * time.Second,
-		BackoffFactor: 2,
-	}
-}
-
 // ErrorType classifies Claude execution failures.
 type ErrorType int
 

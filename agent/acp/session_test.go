@@ -79,6 +79,121 @@ func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestProcessSessionInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
+	session := &processSession{}
+
+	err := session.Interrupt(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil interrupt without active turn, got %v", err)
+	}
+}
+
+func TestProcessSessionInterruptWaitsForTurnCompletion(t *testing.T) {
+	var output bytes.Buffer
+	session := &processSession{
+		transport: newRPCTransport(bytes.NewReader(nil), &output, nil, nil),
+		sessionID: "session-interrupt",
+	}
+
+	activeTurn, err := session.startActiveTurn("session-interrupt")
+	if err != nil {
+		t.Fatalf("startActiveTurn failed: %v", err)
+	}
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	select {
+	case err = <-interruptDone:
+		t.Fatalf("interrupt returned before turn completion: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if strings.Contains(output.String(), "\"method\":\"session/cancel\"") {
+		t.Fatalf("did not expect session/cancel write from Interrupt, got %q", output.String())
+	}
+
+	session.finishActiveTurn(activeTurn)
+
+	select {
+	case err = <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+}
+
+func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes(t *testing.T) {
+	var output bytes.Buffer
+	reader, writer := io.Pipe()
+	session := &processSession{
+		transport: newRPCTransport(reader, &output, nil, nil),
+		sessionID: "session-interrupted-complete",
+	}
+	session.transport.onNotify = session.handleNotification
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go session.transport.readLoop(ctx)
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.RunTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
+		runErrCh <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if strings.Contains(output.String(), "\"method\":\"session/prompt\"") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected session/prompt write, got %q", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	interruptDone := make(chan error, 1)
+	go func() {
+		interruptDone <- session.Interrupt(context.Background())
+	}()
+
+	for {
+		if strings.Contains(output.String(), "\"method\":\"session/cancel\"") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected session/cancel write, got %q", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, _ = writer.Write([]byte("{\"id\":1,\"result\":{\"stopReason\":\"end_turn\"}}\n"))
+	_ = writer.Close()
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("interrupt failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not wait for turn completion")
+	}
+
+	select {
+	case err := <-runErrCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunTurn did not return")
+	}
+}
+
 func TestIgnoreExpectedExitReturnsNilForSIGTERM(t *testing.T) {
 	t.Parallel()
 
@@ -202,6 +317,70 @@ func TestProcessSessionHandleRequestUsesCustomPermissionHandler(t *testing.T) {
 	written := output.String()
 	if !strings.Contains(written, `"optionId":"allow-id"`) {
 		t.Fatalf("expected selected option in response, got %q", written)
+	}
+}
+
+func TestProcessSessionInterruptCancelsPendingPermissionRequests(t *testing.T) {
+	var output bytes.Buffer
+	handlerCtxDone := make(chan struct{})
+	session := &processSession{
+		lifecycleCtx: context.Background(),
+		transport:    newRPCTransport(bytes.NewReader(nil), &output, nil, nil),
+		permission: func(handlerCtx context.Context, request PermissionRequest) (PermissionDecision, error) {
+			<-handlerCtx.Done()
+			close(handlerCtxDone)
+			return PermissionDecision{}, handlerCtx.Err()
+		},
+	}
+
+	activeTurn, err := session.startActiveTurn("session-permission-cancel")
+	if err != nil {
+		t.Fatalf("startActiveTurn failed: %v", err)
+	}
+	defer session.finishActiveTurn(activeTurn)
+
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		params := json.RawMessage(`{"options":[{"optionId":"allow-id","name":"Allow","kind":"allow_once"},{"optionId":"deny-id","name":"Deny","kind":"deny"}]}`)
+		session.handleRequest("session/request_permission", json.RawMessage(`7`), params)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		session.permissionMu.Lock()
+		pendingCount := len(session.pendingPermission)
+		session.permissionMu.Unlock()
+		if pendingCount == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected pending permission request, got output %q", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	session.signalTurnInterrupt(activeTurn)
+	session.watchTurnInterrupt(context.Background(), activeTurn)
+
+	select {
+	case <-handlerCtxDone:
+	case <-time.After(time.Second):
+		t.Fatal("permission handler context was not canceled")
+	}
+
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("permission request did not complete after interrupt")
+	}
+
+	written := output.String()
+	if !strings.Contains(written, `"method":"session/cancel"`) {
+		t.Fatalf("expected session/cancel write, got %q", written)
+	}
+	if !strings.Contains(written, `"id":7`) || !strings.Contains(written, `"outcome":"cancelled"`) {
+		t.Fatalf("expected cancelled permission response, got %q", written)
 	}
 }
 

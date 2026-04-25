@@ -92,17 +92,17 @@ func newProcess(cfg config.Config, factory RunnerFactory) *process {
 func (p *process) start(ctx context.Context) error {
 	// Startup rollback intentionally reuses the startup context. If startup has already timed out,
 	// failing fast is preferable to extending startup with a separate cleanup budget.
+	var err error
 
 	cache.SetGlobal(cache.NewMemoryStorage())
 
-	runner, err := p.runnerFactory(ctx, p.cfg)
+	p.runner, err = p.runnerFactory(ctx, p.cfg)
 	if err != nil {
 		return fmt.Errorf("create runner failed: %w", err)
 	}
-	p.runner = runner
 	defer func() {
 		if err != nil && p.runner != nil {
-			if closeErr := p.closeRunner(); closeErr != nil {
+			if closeErr := p.runner.Close(); closeErr != nil {
 				log.Printf("runner rollback failed: %v", closeErr)
 			}
 		}
@@ -110,12 +110,9 @@ func (p *process) start(ctx context.Context) error {
 
 	p.dispatcher = agent.NewDispatcher(agent.DispatcherOptions{
 		Store:      agent.NewConversationStore(cache.Global()),
-		Runner:     runner,
+		Runner:     p.runner,
 		FatalErrCh: p.errCh,
 	})
-	if err = p.dispatcher.Start(); err != nil { //nolint:contextcheck
-		return fmt.Errorf("start dispatcher failed: %w", err)
-	}
 	defer func() {
 		if err != nil {
 			if shutdownErr := p.dispatcher.Shutdown(ctx); shutdownErr != nil {
@@ -124,9 +121,13 @@ func (p *process) start(ctx context.Context) error {
 		}
 	}()
 
+	if err = p.dispatcher.Start(); err != nil { //nolint:contextcheck
+		return fmt.Errorf("start dispatcher failed: %w", err)
+	}
+
 	seaTalkAdapter := adapter.NewSeaTalkAgentAdapter(p.dispatcher, p.cfg.SeaTalk)
-	runner.RegisterSystemPrompt(seaTalkAdapter.SystemPrompt())
-	runner.RegisterTools(seaTalkAdapter.Tools()...)
+	p.runner.RegisterSystemPrompt(seaTalkAdapter.SystemPrompt())
+	p.runner.RegisterTools(seaTalkAdapter.Tools()...)
 
 	p.httpServer = newHTTPServer(seaTalkAdapter.NewCallbackHandler())
 	defer func() {
@@ -172,9 +173,8 @@ func (p *process) shutdown(ctx context.Context) error {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("dispatcher shutdown failed: %w", err))
 		}
 	}
-
 	if p.runner != nil {
-		if err := p.closeRunner(); err != nil {
+		if err := p.runner.Close(); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("runner shutdown failed: %w", err))
 		}
 	}

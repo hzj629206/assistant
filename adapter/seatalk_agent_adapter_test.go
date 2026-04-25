@@ -4814,6 +4814,56 @@ type testRunner struct {
 	lastReq agent.TurnRequest
 }
 
+type runnerSession struct {
+	run       func(context.Context, agent.TurnRequest) (agent.TurnResult, error)
+	status    func(context.Context) (agent.SessionStatus, error)
+	commands  func() []agent.CommandSpec
+	handleCmd func(context.Context, agent.SlashCommand) (string, error)
+	interrupt func(context.Context) error
+	closeFn   func() error
+}
+
+func (s *runnerSession) ID() string { return "" }
+
+func (s *runnerSession) RunTurn(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
+	return s.run(ctx, req)
+}
+
+func (s *runnerSession) Interrupt(ctx context.Context) error {
+	if s.interrupt == nil {
+		return nil
+	}
+	return s.interrupt(ctx)
+}
+
+func (s *runnerSession) Status(ctx context.Context) (agent.SessionStatus, error) {
+	if s.status == nil {
+		return agent.SessionStatus{}, nil
+	}
+	return s.status(ctx)
+}
+
+func (s *runnerSession) Commands() []agent.CommandSpec {
+	if s.commands == nil {
+		return nil
+	}
+	return s.commands()
+}
+
+func (s *runnerSession) HandleCommand(ctx context.Context, command agent.SlashCommand) (string, error) {
+	if s.handleCmd == nil {
+		return "", errors.New("unsupported slash command")
+	}
+	return s.handleCmd(ctx, command)
+}
+
+func (s *runnerSession) Close() error {
+	if s.closeFn == nil {
+		return nil
+	}
+	return s.closeFn()
+}
+
 type typingRunner struct {
 	mu      sync.Mutex
 	calls   int
@@ -4828,9 +4878,29 @@ func (r *testRunner) RunTurn(_ context.Context, req agent.TurnRequest) (agent.Tu
 	return agent.TurnResult{}, nil
 }
 
+func (r *testRunner) StartSession(_ context.Context, _ agent.SessionOptions) (agent.Session, error) {
+	return &runnerSession{
+		run: func(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
+			return r.RunTurn(ctx, req)
+		},
+		status: func(ctx context.Context) (agent.SessionStatus, error) {
+			return r.Status(ctx, agent.ConversationState{})
+		},
+		closeFn: r.Close,
+	}, nil
+}
+
 func (*testRunner) RegisterSystemPrompt(string) {}
 
 func (*testRunner) RegisterTools(...agent.Tool) {}
+
+func (*testRunner) Interrupt(context.Context, agent.ConversationState) error { return nil }
+
+func (*testRunner) Close() error { return nil }
+
+func (*testRunner) Status(context.Context, agent.ConversationState) (agent.SessionStatus, error) {
+	return agent.SessionStatus{}, nil
+}
 
 func (r *typingRunner) RunTurn(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
 	if err := req.Message.Responder.SetTyping(ctx); err != nil {
@@ -4844,9 +4914,29 @@ func (r *typingRunner) RunTurn(ctx context.Context, req agent.TurnRequest) (agen
 	return agent.TurnResult{}, nil
 }
 
+func (r *typingRunner) StartSession(_ context.Context, _ agent.SessionOptions) (agent.Session, error) {
+	return &runnerSession{
+		run: func(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
+			return r.RunTurn(ctx, req)
+		},
+		status: func(ctx context.Context) (agent.SessionStatus, error) {
+			return r.Status(ctx, agent.ConversationState{})
+		},
+		closeFn: r.Close,
+	}, nil
+}
+
 func (*typingRunner) RegisterSystemPrompt(string) {}
 
 func (*typingRunner) RegisterTools(...agent.Tool) {}
+
+func (*typingRunner) Interrupt(context.Context, agent.ConversationState) error { return nil }
+
+func (*typingRunner) Close() error { return nil }
+
+func (*typingRunner) Status(context.Context, agent.ConversationState) (agent.SessionStatus, error) {
+	return agent.SessionStatus{}, nil
+}
 
 func (r *testRunner) LastRequest() agent.TurnRequest {
 	r.mu.Lock()
@@ -4926,6 +5016,18 @@ func (r *blockingTestRunner) RunTurn(_ context.Context, req agent.TurnRequest) (
 	return agent.TurnResult{}, nil
 }
 
+func (r *blockingTestRunner) StartSession(_ context.Context, _ agent.SessionOptions) (agent.Session, error) {
+	return &runnerSession{
+		run: func(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
+			return r.RunTurn(ctx, req)
+		},
+		status: func(ctx context.Context) (agent.SessionStatus, error) {
+			return r.Status(ctx, agent.ConversationState{})
+		},
+		closeFn: r.Close,
+	}, nil
+}
+
 func waitForBlockingRunnerStarts(runner *blockingTestRunner, calls int) error {
 	deadline := time.After(time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -4941,6 +5043,82 @@ func waitForBlockingRunnerStarts(runner *blockingTestRunner, calls int) error {
 			return context.DeadlineExceeded
 		case <-ticker.C:
 		}
+	}
+}
+
+func TestSeatalkSlashCommandParsesPrivateStop(t *testing.T) {
+	t.Parallel()
+
+	event := &seatalk.MessageFromBotSubscriberEvent{}
+	event.Message.Tag = string(agent.MessageKindText)
+	event.Message.Text.Content = " /stop \n"
+
+	command, ok := seatalkSlashCommand(event)
+	if !ok {
+		t.Fatal("expected slash command to be parsed")
+	}
+	if !command.IsStop() {
+		t.Fatalf("unexpected command: %+v", command)
+	}
+}
+
+func TestSeatalkSlashCommandParsesPrivateHelp(t *testing.T) {
+	t.Parallel()
+
+	event := &seatalk.MessageFromBotSubscriberEvent{}
+	event.Message.Tag = string(agent.MessageKindText)
+	event.Message.Text.Content = "/help"
+
+	command, ok := seatalkSlashCommand(event)
+	if !ok {
+		t.Fatal("expected slash command to be parsed")
+	}
+	if !command.IsHelp() {
+		t.Fatalf("unexpected command: %+v", command)
+	}
+}
+
+func TestSeatalkSlashCommandRemovesBotMentionFromGroupText(t *testing.T) {
+	t.Parallel()
+
+	event := &seatalk.NewMentionedMessageReceivedFromGroupChatEvent{}
+	event.Message.Text.PlainText = "/stop @assistant"
+	event.Message.Text.MentionedList = []struct {
+		Username     string `json:"username"`
+		SeatalkID    string `json:"seatalk_id"`
+		EmployeeCode string `json:"employee_code"`
+		Email        string `json:"email"`
+	}{
+		{Username: "assistant", SeatalkID: "bot-1"},
+	}
+	event.Message.Tag = string(agent.MessageKindText)
+
+	command, ok := seatalkSlashCommand(event)
+	if !ok {
+		t.Fatal("expected slash command to be parsed")
+	}
+	if !command.IsStop() {
+		t.Fatalf("unexpected command: %+v", command)
+	}
+}
+
+func TestNormalizeMentionedGroupSlashCommandTextLeavesNonBotMentionsIntact(t *testing.T) {
+	t.Parallel()
+
+	event := &seatalk.NewMentionedMessageReceivedFromGroupChatEvent{}
+	event.Message.Text.PlainText = "@alice /stop @assistant"
+	event.Message.Text.MentionedList = []struct {
+		Username     string `json:"username"`
+		SeatalkID    string `json:"seatalk_id"`
+		EmployeeCode string `json:"employee_code"`
+		Email        string `json:"email"`
+	}{
+		{Username: "alice", SeatalkID: "user-1", EmployeeCode: "e_1", Email: "alice@example.com"},
+		{Username: "assistant", SeatalkID: "bot-1"},
+	}
+
+	if got := normalizeMentionedGroupSlashCommandText(event); got != "@alice /stop" {
+		t.Fatalf("unexpected normalized text: %q", got)
 	}
 }
 
