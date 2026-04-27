@@ -69,14 +69,13 @@ var ErrSessionBusy = errors.New("session already has an active turn")
 //     successful TurnResult. It should return an interruption or cancellation error instead,
 //     even if the backing runner produced a partial or final reply.
 //   - Close must be safe to call repeatedly and concurrently.
+//   - Status must be safe to call concurrently with RunTurn, Interrupt, and Close.
 type Session interface {
 	ID() string
 	RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error)
 	Interrupt(ctx context.Context) error
 	Close() error
 	Status(ctx context.Context) (SessionStatus, error)
-	Commands() []CommandSpec
-	HandleCommand(ctx context.Context, command SlashCommand) (string, error)
 }
 
 // SessionOptions configures one runner-backed session instance.

@@ -24,8 +24,6 @@ type testRunner struct {
 	lastStatus        ConversationState
 	status            SessionStatus
 	statusErr         error
-	commands          []CommandSpec
-	handleCommand     func(context.Context, SlashCommand) (string, error)
 	statusStarted     chan struct{}
 	statusRelease     chan struct{}
 	interruptStarted  chan struct{}
@@ -87,17 +85,6 @@ func (s *testSession) Interrupt(ctx context.Context) error {
 
 func (s *testSession) Status(ctx context.Context) (SessionStatus, error) {
 	return s.runner.Status(ctx, ConversationState{Key: s.conversationKey, RunnerThreadID: s.sessionID})
-}
-
-func (s *testSession) Commands() []CommandSpec {
-	return append([]CommandSpec(nil), s.runner.commands...)
-}
-
-func (s *testSession) HandleCommand(ctx context.Context, command SlashCommand) (string, error) {
-	if s.runner.handleCommand == nil {
-		return "", errors.New("unsupported slash command")
-	}
-	return s.runner.handleCommand(ctx, command)
 }
 
 func (s *testSession) Close() error {
@@ -570,6 +557,16 @@ func TestDispatcherShutdownDropsQueuedCommandsAndWaitsForRunningCommand(t *testi
 		WorkerCount: 1,
 	})
 	_ = dispatcher.Start()
+	managedSession, err := dispatcher.ensureConversationSession(context.Background(), ConversationState{
+		Key:            "private:e_shutdown:0",
+		RunnerThreadID: "thread-shutdown",
+	})
+	if err != nil {
+		t.Fatalf("ensure managed session failed: %v", err)
+	}
+	if managedSession == nil {
+		t.Fatal("expected managed session")
+	}
 
 	firstResponder := &testResponder{}
 	if err := dispatcher.EnqueueCommand(context.Background(), CommandRequest{
@@ -672,18 +669,33 @@ func TestDispatcherPersistsSessionIDBeforeFirstTurn(t *testing.T) {
 	t.Parallel()
 
 	store := NewConversationStore(cache.NewMemoryStorage())
-	runner := &testRunner{startSessionID: "thread-prestarted"}
-	dispatcher := NewDispatcher(DispatcherOptions{
-		Store:  store,
-		Runner: runner,
-	})
-
-	session, err := dispatcher.ensureConversationSession(context.Background(), ConversationState{Key: "private:e_1:prestart"})
-	if err != nil {
-		t.Fatalf("ensure session failed: %v", err)
+	runner := &testRunner{
+		startSessionID: "thread-prestarted",
+		started:        make(chan struct{}, 1),
+		release:        make(chan struct{}),
 	}
-	if session.ID() != "thread-prestarted" {
-		t.Fatalf("unexpected session id: %q", session.ID())
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       store,
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	err := dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-prestart",
+		ConversationKey: "private:e_1:prestart",
+		Kind:            MessageKindText,
+		Text:            "hello",
+		Responder:       &testResponder{},
+	})
+	if err != nil {
+		t.Fatalf("enqueue message failed: %v", err)
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first turn start")
 	}
 
 	state, err := store.GetConversation(context.Background(), "private:e_1:prestart")
@@ -693,6 +705,8 @@ func TestDispatcherPersistsSessionIDBeforeFirstTurn(t *testing.T) {
 	if state.RunnerThreadID != "thread-prestarted" {
 		t.Fatalf("expected persisted runner thread id, got %q", state.RunnerThreadID)
 	}
+
+	close(runner.release)
 }
 
 func TestDispatcherInterruptsDirtyConversationBeforeNextTurn(t *testing.T) {
@@ -885,8 +899,18 @@ func TestDispatcherResetCommandInterruptsAndResetsConversationState(t *testing.T
 		Store:  store,
 		Runner: runner,
 	})
+	session, err := dispatcher.ensureConversationSession(context.Background(), ConversationState{
+		Key:            "private:e_1:reset",
+		RunnerThreadID: "thread-reset",
+	})
+	if err != nil {
+		t.Fatalf("ensure session failed: %v", err)
+	}
+	if session == nil {
+		t.Fatal("expected managed session")
+	}
 
-	reply, err := dispatcher.buildCommandReply(context.Background(), CommandRequest{
+	reply, err := dispatcher.executeBlockingCommand(context.Background(), CommandRequest{
 		ConversationKey: "private:e_1:reset",
 		Command:         SlashCommand{Name: "reset"},
 	})
@@ -930,7 +954,7 @@ func TestDispatcherResetCausesNextTurnToReloadInitialMessages(t *testing.T) {
 	})
 	_ = dispatcher.Start()
 
-	_, err = dispatcher.buildCommandReply(context.Background(), CommandRequest{
+	_, err = dispatcher.executeBlockingCommand(context.Background(), CommandRequest{
 		ConversationKey: "private:e_1:reset-next",
 		Command:         SlashCommand{Name: "reset"},
 	})
@@ -1870,53 +1894,6 @@ func TestDispatcherHandleStopPreservesDirtyConversationState(t *testing.T) {
 	}
 }
 
-func TestDispatcherHandleStopLoadsPersistedSessionIntoMemory(t *testing.T) {
-	t.Parallel()
-
-	store := NewConversationStore(cache.NewMemoryStorage())
-	err := store.PutConversation(context.Background(), ConversationState{
-		Key:            "private:e_1:stop-load",
-		RunnerThreadID: "thread-stop-load",
-		LastEventID:    "evt-prev",
-		LastActivityAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("put conversation failed: %v", err)
-	}
-
-	runner := &testRunner{}
-	dispatcher := NewDispatcher(DispatcherOptions{
-		Store:       store,
-		Runner:      runner,
-		WorkerCount: 1,
-	})
-	_ = dispatcher.Start()
-
-	commandResponder := &testResponder{}
-	if err = dispatcher.EnqueueCommand(context.Background(), CommandRequest{
-		ConversationKey: "private:e_1:stop-load",
-		EventID:         "evt-stop-load",
-		Responder:       commandResponder,
-		Command:         SlashCommand{Name: "stop", Raw: "/stop"},
-	}); err != nil {
-		t.Fatalf("enqueue command failed: %v", err)
-	}
-	if err = waitForResponderSend(commandResponder); err != nil {
-		t.Fatalf("timed out waiting for command reply: %v", err)
-	}
-
-	if got := runner.StartSessionCalls(); got != 1 {
-		t.Fatalf("expected stop to load persisted session exactly once, got %d", got)
-	}
-	session := dispatcher.managedConversationSession("private:e_1:stop-load")
-	if session == nil {
-		t.Fatal("expected stop to keep loaded session in memory")
-	}
-	if session.ID() != "thread-stop-load" {
-		t.Fatalf("unexpected managed session id: %q", session.ID())
-	}
-}
-
 func TestDispatcherHandleStopWaitsForTurnCompletionBeforeReply(t *testing.T) {
 	t.Parallel()
 
@@ -2074,6 +2051,16 @@ func TestDispatcherHandleStopDropsIncomingMessagesDuringCommand(t *testing.T) {
 		WorkerCount: 1,
 	})
 	_ = dispatcher.Start()
+	managedSession, err := dispatcher.ensureConversationSession(context.Background(), ConversationState{
+		Key:            "private:e_2:0",
+		RunnerThreadID: "thread-stop",
+	})
+	if err != nil {
+		t.Fatalf("ensure managed session failed: %v", err)
+	}
+	if managedSession == nil {
+		t.Fatal("expected managed session")
+	}
 
 	commandResponder := &testResponder{}
 	if err = dispatcher.EnqueueCommand(context.Background(), CommandRequest{
@@ -2326,6 +2313,124 @@ func TestDispatcherStatusWithoutConversationThreadDoesNotStartSession(t *testing
 	}
 }
 
+func TestDispatcherStatusLoadsPersistedSessionWhenConversationIsIdle(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{
+		status: SessionStatus{
+			Agent:              "codex",
+			WorkingDirectories: []string{"/workspace"},
+		},
+		statusStarted: make(chan struct{}, 1),
+	}
+	store := NewConversationStore(cache.NewMemoryStorage())
+	err := store.PutConversation(context.Background(), ConversationState{
+		Key:            "private:e_status_load:0",
+		RunnerThreadID: "thread-status-load",
+		LastEventID:    "evt-prev",
+		LastActivityAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       store,
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	commandResponder := &testResponder{}
+	err = dispatcher.EnqueueCommand(context.Background(), CommandRequest{
+		ConversationKey: "private:e_status_load:0",
+		EventID:         "evt-status-load",
+		Responder:       commandResponder,
+		Command:         SlashCommand{Name: "status", Raw: "/status"},
+	})
+	if err != nil {
+		t.Fatalf("enqueue status command failed: %v", err)
+	}
+
+	if err = waitForResponderSend(commandResponder); err != nil {
+		t.Fatalf("timed out waiting for status reply: %v", err)
+	}
+
+	if got := runner.StartSessionCalls(); got != 1 {
+		t.Fatalf("expected status to lazy load persisted session once, got %d", got)
+	}
+	if got := runner.StatusCalls(); got != 1 {
+		t.Fatalf("expected one status call, got %d", got)
+	}
+	if got := runner.LastStatus().RunnerThreadID; got != "thread-status-load" {
+		t.Fatalf("unexpected status thread id: %q", got)
+	}
+	session := dispatcher.managedConversationSession("private:e_status_load:0")
+	if session == nil {
+		t.Fatal("expected lazy-loaded session to remain managed")
+	}
+	if session.ID() != "thread-status-load" {
+		t.Fatalf("unexpected managed session id: %q", session.ID())
+	}
+}
+
+func TestDispatcherStatusDoesNotLoadPersistedSessionWhenConversationLockIsBusy(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{
+		statusStarted: make(chan struct{}, 1),
+	}
+	store := NewConversationStore(cache.NewMemoryStorage())
+	err := store.PutConversation(context.Background(), ConversationState{
+		Key:            "private:e_status_busy:0",
+		RunnerThreadID: "thread-status-busy",
+		LastEventID:    "evt-prev",
+		LastActivityAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       store,
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	unlock := dispatcher.locks.Lock("private:e_status_busy:0")
+	defer unlock()
+
+	commandResponder := &testResponder{}
+	err = dispatcher.EnqueueCommand(context.Background(), CommandRequest{
+		ConversationKey: "private:e_status_busy:0",
+		EventID:         "evt-status-busy",
+		Responder:       commandResponder,
+		Command:         SlashCommand{Name: "status", Raw: "/status"},
+	})
+	if err != nil {
+		t.Fatalf("enqueue status command failed: %v", err)
+	}
+
+	if err = waitForResponderSend(commandResponder); err != nil {
+		t.Fatalf("timed out waiting for status reply: %v", err)
+	}
+
+	select {
+	case <-runner.statusStarted:
+		t.Fatal("unexpected status call")
+	default:
+	}
+	if got := runner.StartSessionCalls(); got != 0 {
+		t.Fatalf("unexpected start session call count: %d", got)
+	}
+	if session := dispatcher.managedConversationSession("private:e_status_busy:0"); session != nil {
+		t.Fatal("expected no managed session when status lock acquisition fails")
+	}
+	reply := commandResponder.Reply().text
+	if !strings.Contains(reply, "_Current runner status:_ _session not active_") {
+		t.Fatalf("unexpected status reply: %q", reply)
+	}
+}
+
 func TestDispatcherCommandQueueBlocksConversationUntilQueuedCommandsDrain(t *testing.T) {
 	t.Parallel()
 
@@ -2349,6 +2454,16 @@ func TestDispatcherCommandQueueBlocksConversationUntilQueuedCommandsDrain(t *tes
 		WorkerCount: 1,
 	})
 	_ = dispatcher.Start()
+	managedSession, err := dispatcher.ensureConversationSession(context.Background(), ConversationState{
+		Key:            "private:e_3:0",
+		RunnerThreadID: "thread-command-queue",
+	})
+	if err != nil {
+		t.Fatalf("ensure managed session failed: %v", err)
+	}
+	if managedSession == nil {
+		t.Fatal("expected managed session")
+	}
 
 	firstResponder := &testResponder{}
 	secondResponder := &testResponder{}

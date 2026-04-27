@@ -188,12 +188,6 @@ func (s *codexRunnerSession) Status(context.Context) (SessionStatus, error) {
 	}, nil
 }
 
-func (*codexRunnerSession) Commands() []CommandSpec { return nil }
-
-func (*codexRunnerSession) HandleCommand(context.Context, SlashCommand) (string, error) {
-	return "", errors.New("unsupported slash command")
-}
-
 type codexRunnerActiveTurn struct {
 	cancel           func()
 	requestInterrupt func()

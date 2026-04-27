@@ -41,3 +41,35 @@ func (l *keyedLocker) Lock(key string) func() {
 		l.mu.Unlock()
 	}
 }
+
+func (l *keyedLocker) TryLock(key string) func() {
+	l.mu.Lock()
+	entry, ok := l.entries[key]
+	if !ok {
+		entry = &lockEntry{}
+		l.entries[key] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+
+	if !entry.mu.TryLock() {
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(l.entries, key)
+		}
+		l.mu.Unlock()
+		return nil
+	}
+
+	return func() {
+		entry.mu.Unlock()
+
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(l.entries, key)
+		}
+		l.mu.Unlock()
+	}
+}

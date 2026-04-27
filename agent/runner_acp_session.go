@@ -217,12 +217,6 @@ func (s *acpRunnerSession) Status(context.Context) (SessionStatus, error) {
 	return status, nil
 }
 
-func (*acpRunnerSession) Commands() []CommandSpec { return nil }
-
-func (*acpRunnerSession) HandleCommand(context.Context, SlashCommand) (string, error) {
-	return "", errors.New("unsupported slash command")
-}
-
 func (s *acpRunnerSession) currentSessionState() (acp.Session, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

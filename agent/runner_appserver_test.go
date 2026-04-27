@@ -1342,7 +1342,7 @@ func TestInterruptedAppServerTurnDoesNotReturnSuccessfulResult(t *testing.T) {
 	}
 	runner.runThreadTurnFn = func(_ context.Context, _ TurnRequest, _ appServerThread, _ []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 		close(started)
-		active, _, ok := session.activeTurnSnapshot()
+		active, ok := session.activeTurnSnapshot()
 		if !ok {
 			t.Fatal("expected active turn")
 		}
@@ -1405,7 +1405,7 @@ func TestInterruptedAppServerTurnReturnsCanceledAfterActiveTurnClears(t *testing
 	}
 	runner.runThreadTurnFn = func(_ context.Context, _ TurnRequest, _ appServerThread, _ []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 		close(started)
-		active, _, ok := session.activeTurnSnapshot()
+		active, ok := session.activeTurnSnapshot()
 		if !ok {
 			t.Fatal("expected active turn")
 		}

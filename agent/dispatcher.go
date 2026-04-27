@@ -566,6 +566,7 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		return fmt.Errorf("start session failed: %w", err)
 	}
 	defer releaseSession()
+	d.persistConversationSessionID(ctx, state, session)
 	activeTurn, releaseTurn := d.startTurnContext(state, session)
 	defer releaseTurn()
 
@@ -1108,7 +1109,6 @@ func (d *Dispatcher) acquireConversationSession(ctx context.Context, state Conve
 				existing.idleTimer = nil
 			}
 			d.sessionsMu.Unlock()
-			d.persistConversationSessionID(ctx, state, session)
 			return session, d.releaseConversationSessionFunc(conversationKey, session), nil
 		}
 		stale = existing.session
@@ -1148,7 +1148,6 @@ func (d *Dispatcher) acquireConversationSession(ctx context.Context, state Conve
 		idleGeneration: 1,
 	}
 	d.sessionsMu.Unlock()
-	d.persistConversationSessionID(ctx, state, session)
 
 	return session, d.releaseConversationSessionFunc(conversationKey, session), nil
 }
@@ -1502,7 +1501,7 @@ func (d *Dispatcher) finishCommand(req CommandRequest) {
 }
 
 func (d *Dispatcher) executeBlockingCommand(ctx context.Context, req CommandRequest) (string, error) {
-	state, stateExists, interrupted, err := d.interruptCommandConversation(ctx, req)
+	interrupted, err := d.interruptCommandConversation(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -1510,17 +1509,19 @@ func (d *Dispatcher) executeBlockingCommand(ctx context.Context, req CommandRequ
 	unlock := d.locks.Lock(req.ConversationKey)
 	defer unlock()
 
-	return d.buildBlockingCommandReplyLocked(ctx, req, state, stateExists, interrupted)
+	state, _, err := d.loadCommandConversationState(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	interrupted = interrupted || state.RunnerThreadDirty
+
+	return d.buildBlockingCommandReplyLocked(ctx, req, interrupted)
 }
 
 func (d *Dispatcher) buildCommandReply(ctx context.Context, req CommandRequest) (string, error) {
 	switch {
-	case req.Command.IsStop():
-		return d.buildStopCommandReply(ctx, req)
-	case req.Command.IsReset():
-		return d.buildResetCommandReply(ctx, req)
 	case req.Command.IsHelp():
-		return d.buildHelpReply(req), nil
+		return d.buildHelpReply(), nil
 	case req.Command.IsStatus():
 		return d.buildStatusReply(ctx, req)
 	default:
@@ -1528,75 +1529,36 @@ func (d *Dispatcher) buildCommandReply(ctx context.Context, req CommandRequest) 
 	}
 }
 
-func (d *Dispatcher) buildBlockingCommandReplyLocked(ctx context.Context, req CommandRequest, state ConversationState, stateExists bool, interrupted bool) (string, error) {
+func (d *Dispatcher) buildBlockingCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
 	switch {
 	case req.Command.IsStop():
-		return d.buildStopCommandReplyLocked(ctx, req, state, stateExists, interrupted)
+		return d.buildStopCommandReplyLocked(ctx, req, interrupted)
 	case req.Command.IsReset():
 		return d.buildResetCommandReplyLocked(ctx, req, interrupted)
-	case req.Command.IsHelp():
-		return d.buildHelpReply(req), nil
-	case req.Command.IsStatus():
-		return d.buildStatusReply(ctx, req)
 	default:
 		return "", errors.New("unsupported slash command")
 	}
 }
 
-func (d *Dispatcher) interruptCommandConversation(ctx context.Context, req CommandRequest) (ConversationState, bool, bool, error) {
-	state, stateExists, err := d.loadCommandConversationState(ctx, req)
-	if err != nil {
-		return ConversationState{}, false, false, err
-	}
-
-	interrupted := d.hasActiveConversationTurn(req.ConversationKey) || state.RunnerThreadDirty
-	session, releaseSession, err := d.resolveCommandSession(ctx, req.ConversationKey, state, stateExists)
-	if err != nil && !errors.Is(err, errRunnerNotConfigured) {
-		return state, stateExists, interrupted, err
-	}
+func (d *Dispatcher) interruptCommandConversation(ctx context.Context, req CommandRequest) (bool, error) {
+	interrupted := d.hasActiveConversationTurn(req.ConversationKey)
+	session, releaseSession := d.peekCommandSession(req.ConversationKey)
 
 	interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer interruptCancel()
 	if session != nil {
 		defer releaseSession()
+		interrupted = true
 		d.markConversationTurnInterrupted(req.ConversationKey)
 		if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
 			log.Printf("dispatcher session interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
 		}
 	}
 
-	return state, stateExists, interrupted, nil
+	return interrupted, nil
 }
 
-func (d *Dispatcher) buildStopCommandReply(ctx context.Context, req CommandRequest) (string, error) {
-	state, stateExists, err := d.loadCommandConversationState(ctx, req)
-	if err != nil {
-		return "", err
-	}
-
-	interrupted := d.hasActiveConversationTurn(req.ConversationKey) || state.RunnerThreadDirty
-
-	session, releaseSession, err := d.resolveCommandSession(ctx, req.ConversationKey, state, stateExists)
-	if err != nil && !errors.Is(err, errRunnerNotConfigured) {
-		return "", err
-	}
-
-	interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer interruptCancel()
-	if session != nil {
-		defer releaseSession()
-		d.markConversationTurnInterrupted(req.ConversationKey)
-		if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
-			log.Printf("dispatcher session interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
-		}
-	}
-
-	unlock := d.locks.Lock(req.ConversationKey)
-	defer unlock()
-	return d.buildStopCommandReplyLocked(ctx, req, state, stateExists, interrupted)
-}
-
-func (d *Dispatcher) buildStopCommandReplyLocked(ctx context.Context, req CommandRequest, state ConversationState, stateExists bool, interrupted bool) (string, error) {
+func (d *Dispatcher) buildStopCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
 	clearedMessages, cleanupErr := d.dropConversationQueuedWork(ctx, req.ConversationKey)
 	if cleanupErr != nil {
 		return "", cleanupErr
@@ -1606,61 +1568,7 @@ func (d *Dispatcher) buildStopCommandReplyLocked(ctx context.Context, req Comman
 		d.recordCommandMessage(req.ConversationKey, message)
 	}
 
-	if err := d.ensureCommandSessionLoadedLocked(ctx, req.ConversationKey, state, stateExists); err != nil {
-		return "", err
-	}
-
 	return buildStopReply(interrupted, d.takeCommandBriefs(req.ConversationKey)), nil
-}
-
-func (d *Dispatcher) ensureCommandSessionLoadedLocked(ctx context.Context, conversationKey string, state ConversationState, stateExists bool) error {
-	if d == nil {
-		return nil
-	}
-	if d.activeConversationSession(conversationKey) != nil || d.managedConversationSession(conversationKey) != nil {
-		return nil
-	}
-	if !stateExists || strings.TrimSpace(state.RunnerThreadID) == "" {
-		return nil
-	}
-
-	session, releaseSession, err := d.acquireConversationSession(ctx, state)
-	if err != nil {
-		return fmt.Errorf("load conversation session failed: %w", err)
-	}
-	if session == nil {
-		return nil
-	}
-	releaseSession()
-	return nil
-}
-
-func (d *Dispatcher) buildResetCommandReply(ctx context.Context, req CommandRequest) (string, error) {
-	state, stateExists, err := d.loadCommandConversationState(ctx, req)
-	if err != nil {
-		return "", err
-	}
-
-	interrupted := d.hasActiveConversationTurn(req.ConversationKey) || state.RunnerThreadDirty
-
-	session, releaseSession, err := d.resolveCommandSession(ctx, req.ConversationKey, state, stateExists)
-	if err != nil && !errors.Is(err, errRunnerNotConfigured) {
-		return "", err
-	}
-
-	interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer interruptCancel()
-	if session != nil {
-		defer releaseSession()
-		d.markConversationTurnInterrupted(req.ConversationKey)
-		if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
-			log.Printf("dispatcher session interrupt failed during reset: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
-		}
-	}
-
-	unlock := d.locks.Lock(req.ConversationKey)
-	defer unlock()
-	return d.buildResetCommandReplyLocked(ctx, req, interrupted)
 }
 
 func (d *Dispatcher) buildResetCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
@@ -1686,13 +1594,15 @@ func (d *Dispatcher) buildResetCommandReplyLocked(ctx context.Context, req Comma
 }
 
 func (d *Dispatcher) buildStatusReply(ctx context.Context, req CommandRequest) (string, error) {
-	_, _, err := d.loadCommandConversationState(ctx, req)
-	if err != nil {
-		return "", err
-	}
-
 	status := SessionStatus{}
+	var err error
 	session, releaseSession := d.peekCommandSession(req.ConversationKey)
+	if session == nil {
+		session, releaseSession, err = d.tryLoadStatusSession(ctx, req)
+		if err != nil {
+			return "", err
+		}
+	}
 	if session != nil {
 		defer releaseSession()
 		status, err = session.Status(ctx)
@@ -1701,6 +1611,41 @@ func (d *Dispatcher) buildStatusReply(ctx context.Context, req CommandRequest) (
 		}
 	}
 	return renderStatusReply(status), nil
+}
+
+func (d *Dispatcher) tryLoadStatusSession(ctx context.Context, req CommandRequest) (Session, func(), error) {
+	if d == nil {
+		return nil, func() {}, nil
+	}
+
+	conversationKey := req.ConversationKey
+	unlock := d.locks.TryLock(conversationKey)
+	if unlock == nil {
+		return nil, func() {}, nil
+	}
+	defer unlock()
+
+	if active := d.activeConversationSession(conversationKey); active != nil {
+		return active, func() {}, nil
+	}
+	if managed := d.managedConversationSession(conversationKey); managed != nil {
+		d.beginConversationSessionUse(conversationKey, managed)
+		return managed, d.releaseConversationSessionFunc(conversationKey, managed), nil
+	}
+
+	state, stateExists, err := d.loadCommandConversationState(ctx, req)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if !stateExists || strings.TrimSpace(state.RunnerThreadID) == "" {
+		return nil, func() {}, nil
+	}
+
+	session, releaseSession, err := d.acquireConversationSession(ctx, state)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return session, releaseSession, nil
 }
 
 func (d *Dispatcher) loadCommandConversationState(ctx context.Context, req CommandRequest) (ConversationState, bool, error) {
@@ -1729,23 +1674,6 @@ func (d *Dispatcher) peekCommandSession(conversationKey string) (Session, func()
 	}
 
 	return nil, func() {}
-}
-
-func (d *Dispatcher) resolveCommandSession(ctx context.Context, conversationKey string, state ConversationState, stateExists bool) (Session, func(), error) {
-	if active := d.activeConversationSession(conversationKey); active != nil {
-		return active, func() {}, nil
-	}
-
-	if managed := d.managedConversationSession(conversationKey); managed != nil {
-		d.beginConversationSessionUse(conversationKey, managed)
-		return managed, d.releaseConversationSessionFunc(conversationKey, managed), nil
-	}
-
-	if !stateExists || strings.TrimSpace(state.RunnerThreadID) == "" {
-		return nil, func() {}, nil
-	}
-
-	return d.acquireConversationSession(ctx, state)
 }
 
 func (d *Dispatcher) recoverDirtyConversation(ctx context.Context, state *ConversationState) error {
@@ -1953,7 +1881,7 @@ func (d *Dispatcher) resolveCommandSpec(command SlashCommand) (CommandSpec, bool
 	return DispatcherCommandSpec(command.Name)
 }
 
-func (d *Dispatcher) buildHelpReply(req CommandRequest) string {
+func (d *Dispatcher) buildHelpReply() string {
 	specs := SupportedDispatcherSlashCommands()
 
 	lines := make([]string, 0, len(specs)+2)
@@ -1969,48 +1897,13 @@ func renderStatusReply(status SessionStatus) string {
 	if !sessionStatusAvailable(status) {
 		title = "_Current runner status:_ _session not active_"
 	}
-	lines := []string{
-		title,
-		"- _Agent_: `" + formatStatusValue(status.Agent) + "`",
-		"- _Working directories_: `" + formatStatusDirectories(status.WorkingDirectories) + "`",
-		"- _Current mode_: `" + formatStatusValue(status.Modes.CurrentModeID) + "`",
-	}
+	lines := make([]string, 0, 4+len(status.ConfigOptions)*2)
+	lines = append(lines, title)
+	lines = append(lines, "- _Agent_: `"+formatStatusValue(status.Agent)+"`")
+	lines = append(lines, "- _Working directories_: `"+formatStatusDirectories(status.WorkingDirectories)+"`")
+	lines = append(lines, "- _Current mode_: `"+formatStatusValue(status.Modes.CurrentModeID)+"`")
 	lines = append(lines, formatStatusConfigOptions(status.ConfigOptions)...)
 	return strings.Join(lines, "\n")
-}
-
-func formatStatusModes(modes []SessionMode) string {
-	if len(modes) == 0 {
-		return "n/a"
-	}
-
-	values := make([]string, 0, len(modes))
-	seen := make(map[string]struct{}, len(modes))
-	for _, mode := range modes {
-		modeID := strings.TrimSpace(mode.ID)
-		modeLabel := strings.TrimSpace(mode.Label)
-		if modeID == "" && modeLabel == "" {
-			continue
-		}
-
-		value := modeID
-		if modeLabel != "" {
-			if modeID == "" {
-				value = modeLabel
-			} else {
-				value = modeID + " (" + modeLabel + ")"
-			}
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		values = append(values, value)
-	}
-	if len(values) == 0 {
-		return "n/a"
-	}
-	return strings.Join(values, ", ")
 }
 
 func sessionStatusAvailable(status SessionStatus) bool {

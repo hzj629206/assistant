@@ -127,12 +127,6 @@ func (s *claudeRunnerSession) Status(context.Context) (SessionStatus, error) {
 	}, nil
 }
 
-func (*claudeRunnerSession) Commands() []CommandSpec { return nil }
-
-func (*claudeRunnerSession) HandleCommand(context.Context, SlashCommand) (string, error) {
-	return "", errors.New("unsupported slash command")
-}
-
 func (s *claudeRunnerSession) runClaudeTurn(ctx context.Context, req TurnRequest, prompt string, imagePaths []string) (*claudecode.ClaudeResult, error) {
 	if s == nil || s.runner == nil {
 		return nil, errors.New("claude code session is nil")

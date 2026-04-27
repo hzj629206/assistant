@@ -147,10 +147,7 @@ func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes
 	}()
 
 	deadline := time.Now().Add(time.Second)
-	for {
-		if strings.Contains(output.String(), "\"method\":\"session/prompt\"") {
-			break
-		}
+	for !strings.Contains(output.String(), "\"method\":\"session/prompt\"") {
 		if time.Now().After(deadline) {
 			t.Fatalf("expected session/prompt write, got %q", output.String())
 		}
@@ -162,10 +159,7 @@ func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes
 		interruptDone <- session.Interrupt(context.Background())
 	}()
 
-	for {
-		if strings.Contains(output.String(), "\"method\":\"session/cancel\"") {
-			break
-		}
+	for !strings.Contains(output.String(), "\"method\":\"session/cancel\"") {
 		if time.Now().After(deadline) {
 			t.Fatalf("expected session/cancel write, got %q", output.String())
 		}
@@ -379,8 +373,8 @@ func TestProcessSessionInterruptCancelsPendingPermissionRequests(t *testing.T) {
 	if !strings.Contains(written, `"method":"session/cancel"`) {
 		t.Fatalf("expected session/cancel write, got %q", written)
 	}
-	if !strings.Contains(written, `"id":7`) || !strings.Contains(written, `"outcome":"cancelled"`) {
-		t.Fatalf("expected cancelled permission response, got %q", written)
+	if !strings.Contains(written, `"id":7`) || !strings.Contains(written, `"outcome":"canceled"`) {
+		t.Fatalf("expected canceled permission response, got %q", written)
 	}
 }
 

@@ -222,12 +222,6 @@ func (s *appServerSession) Status(context.Context) (SessionStatus, error) {
 	}, nil
 }
 
-func (*appServerSession) Commands() []CommandSpec { return nil }
-
-func (*appServerSession) HandleCommand(context.Context, SlashCommand) (string, error) {
-	return "", errors.New("unsupported slash command")
-}
-
 func (s *appServerSession) unsubscribeThread(threadID string) error {
 	if s == nil || s.runner == nil || threadID == "" {
 		return nil
@@ -344,16 +338,16 @@ func (s *appServerSession) completeInterruptLocked(active *appServerActiveTurn, 
 	close(active.interruptDone)
 }
 
-func (s *appServerSession) activeTurnSnapshot() (*appServerActiveTurn, string, bool) {
+func (s *appServerSession) activeTurnSnapshot() (*appServerActiveTurn, bool) {
 	if s == nil {
-		return nil, "", false
+		return nil, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.activeTurn == nil {
-		return nil, "", false
+		return nil, false
 	}
-	return s.activeTurn, s.threadID, true
+	return s.activeTurn, true
 }
 
 func (s *appServerSession) interruptActiveTurnIfRequested(ctx context.Context, threadID string, turnID string) {
