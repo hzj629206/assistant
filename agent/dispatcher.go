@@ -1594,7 +1594,6 @@ func (d *Dispatcher) buildResetCommandReplyLocked(ctx context.Context, req Comma
 }
 
 func (d *Dispatcher) buildStatusReply(ctx context.Context, req CommandRequest) (string, error) {
-	status := SessionStatus{}
 	var err error
 	session, releaseSession := d.peekCommandSession(req.ConversationKey)
 	if session == nil {
@@ -1605,12 +1604,14 @@ func (d *Dispatcher) buildStatusReply(ctx context.Context, req CommandRequest) (
 	}
 	if session != nil {
 		defer releaseSession()
+		var status SessionStatus
 		status, err = session.Status(ctx)
 		if err != nil {
 			return "", err
 		}
+		return renderStatusReply(status), nil
 	}
-	return renderStatusReply(status), nil
+	return "_Current conversation status:_ _inactive_", nil
 }
 
 func (d *Dispatcher) tryLoadStatusSession(ctx context.Context, req CommandRequest) (Session, func(), error) {
@@ -1844,9 +1845,9 @@ func (d *Dispatcher) dropConversationQueuedWork(ctx context.Context, conversatio
 func buildStopReply(interrupted bool, briefs []string) string {
 	lines := make([]string, 0, len(briefs)+4)
 	if interrupted {
-		lines = append(lines, "_Current turn interrupted._")
+		lines = append(lines, "_Conversation interrupted._")
 	} else {
-		lines = append(lines, "_No active turn was running._")
+		lines = append(lines, "_Conversation is not running._")
 	}
 	lines = append(lines, "_Quote the messages above if you want to continue from them._")
 	if len(briefs) == 0 {
@@ -1854,7 +1855,7 @@ func buildStopReply(interrupted bool, briefs []string) string {
 	}
 	lines = append(lines, "_Discarded unprocessed messages:_")
 	for _, brief := range briefs {
-		lines = append(lines, "- "+brief)
+		lines = append(lines, "- _"+brief+"_")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1862,17 +1863,17 @@ func buildStopReply(interrupted bool, briefs []string) string {
 func buildResetReply(interrupted bool, briefs []string) string {
 	lines := make([]string, 0, len(briefs)+4)
 	if interrupted {
-		lines = append(lines, "_Current turn interrupted and conversation reset._")
+		lines = append(lines, "_Conversation interrupted and reset._")
 	} else {
-		lines = append(lines, "_Conversation reset. No active turn was running._")
+		lines = append(lines, "_Conversation reset._")
 	}
-	lines = append(lines, "_The next message will start a new runner thread and reload initial history._")
+	lines = append(lines, "_A follow-up message will start a new agent thread and reload initial history._")
 	if len(briefs) == 0 {
 		return strings.Join(lines, "\n")
 	}
 	lines = append(lines, "_Discarded unprocessed messages:_")
 	for _, brief := range briefs {
-		lines = append(lines, "- "+brief)
+		lines = append(lines, "- _"+brief+"_")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1893,12 +1894,8 @@ func (d *Dispatcher) buildHelpReply() string {
 }
 
 func renderStatusReply(status SessionStatus) string {
-	title := "_Current runner status:_"
-	if !sessionStatusAvailable(status) {
-		title = "_Current runner status:_ _session not active_"
-	}
 	lines := make([]string, 0, 4+len(status.ConfigOptions)*2)
-	lines = append(lines, title)
+	lines = append(lines, "_Current conversation status:_")
 	lines = append(lines, "- _Agent_: `"+formatStatusValue(status.Agent)+"`")
 	lines = append(lines, "- _Working directories_: `"+formatStatusDirectories(status.WorkingDirectories)+"`")
 	lines = append(lines, "- _Current mode_: `"+formatStatusValue(status.Modes.CurrentModeID)+"`")
@@ -1906,17 +1903,9 @@ func renderStatusReply(status SessionStatus) string {
 	return strings.Join(lines, "\n")
 }
 
-func sessionStatusAvailable(status SessionStatus) bool {
-	return strings.TrimSpace(status.Agent) != "" ||
-		len(status.WorkingDirectories) != 0 ||
-		strings.TrimSpace(status.Modes.CurrentModeID) != "" ||
-		len(status.Modes.AvailableModes) != 0 ||
-		len(status.ConfigOptions) != 0
-}
-
 func formatStatusConfigOptions(options []SessionConfigOption) []string {
 	if len(options) == 0 {
-		return []string{"- _Config options_: _n/a_"}
+		return nil
 	}
 
 	lines := make([]string, 0, 1+len(options)*3)

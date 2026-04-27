@@ -917,7 +917,7 @@ func TestDispatcherResetCommandInterruptsAndResetsConversationState(t *testing.T
 	if err != nil {
 		t.Fatalf("build reset reply failed: %v", err)
 	}
-	if !strings.Contains(reply, "_Current turn interrupted and conversation reset._") {
+	if !strings.Contains(reply, "_Conversation interrupted and reset._") {
 		t.Fatalf("unexpected reset reply: %q", reply)
 	}
 	if runner.InterruptCalls() != 1 {
@@ -1762,7 +1762,7 @@ func TestDispatcherHandleStopCancelsTurnAndRepliesWithDiscardedMessages(t *testi
 	}
 
 	reply := commandResponder.Reply().text
-	if !strings.Contains(reply, "_Current turn interrupted._") {
+	if !strings.Contains(reply, "_Conversation interrupted._") {
 		t.Fatalf("unexpected command reply: %q", reply)
 	}
 	if !strings.Contains(reply, "_Quote the messages above if you want to continue from them._") {
@@ -2260,7 +2260,7 @@ func TestDispatcherStatusDoesNotDropInboundMessages(t *testing.T) {
 	}
 
 	reply := commandResponder.Reply().text
-	if !strings.Contains(reply, "_Current runner status:_") ||
+	if !strings.Contains(reply, "_Current conversation status:_") ||
 		!strings.Contains(reply, "- _Agent_: `codex`") ||
 		!strings.Contains(reply, "- _Working directories_: `/workspace, /workspace/extra`") ||
 		!strings.Contains(reply, "- _Config options:_\n  - _Name_: `model`\n    - _Current value_: `gpt-5.4`") ||
@@ -2307,8 +2307,7 @@ func TestDispatcherStatusWithoutConversationThreadDoesNotStartSession(t *testing
 		t.Fatalf("unexpected start session call count: %d", got)
 	}
 	reply := commandResponder.Reply().text
-	if !strings.Contains(reply, "_Current runner status:_ _session not active_") ||
-		!strings.Contains(reply, "- _Agent_: `n/a`") {
+	if !strings.Contains(reply, "_Current conversation status:_ _inactive_") {
 		t.Fatalf("unexpected status reply: %q", reply)
 	}
 }
@@ -2426,7 +2425,7 @@ func TestDispatcherStatusDoesNotLoadPersistedSessionWhenConversationLockIsBusy(t
 		t.Fatal("expected no managed session when status lock acquisition fails")
 	}
 	reply := commandResponder.Reply().text
-	if !strings.Contains(reply, "_Current runner status:_ _session not active_") {
+	if !strings.Contains(reply, "_Current conversation status:_ _inactive_") {
 		t.Fatalf("unexpected status reply: %q", reply)
 	}
 }

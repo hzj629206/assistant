@@ -34,6 +34,7 @@ type appServerActiveTurn struct {
 	done               chan struct{}
 	interruptRequested chan struct{}
 	interruptDone      chan struct{}
+	interruptOnce      sync.Once
 	interruptErr       error
 	interruptSent      bool
 	interruptFinished  bool
@@ -120,7 +121,7 @@ func (s *appServerSession) Interrupt(ctx context.Context) error {
 	}
 	log.Printf("app-server session interrupt requested: conversation=%s", s.conversationKey)
 	active.interrupted.Store(true)
-	requestInterrupt()
+	active.interruptOnce.Do(requestInterrupt)
 	if interruptDone != nil {
 		select {
 		case <-interruptDone:
