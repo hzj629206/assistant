@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -375,56 +374,6 @@ func TestPersistentProcessSessionInterruptIsIdempotentForConcurrentCallers(t *te
 		}
 	case <-time.After(time.Second):
 		t.Fatal("second InterruptCurrentTurn did not return")
-	}
-}
-
-func TestPersistentProcessSessionRunTurnRejectsConcurrentTurn(t *testing.T) {
-	t.Parallel()
-
-	reader, writer := io.Pipe()
-	t.Cleanup(func() {
-		_ = reader.Close()
-		_ = writer.Close()
-	})
-
-	session := &persistentProcessSession{
-		cmd:       fakeExecCmd(1234),
-		stdinPipe: writer,
-	}
-
-	firstStarted := make(chan struct{})
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := session.runTurnWithInput(context.Background(), []byte("{\"type\":\"user\"}\n"))
-		firstDone <- err
-	}()
-
-	go func() {
-		line, _ := bufio.NewReader(reader).ReadString('\n')
-		if line != "" {
-			close(firstStarted)
-		}
-	}()
-
-	<-firstStarted
-
-	_, err := session.runTurnWithInput(context.Background(), []byte("{\"type\":\"user\"}\n"))
-	if !errors.Is(err, ErrSessionBusy) {
-		t.Fatalf("expected ErrSessionBusy, got %v", err)
-	}
-
-	session.handleResultMessage(map[string]any{}, &Message{
-		Type:   "result",
-		Result: "done",
-	})
-
-	select {
-	case err = <-firstDone:
-		if err != nil {
-			t.Fatalf("first RunTurn failed: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("first RunTurn did not finish")
 	}
 }
 

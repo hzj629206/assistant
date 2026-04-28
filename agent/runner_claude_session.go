@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hzj629206/assistant/agent/claudecode"
 )
@@ -16,70 +17,122 @@ type claudeRunnerSession struct {
 	conversationKey string
 	sessionID       string
 
-	mu      sync.Mutex
-	session claudecode.Session
-	control *claudeControlServer
-	active  *interruptibleRunnerTurn
-	closed  bool
+	mu          sync.Mutex
+	session     claudecode.Session
+	control     *claudeControlServer
+	currentTurn *claudeScheduledTurn
+	closed      bool
 }
 
-func (s *claudeRunnerSession) ID() string { return strings.TrimSpace(s.sessionID) }
+type claudeScheduledTurn struct {
+	session     *claudeRunnerSession
+	req         TurnRequest
+	turn        claudecode.ScheduledTurn
+	promptLen   int
+	imageCount  int
+	interrupted atomic.Bool
+	runCalled   atomic.Bool
+}
 
-func (s *claudeRunnerSession) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+func (s *claudeRunnerSession) ID() string {
+	if s == nil {
+		return ""
+	}
+	return s.currentSessionID()
+}
+
+func (s *claudeRunnerSession) interruptCurrentTurn(ctx context.Context) error {
 	if s == nil || s.runner == nil {
+		return nil
+	}
+	s.mu.Lock()
+	currentTurn := s.currentTurn
+	s.mu.Unlock()
+	if currentTurn != nil {
+		return currentTurn.Interrupt(ctx)
+	}
+	session, _, err := s.currentSessionForInterrupt()
+	if err != nil || session == nil {
+		return err
+	}
+	return mapClaudeSessionError(session.Interrupt(ctx))
+}
+
+func (s *claudeRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error) {
+	if s == nil || s.runner == nil {
+		return nil, errors.New("run claude code turn failed: session is nil")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil, errors.New("run claude code turn failed: session is closed")
+	}
+
+	req, err := normalizeSessionTurnRequest(req, s.conversationKey, s.currentSessionID())
+	if err != nil {
+		return nil, fmt.Errorf("run claude code turn failed: %w", err)
+	}
+	turn, promptLen, imageCount, err := s.scheduleClaudeTurn(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("run claude code turn failed: %w", err)
+	}
+	scheduledTurn := &claudeScheduledTurn{session: s, req: req, turn: turn, promptLen: promptLen, imageCount: imageCount}
+	s.mu.Lock()
+	s.currentTurn = scheduledTurn
+	s.mu.Unlock()
+	return scheduledTurn, nil
+}
+
+func (t *claudeScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
+	s := t.session
+	req := t.req
+	if s == nil || s.runner == nil || t.turn == nil {
 		return TurnResult{}, errors.New("run claude code turn failed: session is nil")
 	}
-
-	req, err := normalizeSessionTurnRequest(req, s.conversationKey, s.sessionID)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run claude code turn failed: %w", err)
+	if !t.runCalled.CompareAndSwap(false, true) {
+		return TurnResult{}, errors.New("run claude code turn failed: turn run already started")
 	}
-
-	prompt, imagePaths := s.runner.buildTurnPrompt(req)
+	defer t.session.clearCurrentTurn(t)
 	_, tools := s.runner.globalContext()
-	log.Printf("claude code session executing turn: conversation=%s session_id=%s tool_count=%d", s.conversationKey, s.sessionID, len(tools))
-	active, err := s.beginActiveTurn()
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run claude code turn failed: %w", err)
-	}
-	defer s.endActiveTurn(active)
+	log.Printf("claude code session executing turn: conversation=%s session_id=%s tool_count=%d", s.conversationKey, s.currentSessionID(), len(tools))
 	stopTyping := startTyping(ctx, req.Message.Responder)
 	defer stopTyping()
 
-	result, err := s.runClaudeTurn(ctx, req, prompt, imagePaths)
+	if t.interrupted.Load() {
+		return TurnResult{}, fmt.Errorf("run claude code turn failed: %w", context.Canceled)
+	}
+	result, err := s.runClaudeTurn(ctx, req, t.turn, t.promptLen, t.imageCount)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("run claude code turn failed: %w", err)
 	}
-	if active.interrupted.Load() {
+	if t.interrupted.Load() {
 		return TurnResult{}, fmt.Errorf("run claude code turn failed: %w", context.Canceled)
 	}
-	s.sessionID = claudecode.ResolveSessionID(s.sessionID, result)
+	s.setSessionID(claudecode.ResolveSessionID(s.currentSessionID(), result))
 	return TurnResult{
-		RunnerThreadID: s.sessionID,
+		RunnerThreadID: s.currentSessionID(),
 		ReplyText:      result.Result,
 	}, nil
 }
 
-func (s *claudeRunnerSession) Interrupt(ctx context.Context) error {
-	if s == nil || s.runner == nil {
+func (t *claudeScheduledTurn) Interrupt(ctx context.Context) error {
+	if t == nil || t.turn == nil {
 		return nil
 	}
-
-	session, sessionID, err := s.currentSessionForInterrupt()
-	if err != nil {
-		return err
-	}
-	if session == nil {
-		return nil
-	}
-	s.markActiveTurnInterrupted()
-	log.Printf("claude code session interrupt requested: conversation=%s session_id=%s", s.conversationKey, sessionID)
-	err = session.Interrupt(ctx)
+	t.interrupted.Store(true)
+	err := t.turn.Interrupt(ctx)
 	if err != nil {
 		return mapClaudeSessionError(err)
 	}
-	log.Printf("claude code session interrupt completed: conversation=%s session_id=%s", s.conversationKey, sessionID)
 	return nil
+}
+
+func (t *claudeScheduledTurn) Done() <-chan struct{} {
+	if t == nil || t.turn == nil {
+		return nil
+	}
+	return t.turn.Done()
 }
 
 func (s *claudeRunnerSession) Close() error {
@@ -127,14 +180,9 @@ func (s *claudeRunnerSession) Status(context.Context) (SessionStatus, error) {
 	}, nil
 }
 
-func (s *claudeRunnerSession) runClaudeTurn(ctx context.Context, req TurnRequest, prompt string, imagePaths []string) (*claudecode.ClaudeResult, error) {
+func (s *claudeRunnerSession) runClaudeTurn(ctx context.Context, req TurnRequest, turn claudecode.ScheduledTurn, promptLen int, imageCount int) (*claudecode.ClaudeResult, error) {
 	if s == nil || s.runner == nil {
 		return nil, errors.New("claude code session is nil")
-	}
-
-	blocks, err := claudecode.BuildUserContentBlocks(prompt, imagePaths)
-	if err != nil {
-		return nil, err
 	}
 
 	session, err := s.currentSession()
@@ -151,16 +199,14 @@ func (s *claudeRunnerSession) runClaudeTurn(ctx context.Context, req TurnRequest
 		"claude code runner using session process: conversation=%s session_id=%s prompt_len=%d image_count=%d",
 		req.Conversation.Key,
 		session.SessionID(),
-		len(prompt),
-		len(imagePaths),
+		promptLen,
+		imageCount,
 	)
-	result, err := session.RunTurn(turnCtx, blocks)
+	result, err := turn.Run(turnCtx)
 	if err != nil {
 		return nil, mapClaudeSessionError(err)
 	}
-	s.mu.Lock()
-	s.sessionID = claudecode.ResolveSessionID(s.sessionID, result)
-	s.mu.Unlock()
+	s.setSessionID(claudecode.ResolveSessionID(s.currentSessionID(), result))
 	log.Printf(
 		"claude code runner completed turn: conversation=%s session_id=%s result_len=%d",
 		req.Conversation.Key,
@@ -202,44 +248,6 @@ func (s *claudeRunnerSession) currentSessionForInterrupt() (claudecode.Session, 
 	return s.session, s.currentSessionIDLocked(), nil
 }
 
-func (s *claudeRunnerSession) beginActiveTurn() (*interruptibleRunnerTurn, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, errors.New("claude code session is closed")
-	}
-	if s.active != nil {
-		return nil, ErrSessionBusy
-	}
-	active := &interruptibleRunnerTurn{done: make(chan struct{})}
-	s.active = active
-	return active, nil
-}
-
-func (s *claudeRunnerSession) endActiveTurn(active *interruptibleRunnerTurn) {
-	if s == nil || active == nil {
-		return
-	}
-	s.mu.Lock()
-	if s.active == active {
-		s.active = nil
-	}
-	s.mu.Unlock()
-	close(active.done)
-}
-
-func (s *claudeRunnerSession) markActiveTurnInterrupted() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	active := s.active
-	s.mu.Unlock()
-	if active != nil {
-		active.interrupted.Store(true)
-	}
-}
-
 func (s *claudeRunnerSession) closeState() claudecode.Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -252,6 +260,37 @@ func (s *claudeRunnerSession) closeState() claudecode.Session {
 	return session
 }
 
+func (s *claudeRunnerSession) scheduleClaudeTurn(ctx context.Context, req TurnRequest) (claudecode.ScheduledTurn, int, int, error) {
+	if s == nil || s.runner == nil {
+		return nil, 0, 0, errors.New("claude code session is nil")
+	}
+	prompt, imagePaths := s.runner.buildTurnPrompt(req)
+	blocks, err := claudecode.BuildUserContentBlocks(prompt, imagePaths)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	session, err := s.currentSession()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	turn, err := session.ScheduleTurn(ctx, blocks)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return turn, len(prompt), len(imagePaths), nil
+}
+
+func (s *claudeRunnerSession) clearCurrentTurn(turn *claudeScheduledTurn) {
+	if s == nil || turn == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.currentTurn == turn {
+		s.currentTurn = nil
+	}
+	s.mu.Unlock()
+}
+
 func (s *claudeRunnerSession) currentSessionIDLocked() string {
 	if s.session != nil {
 		if current := strings.TrimSpace(s.session.SessionID()); current != "" {
@@ -261,12 +300,29 @@ func (s *claudeRunnerSession) currentSessionIDLocked() string {
 	return strings.TrimSpace(s.sessionID)
 }
 
+func (s *claudeRunnerSession) currentSessionID() string {
+	if s == nil {
+		return ""
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentSessionIDLocked()
+}
+
+func (s *claudeRunnerSession) setSessionID(sessionID string) {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	s.sessionID = strings.TrimSpace(sessionID)
+	s.mu.Unlock()
+}
+
 func mapClaudeSessionError(err error) error {
 	if err == nil {
 		return nil
-	}
-	if errors.Is(err, claudecode.ErrSessionBusy) {
-		return ErrSessionBusy
 	}
 	return err
 }

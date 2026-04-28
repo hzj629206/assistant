@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,54 @@ type fakeACPSession struct {
 	closed       bool
 	runTurn      func(context.Context, []acp.ContentBlock) (acp.TurnResult, error)
 	interrupt    func(context.Context) error
+	mu           sync.Mutex
+	currentTurn  *fakeACPScheduledTurn
+}
+
+type fakeACPScheduledTurn struct {
+	session *fakeACPSession
+	blocks  []acp.ContentBlock
+	done    chan struct{}
+}
+
+func (t *fakeACPScheduledTurn) Run(ctx context.Context) (acp.TurnResult, error) {
+	defer func() {
+		t.session.clearCurrentTurn(t)
+		close(t.done)
+	}()
+	return t.session.RunTurn(ctx, t.blocks)
+}
+
+func (t *fakeACPScheduledTurn) Interrupt(ctx context.Context) error {
+	return t.session.Interrupt(ctx)
+}
+
+func (t *fakeACPScheduledTurn) Done() <-chan struct{} { return t.done }
+
+//nolint:contextcheck // Test fake uses the caller context only to wait for preemption of the previous turn.
+func (s *fakeACPSession) ScheduleTurn(ctx context.Context, blocks []acp.ContentBlock) (acp.ScheduledTurn, error) {
+	s.mu.Lock()
+	currentTurn := s.currentTurn
+	s.mu.Unlock()
+	if currentTurn != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := currentTurn.Interrupt(ctx); err != nil {
+			return nil, err
+		}
+	}
+	copied := make([]acp.ContentBlock, len(blocks))
+	copy(copied, blocks)
+	turn := &fakeACPScheduledTurn{
+		session: s,
+		blocks:  copied,
+		done:    make(chan struct{}),
+	}
+	s.mu.Lock()
+	s.currentTurn = turn
+	s.mu.Unlock()
+	return turn, nil
 }
 
 func (s *fakeACPSession) RunTurn(ctx context.Context, blocks []acp.ContentBlock) (acp.TurnResult, error) {
@@ -67,6 +116,14 @@ func (s *fakeACPSession) Interrupt(ctx context.Context) error {
 func (s *fakeACPSession) Close() error {
 	s.closed = true
 	return nil
+}
+
+func (s *fakeACPSession) clearCurrentTurn(turn *fakeACPScheduledTurn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentTurn == turn {
+		s.currentTurn = nil
+	}
 }
 
 func TestACPRunnerRunTurnRegistersHTTPToolServerForGlobalTools(t *testing.T) {
@@ -240,7 +297,7 @@ func TestACPRunnerSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T)
 		RunnerThreadID: "session-live",
 	})
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{
+	_, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-2",
 			RunnerThreadID: "session-live",
@@ -251,7 +308,7 @@ func TestACPRunnerSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T)
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-1",
 			RunnerThreadID: "session-other",
@@ -474,14 +531,15 @@ func TestACPRunnerSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conversation-1"},
 			Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
 		})
@@ -492,7 +550,7 @@ func TestACPRunnerSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -550,14 +608,15 @@ func TestACPRunnerSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T)
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conversation-1"},
 			Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
 		})
@@ -568,7 +627,7 @@ func TestACPRunnerSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T)
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -622,7 +681,7 @@ func TestACPRunnerSessionCloseWaitsForActiveTurnCompletion(t *testing.T) {
 	t.Skip("runner close is a thin delegation layer; wait semantics are covered by agent/acp session tests")
 }
 
-func TestACPRunnerSessionRejectsConcurrentRunTurn(t *testing.T) {
+func TestACPRunnerSessionScheduleTurnInterruptsPreviousTurn(t *testing.T) {
 	t.Parallel()
 
 	runner := NewACPRunner(context.Background(), ACPRunnerOptions{
@@ -631,30 +690,39 @@ func TestACPRunnerSessionRejectsConcurrentRunTurn(t *testing.T) {
 	})
 
 	started := make(chan struct{})
-	release := make(chan struct{})
+	interruptRequested := make(chan struct{})
+	runCount := 0
 	runner.sessionFactory = func(_ context.Context, _ acp.SessionOptions) (acp.Session, error) {
 		return &fakeACPSession{
 			sessionID: "session-live",
-			runTurn: func(context.Context, []acp.ContentBlock) (acp.TurnResult, error) {
-				select {
-				case <-started:
-					return acp.TurnResult{}, acp.ErrSessionBusy
-				default:
+			runTurn: func(_ context.Context, _ []acp.ContentBlock) (acp.TurnResult, error) {
+				runCount++
+				if runCount == 1 {
 					close(started)
+					<-interruptRequested
+					return acp.TurnResult{}, context.Canceled
 				}
-				<-release
-				return acp.TurnResult{}, errors.New("interrupted")
+				return acp.TurnResult{SessionID: "session-live", ReplyText: "second reply"}, nil
+			},
+			interrupt: func(context.Context) error {
+				select {
+				case <-interruptRequested:
+				default:
+					close(interruptRequested)
+				}
+				return nil
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-busy"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-busy"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conversation-busy"},
 			Message:      InboundMessage{Text: "hello", Kind: MessageKindText, Sender: "user"},
 		})
@@ -663,19 +731,20 @@ func TestACPRunnerSessionRejectsConcurrentRunTurn(t *testing.T) {
 
 	<-started
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	result, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-busy"},
 		Message:      InboundMessage{Text: "again", Kind: MessageKindText, Sender: "user"},
 	})
-	if !errors.Is(err, ErrSessionBusy) {
-		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
 	}
-
-	close(release)
+	if result.ReplyText != "second reply" {
+		t.Fatalf("unexpected second reply: %q", result.ReplyText)
+	}
 
 	select {
 	case err = <-runErrCh:
-		if err == nil || err.Error() != "run acp turn failed: interrupted" {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("unexpected first run error: %v", err)
 		}
 	case <-time.After(time.Second):
@@ -740,12 +809,13 @@ func TestACPRunnerRunTurnDoesNotRepeatSystemPromptWithinSameSession(t *testing.T
 		return fakeSession, nil
 	}
 
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message: InboundMessage{
 			Text:   "hello",
@@ -757,7 +827,7 @@ func TestACPRunnerRunTurnDoesNotRepeatSystemPromptWithinSameSession(t *testing.T
 		t.Fatalf("first RunTurn failed: %v", err)
 	}
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: "session-new"},
 		Message: InboundMessage{
 			Text:   "continue",

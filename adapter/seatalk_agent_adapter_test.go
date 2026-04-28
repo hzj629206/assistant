@@ -4823,7 +4823,23 @@ type runnerSession struct {
 	closeFn   func() error
 }
 
+type runnerScheduledTurn struct {
+	run       func(context.Context, agent.TurnRequest) (agent.TurnResult, error)
+	interrupt func(context.Context) error
+	req       agent.TurnRequest
+	done      chan struct{}
+}
+
 func (s *runnerSession) ID() string { return "" }
+
+func (s *runnerSession) ScheduleTurn(_ context.Context, req agent.TurnRequest) (agent.ScheduledTurn, error) {
+	return &runnerScheduledTurn{
+		run:       s.run,
+		interrupt: s.interrupt,
+		req:       req,
+		done:      make(chan struct{}),
+	}, nil
+}
 
 func (s *runnerSession) RunTurn(ctx context.Context, req agent.TurnRequest) (agent.TurnResult, error) {
 	return s.run(ctx, req)
@@ -4863,6 +4879,30 @@ func (s *runnerSession) Close() error {
 	}
 	return s.closeFn()
 }
+
+func (t *runnerScheduledTurn) Run(ctx context.Context) (agent.TurnResult, error) {
+	defer close(t.done)
+	if t.run == nil {
+		return agent.TurnResult{}, nil
+	}
+	return t.run(ctx, t.req)
+}
+
+func (t *runnerScheduledTurn) Interrupt(ctx context.Context) error {
+	defer func() {
+		select {
+		case <-t.done:
+		default:
+			close(t.done)
+		}
+	}()
+	if t.interrupt == nil {
+		return nil
+	}
+	return t.interrupt(ctx)
+}
+
+func (t *runnerScheduledTurn) Done() <-chan struct{} { return t.done }
 
 type typingRunner struct {
 	mu      sync.Mutex

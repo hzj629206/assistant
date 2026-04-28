@@ -23,24 +23,89 @@ type codexRunnerSession struct {
 	closed                atomic.Bool
 }
 
-func (s *codexRunnerSession) ID() string { return strings.TrimSpace(s.threadID) }
+type codexScheduledTurn struct {
+	session *codexRunnerSession
+	req     TurnRequest
+	active  *codexRunnerActiveTurn
+	runCalled atomic.Bool
+}
 
-func (s *codexRunnerSession) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+func (s *codexRunnerSession) ID() string {
+	if s == nil {
+		return ""
+	}
+	return s.currentThreadID()
+}
+
+func (s *codexRunnerSession) interruptCurrentTurn(ctx context.Context) error {
+	if s == nil || s.runner == nil {
+		return nil
+	}
+	activeTurn, ok := s.activeSessionTurn()
+	if !ok {
+		return nil
+	}
+	return (&codexScheduledTurn{session: s, active: activeTurn}).Interrupt(ctx)
+}
+
+//nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
+func (s *codexRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error) {
+	if s == nil || s.runner == nil {
+		return nil, errors.New("run codex turn failed: session is nil")
+	}
+	if s.closed.Load() {
+		return nil, errors.New("run codex turn failed: session is closed")
+	}
+	if s.runner.isClosed() {
+		return nil, errors.New("run codex turn failed: runner is closed")
+	}
+
+	req, err := normalizeSessionTurnRequest(req, s.conversationKey, s.currentThreadID())
+	if err != nil {
+		return nil, fmt.Errorf("run codex turn failed: %w", err)
+	}
+	s.mu.Lock()
+	thread := s.thread
+	s.mu.Unlock()
+	if thread == nil {
+		return nil, errors.New("run codex turn failed: thread is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var activeTurn *codexRunnerActiveTurn
+	for {
+		_, releaseTurnCtx := joinRunnerContext(context.Background(), s.runner.lifecycleCtx)
+		var currentTurn *codexRunnerActiveTurn
+		activeTurn, currentTurn, err = s.startTurn(thread.ID(), releaseTurnCtx)
+		if err != nil {
+			releaseTurnCtx()
+			return nil, fmt.Errorf("run codex turn failed: %w", err)
+		}
+		if currentTurn == nil {
+			break
+		}
+		releaseTurnCtx()
+		if interruptErr := (&codexScheduledTurn{session: s, active: currentTurn}).Interrupt(ctx); interruptErr != nil {
+			return nil, fmt.Errorf("run codex turn failed: %w", interruptErr)
+		}
+	}
+	return &codexScheduledTurn{session: s, req: req, active: activeTurn}, nil
+}
+
+func (t *codexScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
+	s := t.session
+	req := t.req
+	activeTurn := t.active
 	if s == nil || s.runner == nil {
 		return TurnResult{}, errors.New("run codex turn failed: session is nil")
 	}
-	if s.closed.Load() {
-		return TurnResult{}, errors.New("run codex turn failed: session is closed")
+	if !t.runCalled.CompareAndSwap(false, true) {
+		return TurnResult{}, errors.New("run codex turn failed: turn run already started")
 	}
-	if s.runner.isClosed() {
-		return TurnResult{}, errors.New("run codex turn failed: runner is closed")
+	if !s.startTurnRun(activeTurn) {
+		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", context.Canceled)
 	}
-
-	req, err := normalizeSessionTurnRequest(req, s.conversationKey, s.threadID)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
-	}
-
 	prompts, tools := s.runner.globalContext()
 	turnContext := codexTurnContext{
 		prompts: prompts,
@@ -73,13 +138,13 @@ func (s *codexRunnerSession) RunTurn(ctx context.Context, req TurnRequest) (Turn
 	s.pendingInitialContext = false
 	s.mu.Unlock()
 
-	turnCtx, releaseTurnCtx := joinRunnerContext(ctx, s.runner.lifecycleCtx)
-	defer releaseTurnCtx()
-	activeTurn, err := s.startTurn(thread.ID(), releaseTurnCtx)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
-	}
 	defer s.finishTurn(activeTurn, thread.ID())
+	turnCtx, releaseTurnCtx := joinRunnerContext(ctx, s.runner.lifecycleCtx)
+	s.setActiveTurnInterrupt(activeTurn, releaseTurnCtx)
+	defer releaseTurnCtx()
+	if activeTurn.interrupted.Load() {
+		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", context.Canceled)
+	}
 
 	stopTyping := startTyping(ctx, req.Message.Responder)
 	defer stopTyping()
@@ -103,30 +168,30 @@ func (s *codexRunnerSession) RunTurn(ctx context.Context, req TurnRequest) (Turn
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", context.Canceled)
 	}
 
-	if threadID := strings.TrimSpace(thread.ID()); threadID != "" {
-		s.threadID = threadID
-	}
+	s.setThreadID(thread.ID())
 	return TurnResult{
-		RunnerThreadID: s.threadID,
+		RunnerThreadID: s.currentThreadID(),
 		ReplyText:      replyText,
 	}, nil
 }
 
 //nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
-func (s *codexRunnerSession) Interrupt(ctx context.Context) error {
+func (t *codexScheduledTurn) Interrupt(ctx context.Context) error {
+	s := t.session
 	if s == nil || s.runner == nil {
 		return nil
 	}
 
-	activeTurn, threadID, ok := s.activeSessionTurn()
-	if !ok {
-		return nil
-	}
-
+	activeTurn := t.active
+	threadID := s.ID()
 	log.Printf("codex session interrupt requested: conversation=%s thread_id=%s", s.conversationKey, threadID)
 	activeTurn.interrupted.Store(true)
-	if activeTurn.requestInterrupt != nil {
-		activeTurn.requestInterrupt()
+	if s.finishTurnInterruptBeforeRun(activeTurn) {
+		log.Printf("codex session interrupt completed: conversation=%s thread_id=%s", s.conversationKey, threadID)
+		return nil
+	}
+	if requestInterrupt := s.activeTurnInterrupt(activeTurn); requestInterrupt != nil {
+		requestInterrupt()
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -140,6 +205,8 @@ func (s *codexRunnerSession) Interrupt(ctx context.Context) error {
 	}
 }
 
+func (t *codexScheduledTurn) Done() <-chan struct{} { return t.active.done }
+
 func (s *codexRunnerSession) Close() error {
 	if s == nil || s.runner == nil {
 		return nil
@@ -147,7 +214,7 @@ func (s *codexRunnerSession) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
-	activeTurn, _, ok := s.activeSessionTurn()
+	activeTurn, ok := s.activeSessionTurn()
 	if !ok {
 		return nil
 	}
@@ -189,49 +256,135 @@ func (s *codexRunnerSession) Status(context.Context) (SessionStatus, error) {
 }
 
 type codexRunnerActiveTurn struct {
-	cancel           func()
 	requestInterrupt func()
 	done             chan struct{}
 	interrupted      atomic.Bool
+	runStarted       bool
+	finished         bool
 }
 
-func (s *codexRunnerSession) activeSessionTurn() (*codexRunnerActiveTurn, string, bool) {
+func (s *codexRunnerSession) currentThreadID() string {
 	if s == nil {
-		return nil, "", false
+		return ""
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.threadID)
+}
+
+func (s *codexRunnerSession) setThreadID(threadID string) {
+	if s == nil {
+		return
+	}
+
+	trimmedThreadID := strings.TrimSpace(threadID)
+	if trimmedThreadID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	s.threadID = trimmedThreadID
+	s.mu.Unlock()
+}
+
+func (s *codexRunnerSession) activeSessionTurn() (*codexRunnerActiveTurn, bool) {
+	if s == nil {
+		return nil, false
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.activeTurn == nil {
-		return nil, "", false
+		return nil, false
 	}
-	return s.activeTurn, s.threadID, true
+	return s.activeTurn, true
 }
 
-func (s *codexRunnerSession) startTurn(threadID string, cancel func()) (*codexRunnerActiveTurn, error) {
+func (s *codexRunnerSession) startTurnRun(activeTurn *codexRunnerActiveTurn) bool {
+	if s == nil || activeTurn == nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurn != activeTurn || activeTurn.finished || activeTurn.interrupted.Load() {
+		return false
+	}
+	activeTurn.runStarted = true
+	return true
+}
+
+func (s *codexRunnerSession) setActiveTurnInterrupt(activeTurn *codexRunnerActiveTurn, requestInterrupt func()) {
+	if s == nil || activeTurn == nil {
+		return
+	}
+
+	s.mu.Lock()
+	if s.activeTurn == activeTurn && !activeTurn.finished {
+		activeTurn.requestInterrupt = requestInterrupt
+	}
+	s.mu.Unlock()
+}
+
+func (s *codexRunnerSession) activeTurnInterrupt(activeTurn *codexRunnerActiveTurn) func() {
+	if s == nil || activeTurn == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurn != activeTurn || activeTurn.finished {
+		return nil
+	}
+	return activeTurn.requestInterrupt
+}
+
+func (s *codexRunnerSession) startTurn(threadID string, cancel func()) (*codexRunnerActiveTurn, *codexRunnerActiveTurn, error) {
 	if s == nil {
-		return nil, errors.New("session is nil")
+		return nil, nil, errors.New("session is nil")
 	}
 
 	activeTurn := &codexRunnerActiveTurn{
-		cancel:           cancel,
 		requestInterrupt: cancel,
 		done:             make(chan struct{}),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
-		return nil, errors.New("session is closed")
+		return nil, nil, errors.New("session is closed")
 	}
 	if s.activeTurn != nil {
-		return nil, ErrSessionBusy
+		return nil, s.activeTurn, nil
 	}
 	if trimmedThreadID := strings.TrimSpace(threadID); trimmedThreadID != "" {
 		s.threadID = trimmedThreadID
 	}
 	s.activeTurn = activeTurn
 
-	return activeTurn, nil
+	return activeTurn, nil, nil
+}
+
+func (s *codexRunnerSession) finishTurnInterruptBeforeRun(activeTurn *codexRunnerActiveTurn) bool {
+	if s == nil || activeTurn == nil {
+		return false
+	}
+
+	var done chan struct{}
+	s.mu.Lock()
+	if s.activeTurn != activeTurn || activeTurn.runStarted || activeTurn.finished {
+		s.mu.Unlock()
+		return false
+	}
+	s.activeTurn = nil
+	activeTurn.finished = true
+	done = activeTurn.done
+	s.mu.Unlock()
+
+	if done != nil {
+		close(done)
+	}
+	return true
 }
 
 func (s *codexRunnerSession) finishTurn(activeTurn *codexRunnerActiveTurn, threadID string) {
@@ -239,18 +392,27 @@ func (s *codexRunnerSession) finishTurn(activeTurn *codexRunnerActiveTurn, threa
 		return
 	}
 
+	var done chan struct{}
 	if s != nil {
 		s.mu.Lock()
+		if activeTurn.finished {
+			s.mu.Unlock()
+			return
+		}
 		if trimmedThreadID := strings.TrimSpace(threadID); trimmedThreadID != "" {
 			s.threadID = trimmedThreadID
 		}
 		if s.activeTurn == activeTurn {
 			s.activeTurn = nil
 		}
+		activeTurn.finished = true
+		done = activeTurn.done
 		s.mu.Unlock()
 	}
 
-	close(activeTurn.done)
+	if done != nil {
+		close(done)
+	}
 }
 
 func (s *codexRunnerSession) runThreadTurn(req TurnRequest, thread codexThread, input codex.Input, options codex.TurnOptions) (codex.Turn, error) {

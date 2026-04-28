@@ -31,6 +31,7 @@ type appServerActiveTurn struct {
 	tools              []Tool
 	threadID           string
 	turnID             string
+	runStarted         bool
 	done               chan struct{}
 	interruptRequested chan struct{}
 	interruptDone      chan struct{}
@@ -42,49 +43,102 @@ type appServerActiveTurn struct {
 	interrupted        atomic.Bool
 }
 
-func (s *appServerSession) ID() string { return strings.TrimSpace(s.threadID) }
+type appServerScheduledTurn struct {
+	session *appServerSession
+	req     TurnRequest
+	active  *appServerActiveTurn
+	runCalled atomic.Bool
+}
 
-func (s *appServerSession) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+func (s *appServerSession) ID() string {
+	if s == nil {
+		return ""
+	}
+	return s.currentThreadID()
+}
+
+func (s *appServerSession) interruptCurrentTurn(ctx context.Context) error {
+	if s == nil || s.runner == nil {
+		return nil
+	}
+	s.mu.Lock()
+	active := s.activeTurn
+	s.mu.Unlock()
+	if active == nil {
+		return nil
+	}
+	return (&appServerScheduledTurn{session: s, active: active}).Interrupt(ctx)
+}
+
+//nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
+func (s *appServerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error) {
+	if s == nil || s.runner == nil {
+		return nil, errors.New("run app-server turn failed: session is nil")
+	}
+	if s.closed.Load() {
+		return nil, errors.New("run app-server turn failed: session is closed")
+	}
+	var err error
+	req, err = normalizeSessionTurnRequest(req, s.conversationKey, s.currentThreadID())
+	if err != nil {
+		return nil, fmt.Errorf("run app-server turn failed: %w", err)
+	}
+	thread := s.currentThread()
+	if thread == nil {
+		return nil, errors.New("run app-server turn failed: thread is nil")
+	}
+	threadID := firstNonEmptyString(thread.ID(), s.ID(), req.Conversation.RunnerThreadID, s.conversationKey)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var active *appServerActiveTurn
+	for {
+		var current *appServerActiveTurn
+		active, current, err = s.beginTurn(threadID, "", req, s.runner.globalTools())
+		if err != nil {
+			return nil, fmt.Errorf("run app-server turn failed: %w", err)
+		}
+		if current == nil {
+			break
+		}
+		if interruptErr := (&appServerScheduledTurn{session: s, active: current}).Interrupt(ctx); interruptErr != nil {
+			return nil, fmt.Errorf("run app-server turn failed: %w", interruptErr)
+		}
+	}
+	return &appServerScheduledTurn{session: s, req: req, active: active}, nil
+}
+
+func (t *appServerScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
+	s := t.session
+	req := t.req
+	active := t.active
 	if s == nil || s.runner == nil {
 		return TurnResult{}, errors.New("run app-server turn failed: session is nil")
 	}
-	if s.closed.Load() {
-		return TurnResult{}, errors.New("run app-server turn failed: session is closed")
+	if !t.runCalled.CompareAndSwap(false, true) {
+		return TurnResult{}, errors.New("run app-server turn failed: turn run already started")
 	}
-	var err error
-	req, err = normalizeSessionTurnRequest(req, s.conversationKey, s.threadID)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
+	if !s.startTurnRun(active) {
+		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", context.Canceled)
 	}
-
 	thread := s.currentThread()
 	if thread == nil {
 		return TurnResult{}, errors.New("run app-server turn failed: thread is nil")
 	}
-
-	turnContext := appServerTurnContext{
-		prompts: s.runner.globalPrompts(),
-		tools:   s.runner.globalTools(),
-	}
-
 	runCtx, releaseRunCtx := joinRunnerContext(ctx, s.runner.lifecycleCtx)
 	defer releaseRunCtx()
-
 	inputs := buildAppServerTurnInputs(req)
 	stopTyping := startTyping(ctx, req.Message.Responder)
 	defer stopTyping()
-
 	log.Printf("app-server session executing turn: conversation=%s mode=direct", s.conversationKey)
 	sessionKey := appServerSessionKey(req.Conversation)
 	s.runner.registerSession(sessionKey, s)
+	defer s.runner.unregisterSession(sessionKey, s)
 	threadID := firstNonEmptyString(thread.ID(), s.ID(), req.Conversation.RunnerThreadID, s.conversationKey)
-	active, err := s.beginTurn(threadID, "", req, turnContext.tools)
-	if err != nil {
-		s.runner.unregisterSession(sessionKey, s)
-		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", err)
-	}
 	defer s.endTurn(threadID, "")
-
+	if active != nil && active.interrupted.Load() {
+		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", context.Canceled)
+	}
 	turn, runErr := s.runThreadTurn(runCtx, req, thread, inputs, &s.runner.turnOptions)
 	if runErr != nil {
 		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", runErr)
@@ -102,17 +156,16 @@ func (s *appServerSession) RunTurn(ctx context.Context, req TurnRequest) (TurnRe
 	}, nil
 }
 
-func (s *appServerSession) Interrupt(ctx context.Context) error {
+func (t *appServerScheduledTurn) Interrupt(ctx context.Context) error {
+	s := t.session
 	if s == nil || s.runner == nil {
 		return nil
 	}
-
-	s.mu.Lock()
-	active := s.activeTurn
+	active := t.active
 	if active == nil {
-		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Lock()
 	interruptDone := active.interruptDone
 	requestInterrupt := active.requestInterrupt
 	s.mu.Unlock()
@@ -121,6 +174,10 @@ func (s *appServerSession) Interrupt(ctx context.Context) error {
 	}
 	log.Printf("app-server session interrupt requested: conversation=%s", s.conversationKey)
 	active.interrupted.Store(true)
+	if s.finishTurnInterruptBeforeRun(active) {
+		log.Printf("app-server session interrupt completed: conversation=%s", s.conversationKey)
+		return nil
+	}
 	active.interruptOnce.Do(requestInterrupt)
 	if interruptDone != nil {
 		select {
@@ -146,6 +203,8 @@ func (s *appServerSession) Interrupt(ctx context.Context) error {
 	}
 }
 
+func (t *appServerScheduledTurn) Done() <-chan struct{} { return t.active.done }
+
 func (s *appServerSession) Close() error {
 	if s == nil || s.runner == nil {
 		return nil
@@ -155,7 +214,7 @@ func (s *appServerSession) Close() error {
 	}
 	s.mu.Lock()
 	active := s.activeTurn
-	threadID := strings.TrimSpace(s.threadID)
+	threadID := s.currentThreadIDLocked()
 	s.mu.Unlock()
 	if active == nil || active.done == nil {
 		err := s.unsubscribeThread(threadID)
@@ -163,17 +222,13 @@ func (s *appServerSession) Close() error {
 		return err
 	}
 	done := active.done
-	interruptCtx, cancel := context.WithTimeout(context.Background(), defaultRunnerCloseInterruptTimeout)
-	err := s.Interrupt(interruptCtx)
-	cancel()
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrSessionInterruptUnavailable) {
-		return err
-	}
+	active.interrupted.Store(true)
+	active.interruptOnce.Do(active.requestInterrupt)
 	select {
 	case <-done:
 	case <-time.After(defaultRunnerCloseInterruptTimeout):
 	}
-	err = s.unsubscribeThread(threadID)
+	err := s.unsubscribeThread(threadID)
 	s.runner.unregisterSession(s.conversationKey, s)
 	return err
 }
@@ -249,17 +304,34 @@ func (s *appServerSession) currentThread() appServerThread {
 	return s.thread
 }
 
-func (s *appServerSession) beginTurn(threadID string, turnID string, req TurnRequest, tools []Tool) (*appServerActiveTurn, error) {
+func (s *appServerSession) currentThreadID() string {
+	if s == nil {
+		return ""
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentThreadIDLocked()
+}
+
+func (s *appServerSession) currentThreadIDLocked() string {
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.threadID)
+}
+
+func (s *appServerSession) beginTurn(threadID string, turnID string, req TurnRequest, tools []Tool) (*appServerActiveTurn, *appServerActiveTurn, error) {
 	if s == nil || strings.TrimSpace(threadID) == "" {
-		return nil, errors.New("app-server session is nil")
+		return nil, nil, errors.New("app-server session is nil")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
-		return nil, errors.New("session is closed")
+		return nil, nil, errors.New("session is closed")
 	}
 	if s.activeTurn != nil {
-		return nil, ErrSessionBusy
+		return nil, s.activeTurn, nil
 	}
 
 	interruptRequested := make(chan struct{})
@@ -281,7 +353,43 @@ func (s *appServerSession) beginTurn(threadID string, turnID string, req TurnReq
 	active.turnID = strings.TrimSpace(turnID)
 	s.threadID = threadID
 	s.activeTurn = active
-	return active, nil
+	return active, nil, nil
+}
+
+func (s *appServerSession) startTurnRun(active *appServerActiveTurn) bool {
+	if s == nil || active == nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurn != active || active.interrupted.Load() || active.interruptFinished {
+		return false
+	}
+	active.runStarted = true
+	return true
+}
+
+func (s *appServerSession) finishTurnInterruptBeforeRun(active *appServerActiveTurn) bool {
+	if s == nil || active == nil {
+		return false
+	}
+
+	var done chan struct{}
+	s.mu.Lock()
+	if s.activeTurn != active || active.runStarted || active.interruptFinished {
+		s.mu.Unlock()
+		return false
+	}
+	s.activeTurn = nil
+	s.completeInterruptLocked(active, nil)
+	done = active.done
+	s.mu.Unlock()
+
+	if done != nil {
+		close(done)
+	}
+	return true
 }
 
 func (s *appServerSession) endTurn(threadID string, turnID string) {
@@ -386,7 +494,7 @@ func (s *appServerSession) interruptActiveTurnIfRequested(ctx context.Context, t
 	if interruptTurnFn == nil {
 		s.mu.Lock()
 		if current := s.activeTurn; current == active {
-			s.completeInterruptLocked(active, ErrSessionInterruptUnavailable)
+			s.completeInterruptLocked(active, errors.New("app-server runner interrupt function is nil"))
 		}
 		s.mu.Unlock()
 		return
@@ -577,20 +685,29 @@ func (s *appServerSession) collectStreamedTurn(ctx context.Context, req TurnRequ
 		return nil, errors.New("streamed turn is nil")
 	}
 
+	readCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+
 	type turnNoteResult struct {
 		note apprpc.Notification
 		err  error
 	}
 
 	noteCh := make(chan turnNoteResult, 1)
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		for {
-			note, err := stream.Next(ctx)
+			note, err := stream.Next(readCtx)
 			noteCh <- turnNoteResult{note: note, err: err}
 			if err != nil {
 				return
 			}
 		}
+	}()
+	defer func() {
+		cancelRead()
+		<-readerDone
 	}()
 
 	var interruptRequested <-chan struct{}

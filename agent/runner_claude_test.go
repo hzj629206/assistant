@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -199,10 +200,11 @@ func TestClaudeCodeRunnerStartSessionExposesGeneratedSessionID(t *testing.T) {
 		}, nil
 	}
 
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 	if err = claudecode.ValidateSessionID(createdOptions.SessionID); err != nil {
 		t.Fatalf("expected generated session id, got %q (%v)", createdOptions.SessionID, err)
 	}
@@ -220,7 +222,7 @@ func TestClaudeCodeSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T
 		sessionID:       "session-live",
 	}
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{
+	_, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-2",
 			RunnerThreadID: "session-live",
@@ -231,7 +233,7 @@ func TestClaudeCodeSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-1",
 			RunnerThreadID: "session-other",
@@ -472,19 +474,20 @@ func TestClaudeCodeSessionReusesPersistentProcessWithinSession(t *testing.T) {
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
-	first, err := session.RunTurn(context.Background(), TurnRequest{
+	first, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1"},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("first RunTurn failed: %v", err)
 	}
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-1", RunnerThreadID: first.RunnerThreadID},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
 	})
@@ -568,14 +571,15 @@ func TestClaudeCodeSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conversation-1"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -586,7 +590,7 @@ func TestClaudeCodeSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -644,14 +648,15 @@ func TestClaudeCodeSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conversation-1"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -662,7 +667,7 @@ func TestClaudeCodeSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -703,29 +708,65 @@ func TestClaudeCodeRunnerInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeRunnerRunTurnMapsClaudeSessionBusyError(t *testing.T) {
+func TestClaudeScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T) {
 	t.Parallel()
 
+	started := make(chan struct{})
+	release := make(chan struct{})
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
 	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
 		return &fakeClaudePersistentSession{
-			currentSessionID: "session-live",
-			runTurn: func(context.Context, []map[string]any) (*claudecode.ClaudeResult, error) {
-				return nil, claudecode.ErrSessionBusy
+			runTurn: func(ctx context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
+				close(started)
+				<-release
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "done",
+					SessionID: "session-concurrent-run",
+				}, nil
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-concurrent-run"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
-		Conversation: ConversationState{Key: "conversation-1"},
-		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conversation-concurrent-run"},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
-	if !errors.Is(err, ErrSessionBusy) {
-		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	firstRunDone := make(chan error, 1)
+	go func() {
+		_, runErr := turn.Run(context.Background())
+		firstRunDone <- runErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not start")
+	}
+
+	_, err = turn.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "turn run already started") {
+		t.Fatalf("expected concurrent Run error, got %v", err)
+	}
+
+	close(release)
+
+	select {
+	case err = <-firstRunDone:
+		if err != nil {
+			t.Fatalf("first Run failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not complete")
 	}
 }
 
@@ -743,10 +784,11 @@ func TestClaudeCodeSessionCloseClosesUnderlyingSession(t *testing.T) {
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-close"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-close"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	if err = session.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
@@ -756,35 +798,48 @@ func TestClaudeCodeSessionCloseClosesUnderlyingSession(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeSessionRejectsConcurrentRunTurn(t *testing.T) {
+func TestClaudeCodeSessionScheduleTurnInterruptsPreviousTurn(t *testing.T) {
 	t.Parallel()
 
 	started := make(chan struct{})
-	release := make(chan struct{})
+	interruptRequested := make(chan struct{})
 	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	runCount := 0
 	runner.sessionFactory = func(_ context.Context, _ string, _ claudecode.RunOptions, _ claudecode.SessionHooks) (claudecode.Session, error) {
 		return &fakeClaudePersistentSession{
 			currentSessionID: "session-live",
 			runTurn: func(_ context.Context, _ []map[string]any) (*claudecode.ClaudeResult, error) {
-				select {
-				case <-started:
-					return nil, claudecode.ErrSessionBusy
-				default:
+				runCount++
+				if runCount == 1 {
 					close(started)
+					<-interruptRequested
+					return nil, context.Canceled
 				}
-				<-release
-				return nil, errors.New("interrupted")
+				return &claudecode.ClaudeResult{
+					Type:      "result",
+					Result:    "second reply",
+					SessionID: "session-live",
+				}, nil
+			},
+			interruptCurrentTurn: func(context.Context) error {
+				select {
+				case <-interruptRequested:
+				default:
+					close(interruptRequested)
+				}
+				return nil
 			},
 		}, nil
 	}
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-busy"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-busy"})
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conversation-busy"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -793,18 +848,22 @@ func TestClaudeCodeSessionRejectsConcurrentRunTurn(t *testing.T) {
 
 	<-started
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	result, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conversation-busy"},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
 	})
-	if !errors.Is(err, ErrSessionBusy) {
-		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
+	}
+	if result.ReplyText != "second reply" {
+		t.Fatalf("unexpected second reply: %q", result.ReplyText)
 	}
 
-	close(release)
-
 	select {
-	case <-runErrCh:
+	case err = <-runErrCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected first run error: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("first run turn did not finish")
 	}
@@ -1018,6 +1077,54 @@ type fakeClaudePersistentSession struct {
 	interruptCurrentTurn func(context.Context) error
 	closeFunc            func() error
 	currentSessionID     string
+	mu                   sync.Mutex
+	currentTurn          *fakeClaudeScheduledTurn
+}
+
+type fakeClaudeScheduledTurn struct {
+	session *fakeClaudePersistentSession
+	blocks  []map[string]any
+	done    chan struct{}
+}
+
+func (t *fakeClaudeScheduledTurn) Run(ctx context.Context) (*claudecode.ClaudeResult, error) {
+	defer func() {
+		t.session.clearCurrentTurn(t)
+		close(t.done)
+	}()
+	return t.session.RunTurn(ctx, t.blocks)
+}
+
+func (t *fakeClaudeScheduledTurn) Interrupt(ctx context.Context) error {
+	return t.session.Interrupt(ctx)
+}
+
+func (t *fakeClaudeScheduledTurn) Done() <-chan struct{} { return t.done }
+
+//nolint:contextcheck // Test fake uses the caller context only to wait for preemption of the previous turn.
+func (s *fakeClaudePersistentSession) ScheduleTurn(ctx context.Context, blocks []map[string]any) (claudecode.ScheduledTurn, error) {
+	s.mu.Lock()
+	currentTurn := s.currentTurn
+	s.mu.Unlock()
+	if currentTurn != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := currentTurn.Interrupt(ctx); err != nil {
+			return nil, err
+		}
+	}
+	copied := make([]map[string]any, len(blocks))
+	copy(copied, blocks)
+	turn := &fakeClaudeScheduledTurn{
+		session: s,
+		blocks:  copied,
+		done:    make(chan struct{}),
+	}
+	s.mu.Lock()
+	s.currentTurn = turn
+	s.mu.Unlock()
+	return turn, nil
 }
 
 func (s *fakeClaudePersistentSession) RunTurn(ctx context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
@@ -1047,6 +1154,14 @@ func (s *fakeClaudePersistentSession) Close() error {
 		return nil
 	}
 	return s.closeFunc()
+}
+
+func (s *fakeClaudePersistentSession) clearCurrentTurn(turn *fakeClaudeScheduledTurn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentTurn == turn {
+		s.currentTurn = nil
+	}
 }
 
 func readClaudeStreamInput(blocks []map[string]any) string {

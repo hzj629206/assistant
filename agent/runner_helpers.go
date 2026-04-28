@@ -2,11 +2,40 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 )
+
+func joinRunnerContext(ctx context.Context, runnerCtx context.Context) (context.Context, func()) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if runnerCtx == nil {
+		return context.WithCancel(ctx)
+	}
+
+	joinedCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(runnerCtx, cancel)
+	return joinedCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func runSessionTurn(ctx context.Context, session Session, req TurnRequest) (TurnResult, error) {
+	if session == nil {
+		return TurnResult{}, errors.New("session is nil")
+	}
+	turn, err := session.ScheduleTurn(ctx, req)
+	if err != nil {
+		return TurnResult{}, err
+	}
+	return turn.Run(ctx)
+}
 
 func formatRunnerMode(mode string, approval string) string {
 	mode = strings.TrimSpace(mode)

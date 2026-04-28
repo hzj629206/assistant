@@ -20,54 +20,88 @@ type acpRunnerSession struct {
 	mu                          sync.Mutex
 	session                     acp.Session
 	token                       string
-	active                      *interruptibleRunnerTurn
 	pendingInitialSystemPrompts bool
+	currentTurn                 *acpScheduledTurn
 	closed                      bool
 }
 
-type interruptibleRunnerTurn struct {
-	done        chan struct{}
+type acpScheduledTurn struct {
+	session     *acpRunnerSession
+	req         TurnRequest
+	turn        acp.ScheduledTurn
 	interrupted atomic.Bool
 }
 
-func (s *acpRunnerSession) ID() string { return strings.TrimSpace(s.sessionID) }
+func (s *acpRunnerSession) ID() string {
+	if s == nil {
+		return ""
+	}
+	return s.currentSessionID()
+}
 
-func (s *acpRunnerSession) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+func (s *acpRunnerSession) interruptCurrentTurn(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	currentTurn := s.currentTurn
+	s.mu.Unlock()
+	if currentTurn != nil {
+		return currentTurn.Interrupt(ctx)
+	}
+	session, _, err := s.currentSessionForInterrupt()
+	if err != nil || session == nil {
+		return err
+	}
+	return mapACPSessionError(session.Interrupt(ctx))
+}
+
+func (s *acpRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error) {
 	if s == nil || s.runner == nil {
-		return TurnResult{}, errors.New("run acp turn failed: session is nil")
+		return nil, errors.New("run acp turn failed: session is nil")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil, errors.New("run acp turn failed: session is closed")
 	}
 
 	req, err := s.normalizeTurnRequest(req)
 	if err != nil {
-		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", err)
+		return nil, fmt.Errorf("run acp turn failed: %w", err)
 	}
+	underlyingTurn, err := s.scheduleACPturn(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("run acp turn failed: %w", err)
+	}
+	scheduledTurn := &acpScheduledTurn{session: s, req: req, turn: underlyingTurn}
+	s.mu.Lock()
+	s.currentTurn = scheduledTurn
+	s.mu.Unlock()
+	return scheduledTurn, nil
+}
 
-	prompts, tools := s.runner.globalContext()
+func (t *acpScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
+	s := t.session
+	req := t.req
+	if s == nil || s.runner == nil || t.turn == nil {
+		return TurnResult{}, errors.New("run acp turn failed: session is nil")
+	}
+	defer t.session.clearCurrentTurn(t)
+	_, tools := s.runner.globalContext()
 	session, token, err := s.currentSessionState()
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", err)
 	}
-	active, err := s.beginActiveTurn()
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", err)
-	}
-	defer s.endActiveTurn(active)
 
-	initialPromptBlocks := []string(nil)
-	if s.consumeInitialSystemPrompts() {
-		initialPromptBlocks = prompts
-	}
-	promptBlocks, err := buildACPPromptBlocks(initialPromptBlocks, req.Message, session.Capabilities().Prompt)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("run acp turn failed: build prompt blocks: %w", err)
-	}
 	s.runner.registerToolCallContext(token, req)
 	defer s.runner.unregisterToolCallContext(token)
 
 	log.Printf(
 		"acp session ready: conversation=%s requested_session=%s actual_session=%s tool_count=%d",
 		s.conversationKey,
-		s.sessionID,
+		s.currentSessionID(),
 		session.SessionID(),
 		len(tools),
 	)
@@ -78,89 +112,52 @@ func (s *acpRunnerSession) RunTurn(ctx context.Context, req TurnRequest) (TurnRe
 	turnCtx, cancelTurn := joinRunnerContext(ctx, s.runner.lifecycleCtx)
 	defer cancelTurn()
 
-	turnResult, err := session.RunTurn(turnCtx, promptBlocks)
+	if t.interrupted.Load() {
+		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", context.Canceled)
+	}
+	turnResult, err := t.turn.Run(turnCtx)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", mapACPSessionError(err))
 	}
-	if active.interrupted.Load() {
+	if t.interrupted.Load() {
 		return TurnResult{}, fmt.Errorf("run acp turn failed: %w", context.Canceled)
 	}
-	s.sessionID = strings.TrimSpace(turnResult.SessionID)
+	s.setSessionID(turnResult.SessionID)
 	return TurnResult{
-		RunnerThreadID: s.sessionID,
+		RunnerThreadID: s.currentSessionID(),
 		ReplyText:      turnResult.ReplyText,
 	}, nil
+}
+
+//nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
+func (t *acpScheduledTurn) Interrupt(ctx context.Context) error {
+	s := t.session
+	if s == nil || t.turn == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.interrupted.Store(true)
+	err := t.turn.Interrupt(ctx)
+	if err != nil {
+		return mapACPSessionError(err)
+	}
+	return nil
+}
+
+func (t *acpScheduledTurn) Done() <-chan struct{} {
+	if t == nil || t.turn == nil {
+		return nil
+	}
+	return t.turn.Done()
 }
 
 func (s *acpRunnerSession) normalizeTurnRequest(req TurnRequest) (TurnRequest, error) {
 	if s == nil {
 		return req, errors.New("acp session is nil")
 	}
-	return normalizeSessionTurnRequest(req, s.conversationKey, s.sessionID)
-}
-
-//nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
-func (s *acpRunnerSession) Interrupt(ctx context.Context) error {
-	if s == nil {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	session, sessionID, err := s.currentSessionForInterrupt()
-	if err != nil {
-		return err
-	}
-	if session == nil {
-		return nil
-	}
-	s.markActiveTurnInterrupted()
-	log.Printf("acp session interrupt requested: conversation=%s session_id=%s", s.conversationKey, sessionID)
-	err = session.Interrupt(ctx)
-	if err != nil {
-		return mapACPSessionError(err)
-	}
-	log.Printf("acp session interrupt completed: conversation=%s session_id=%s", s.conversationKey, sessionID)
-	return nil
-}
-
-func (s *acpRunnerSession) beginActiveTurn() (*interruptibleRunnerTurn, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, errors.New("session is closed")
-	}
-	if s.active != nil {
-		return nil, ErrSessionBusy
-	}
-	active := &interruptibleRunnerTurn{done: make(chan struct{})}
-	s.active = active
-	return active, nil
-}
-
-func (s *acpRunnerSession) endActiveTurn(active *interruptibleRunnerTurn) {
-	if s == nil || active == nil {
-		return
-	}
-	s.mu.Lock()
-	if s.active == active {
-		s.active = nil
-	}
-	s.mu.Unlock()
-	close(active.done)
-}
-
-func (s *acpRunnerSession) markActiveTurnInterrupted() {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	active := s.active
-	s.mu.Unlock()
-	if active != nil {
-		active.interrupted.Store(true)
-	}
+	return normalizeSessionTurnRequest(req, s.conversationKey, s.currentSessionID())
 }
 
 func (s *acpRunnerSession) Close() error {
@@ -176,6 +173,44 @@ func (s *acpRunnerSession) Close() error {
 		return nil
 	}
 	return session.Close()
+}
+
+func (s *acpRunnerSession) scheduleACPturn(ctx context.Context, req TurnRequest) (acp.ScheduledTurn, error) {
+	if s == nil {
+		return nil, errors.New("acp session is nil")
+	}
+	prompts, _ := s.runner.globalContext()
+	session, _, err := s.currentSessionState()
+	if err != nil {
+		return nil, err
+	}
+	initialPromptBlocks := []string(nil)
+	if s.hasPendingInitialSystemPrompts() {
+		initialPromptBlocks = prompts
+	}
+	promptBlocks, err := buildACPPromptBlocks(initialPromptBlocks, req.Message, session.Capabilities().Prompt)
+	if err != nil {
+		return nil, fmt.Errorf("build prompt blocks: %w", err)
+	}
+	turn, err := session.ScheduleTurn(ctx, promptBlocks)
+	if err != nil {
+		return nil, err
+	}
+	if len(initialPromptBlocks) != 0 {
+		s.consumeInitialSystemPrompts()
+	}
+	return turn, nil
+}
+
+func (s *acpRunnerSession) clearCurrentTurn(turn *acpScheduledTurn) {
+	if s == nil || turn == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.currentTurn == turn {
+		s.currentTurn = nil
+	}
+	s.mu.Unlock()
 }
 
 func (s *acpRunnerSession) Status(context.Context) (SessionStatus, error) {
@@ -264,6 +299,36 @@ func (s *acpRunnerSession) currentSessionIDLocked() string {
 	return strings.TrimSpace(s.sessionID)
 }
 
+func (s *acpRunnerSession) currentSessionID() string {
+	if s == nil {
+		return ""
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentSessionIDLocked()
+}
+
+func (s *acpRunnerSession) setSessionID(sessionID string) {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	s.sessionID = strings.TrimSpace(sessionID)
+	s.mu.Unlock()
+}
+
+func (s *acpRunnerSession) hasPendingInitialSystemPrompts() bool {
+	if s == nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingInitialSystemPrompts
+}
+
 func (s *acpRunnerSession) consumeInitialSystemPrompts() bool {
 	if s == nil {
 		return false
@@ -280,9 +345,6 @@ func (s *acpRunnerSession) consumeInitialSystemPrompts() bool {
 func mapACPSessionError(err error) error {
 	if err == nil {
 		return nil
-	}
-	if errors.Is(err, acp.ErrSessionBusy) {
-		return ErrSessionBusy
 	}
 	return err
 }

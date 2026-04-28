@@ -28,9 +28,6 @@ const (
 
 var processHandshakeTimeout = 30 * time.Second
 
-// ErrSessionBusy reports that the ACP session already has an active turn.
-var ErrSessionBusy = errors.New("acp session already has an active turn")
-
 type processSession struct {
 	//nolint:containedctx // This is the session lifecycle root context, not a per-request context.
 	lifecycleCtx context.Context
@@ -64,10 +61,18 @@ type processActiveTurn struct {
 	done               chan struct{}
 	interruptRequested chan struct{}
 	interruptDone      chan struct{}
+	runStarted         bool
 	interruptSent      bool
 	interruptFinished  bool
 	interruptErr       error
 	interrupted        bool
+}
+
+type scheduledTurn struct {
+	session    *processSession
+	activeTurn *processActiveTurn
+	blocks     []ContentBlock
+	runCalled  atomic.Bool
 }
 
 type pendingPermissionRequest struct {
@@ -326,15 +331,59 @@ func (s *processSession) newSession(ctx context.Context, workDir string, mcpServ
 	return nil
 }
 
-func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (TurnResult, error) {
+//nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
+func (s *processSession) ScheduleTurn(ctx context.Context, blocks []ContentBlock) (ScheduledTurn, error) {
 	sessionID := s.SessionID()
 	if sessionID == "" {
-		return TurnResult{}, errors.New("acp session id is empty")
+		return nil, errors.New("acp session id is empty")
 	}
 
-	activeTurn, err := s.startActiveTurn(sessionID)
+	var activeTurn *processActiveTurn
+	var err error
+	for {
+		var currentTurn *processActiveTurn
+		activeTurn, currentTurn, err = s.startActiveTurn(sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if currentTurn == nil {
+			break
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if interruptErr := (&scheduledTurn{session: s, activeTurn: currentTurn}).Interrupt(ctx); interruptErr != nil {
+			return nil, interruptErr
+		}
+	}
+	copied := make([]ContentBlock, len(blocks))
+	copy(copied, blocks)
+	return &scheduledTurn{
+		session:    s,
+		activeTurn: activeTurn,
+		blocks:     copied,
+	}, nil
+}
+
+func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (TurnResult, error) {
+	turn, err := s.ScheduleTurn(ctx, blocks)
 	if err != nil {
 		return TurnResult{}, err
+	}
+	return turn.Run(ctx)
+}
+
+func (t *scheduledTurn) Run(ctx context.Context) (TurnResult, error) {
+	if t == nil || t.session == nil || t.activeTurn == nil {
+		return TurnResult{}, errors.New("acp scheduled turn is nil")
+	}
+	if !t.runCalled.CompareAndSwap(false, true) {
+		return TurnResult{}, errors.New("acp scheduled turn run already started")
+	}
+	s := t.session
+	activeTurn := t.activeTurn
+	if !s.startTurnRun(activeTurn) {
+		return TurnResult{}, context.Canceled
 	}
 	defer s.finishActiveTurn(activeTurn)
 
@@ -350,8 +399,8 @@ func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (Tu
 	go s.watchTurnInterrupt(ctx, activeTurn)
 
 	result, err := s.transport.call(ctx, "session/prompt", map[string]any{
-		"sessionId": sessionID,
-		"prompt":    blocks,
+		"sessionId": activeTurn.sessionID,
+		"prompt":    t.blocks,
 	})
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("acp session/prompt failed: %w", err)
@@ -359,7 +408,7 @@ func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (Tu
 	if s.wasTurnInterrupted(activeTurn) {
 		return TurnResult{}, context.Canceled
 	}
-	logACPStopReason(sessionID, result)
+	logACPStopReason(activeTurn.sessionID, result)
 
 	s.promptMu.Lock()
 	reply := ""
@@ -372,6 +421,53 @@ func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (Tu
 		ReplyText: reply,
 		RawResult: append(json.RawMessage(nil), result...),
 	}, nil
+}
+
+//nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the scheduled turn.
+func (t *scheduledTurn) Interrupt(ctx context.Context) error {
+	if t == nil || t.session == nil || t.activeTurn == nil {
+		return nil
+	}
+	s := t.session
+	activeTurn := t.activeTurn
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	done := s.signalTurnInterrupt(activeTurn)
+	if s.finishTurnInterruptBeforeRun(activeTurn) {
+		return nil
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-activeTurn.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	s.turnMu.Lock()
+	interruptErr := activeTurn.interruptErr
+	s.turnMu.Unlock()
+	if interruptErr != nil {
+		return interruptErr
+	}
+
+	select {
+	case <-activeTurn.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t *scheduledTurn) Done() <-chan struct{} {
+	if t == nil || t.activeTurn == nil {
+		return nil
+	}
+	return t.activeTurn.done
 }
 
 //nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
@@ -502,11 +598,11 @@ func (s *processSession) Close() error {
 	return shutdownErr
 }
 
-func (s *processSession) startActiveTurn(sessionID string) (*processActiveTurn, error) {
+func (s *processSession) startActiveTurn(sessionID string) (*processActiveTurn, *processActiveTurn, error) {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
 	if s.activeTurn != nil {
-		return nil, ErrSessionBusy
+		return nil, s.activeTurn, nil
 	}
 	activeTurn := &processActiveTurn{
 		sessionID:          strings.TrimSpace(sessionID),
@@ -514,7 +610,7 @@ func (s *processSession) startActiveTurn(sessionID string) (*processActiveTurn, 
 		interruptRequested: make(chan struct{}),
 	}
 	s.activeTurn = activeTurn
-	return activeTurn, nil
+	return activeTurn, nil, nil
 }
 
 func (s *processSession) finishActiveTurn(activeTurn *processActiveTurn) {
@@ -528,6 +624,20 @@ func (s *processSession) finishActiveTurn(activeTurn *processActiveTurn) {
 	}
 	s.turnMu.Unlock()
 	close(activeTurn.done)
+}
+
+func (s *processSession) startTurnRun(activeTurn *processActiveTurn) bool {
+	if activeTurn == nil {
+		return false
+	}
+
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.activeTurn != activeTurn || activeTurn.interrupted {
+		return false
+	}
+	activeTurn.runStarted = true
+	return true
 }
 
 func (s *processSession) currentActiveTurn() *processActiveTurn {
@@ -558,6 +668,38 @@ func (s *processSession) signalTurnInterrupt(activeTurn *processActiveTurn) <-ch
 		activeTurn.interruptDone = make(chan struct{})
 	}
 	return activeTurn.interruptDone
+}
+
+func (s *processSession) finishTurnInterruptBeforeRun(activeTurn *processActiveTurn) bool {
+	if activeTurn == nil {
+		return false
+	}
+
+	var (
+		done          chan struct{}
+		interruptDone chan struct{}
+	)
+
+	s.turnMu.Lock()
+	if s.activeTurn != activeTurn || activeTurn.runStarted || activeTurn.interruptFinished {
+		s.turnMu.Unlock()
+		return false
+	}
+	s.activeTurn = nil
+	activeTurn.interrupted = true
+	activeTurn.interruptFinished = true
+	done = activeTurn.done
+	interruptDone = activeTurn.interruptDone
+	s.turnMu.Unlock()
+
+	s.cancelPendingPermissions(activeTurn)
+	if interruptDone != nil {
+		close(interruptDone)
+	}
+	if done != nil {
+		close(done)
+	}
+	return true
 }
 
 func (s *processSession) requestTurnInterrupt(activeTurn *processActiveTurn) (<-chan struct{}, bool) {

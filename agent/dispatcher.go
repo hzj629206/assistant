@@ -38,34 +38,34 @@ type DispatcherOptions struct {
 
 // Dispatcher normalizes callback events and runs them asynchronously.
 type Dispatcher struct {
-	store                *ConversationStore
-	runner               Runner
-	queue                *dispatcherQueue
-	workerCount          int
-	mergeWindow          time.Duration
-	locks                *keyedLocker
-	pendingMu            sync.Mutex
-	pending              map[string]*pendingConversation
-	delayed              map[string]*delayedConversation
-	commandMu            sync.Mutex
-	commanding           map[string]*commandConversation
-	commandWG            sync.WaitGroup
-	startOnce            sync.Once
-	stopOnce             sync.Once
-	sessionsCloseOnce    sync.Once
-	workersDone          chan struct{}
-	workersWG            sync.WaitGroup
-	closeMu              sync.RWMutex
-	closed               bool
-	stopCh               chan struct{}
-	fatalErrCh           chan<- error
-	sessionIdleTimeout   time.Duration
-	shutdownTurnTimeout  time.Duration
-	sessionsMu           sync.Mutex
-	sessions             map[string]*managedConversationSession
-	activeTurnsMu        sync.Mutex
-	activeTurnSeq        uint64
-	activeByConversation map[string]*activeConversationTurn
+	store                    *ConversationStore
+	runner                   Runner
+	queue                    *dispatcherQueue
+	workerCount              int
+	mergeWindow              time.Duration
+	locks                    *keyedLocker
+	pendingMu                sync.Mutex
+	pending                  map[string]*pendingConversation
+	delayed                  map[string]*delayedConversation
+	commandMu                sync.Mutex
+	commanding               map[string]*commandConversation
+	commandWG                sync.WaitGroup
+	startOnce                sync.Once
+	stopOnce                 sync.Once
+	sessionsCloseOnce        sync.Once
+	workersDone              chan struct{}
+	workersWG                sync.WaitGroup
+	closeMu                  sync.RWMutex
+	closed                   bool
+	stopCh                   chan struct{}
+	fatalErrCh               chan<- error
+	sessionIdleTimeout       time.Duration
+	shutdownTurnTimeout      time.Duration
+	sessionsMu               sync.Mutex
+	sessions                 map[string]*managedConversationSession
+	activeWorkMu             sync.Mutex
+	activeWorkSeq            uint64
+	activeWorkByConversation map[string]*activeConversationWork
 }
 
 type pendingConversation struct {
@@ -86,12 +86,13 @@ type commandConversation struct {
 	running       bool
 }
 
-type activeConversationTurn struct {
+type activeConversationWork struct {
 	id           uint64
 	conversation ConversationState
 	mu           sync.Mutex
 	session      Session
-	sessionDone  chan struct{}
+	turn         ScheduledTurn
+	turnDone     chan struct{}
 	sessionOnce  sync.Once
 	done         chan struct{}
 	interrupted  atomic.Bool
@@ -153,11 +154,14 @@ func (q *dispatcherQueue) Enqueue(ctx context.Context, stopCh <-chan struct{}, m
 	}
 }
 
-func (q *dispatcherQueue) Dequeue(stopCh <-chan struct{}) (InboundMessage, bool) {
+func (q *dispatcherQueue) ClaimNext(stopCh <-chan struct{}, claim func(InboundMessage)) (InboundMessage, bool) {
 	for {
 		q.mu.Lock()
 		if len(q.items) > 0 {
 			message := q.items[0]
+			if claim != nil {
+				claim(message)
+			}
 			copy(q.items, q.items[1:])
 			q.items = q.items[:len(q.items)-1]
 			remaining := len(q.items)
@@ -280,22 +284,22 @@ func NewDispatcher(options DispatcherOptions) *Dispatcher {
 	}
 
 	return &Dispatcher{
-		store:                store,
-		runner:               runner,
-		queue:                newDispatcherQueue(queueSize),
-		workerCount:          workerCount,
-		mergeWindow:          mergeWindow,
-		locks:                newKeyedLocker(),
-		pending:              make(map[string]*pendingConversation),
-		delayed:              make(map[string]*delayedConversation),
-		commanding:           make(map[string]*commandConversation),
-		workersDone:          make(chan struct{}),
-		stopCh:               make(chan struct{}),
-		fatalErrCh:           options.FatalErrCh,
-		sessionIdleTimeout:   normalizedDispatcherSessionIdleTimeout(options.SessionIdleTimeout),
-		shutdownTurnTimeout:  options.ShutdownTurnTimeout,
-		sessions:             make(map[string]*managedConversationSession),
-		activeByConversation: make(map[string]*activeConversationTurn),
+		store:                    store,
+		runner:                   runner,
+		queue:                    newDispatcherQueue(queueSize),
+		workerCount:              workerCount,
+		mergeWindow:              mergeWindow,
+		locks:                    newKeyedLocker(),
+		pending:                  make(map[string]*pendingConversation),
+		delayed:                  make(map[string]*delayedConversation),
+		commanding:               make(map[string]*commandConversation),
+		workersDone:              make(chan struct{}),
+		stopCh:                   make(chan struct{}),
+		fatalErrCh:               options.FatalErrCh,
+		sessionIdleTimeout:       normalizedDispatcherSessionIdleTimeout(options.SessionIdleTimeout),
+		shutdownTurnTimeout:      options.ShutdownTurnTimeout,
+		sessions:                 make(map[string]*managedConversationSession),
+		activeWorkByConversation: make(map[string]*activeConversationWork),
 	}
 }
 
@@ -388,10 +392,12 @@ func (d *Dispatcher) waitForWorkers(ctx context.Context) (bool, error) {
 	case <-done:
 		return true, nil
 	case <-timer.C:
-		log.Printf("dispatcher shutdown grace period elapsed; interrupting running turns")
-		d.interruptActiveTurns(context.Background(), defaultShutdownInterruptTimeout) //nolint:contextcheck
+		log.Printf("dispatcher shutdown grace period elapsed; closing managed sessions")
+		if err := d.closeSessionsOnce(); err != nil {
+			return false, err
+		}
 	case <-ctx.Done():
-		d.interruptActiveTurns(context.Background(), defaultShutdownInterruptTimeout) //nolint:contextcheck
+		_ = d.closeSessionsOnce()
 		return false, ctx.Err()
 	}
 
@@ -399,10 +405,10 @@ func (d *Dispatcher) waitForWorkers(ctx context.Context) (bool, error) {
 	case <-done:
 		return true, nil
 	case <-time.After(defaultShutdownInterruptTimeout):
-		log.Printf("dispatcher shutdown interrupt grace period elapsed; deferring final cleanup to runner close")
+		log.Printf("dispatcher shutdown close grace period elapsed; deferring final cleanup to runner close")
 		return false, nil
 	case <-ctx.Done():
-		d.interruptActiveTurns(context.Background(), defaultShutdownInterruptTimeout) //nolint:contextcheck
+		_ = d.closeSessionsOnce()
 		return false, ctx.Err()
 	}
 }
@@ -453,14 +459,13 @@ func (d *Dispatcher) runWorker(workerID int) {
 		default:
 		}
 
-		message, ok := d.queue.Dequeue(d.stopCh)
+		message, ok := d.queue.ClaimNext(d.stopCh, d.claimConversationWork)
 		if !ok {
 			return
 		}
 
 		current := message
 		for {
-			d.activateConversation(current.ConversationKey)
 			if err := d.handleMessage(context.Background(), current); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf(
 					"dispatcher worker %d failed: conversation=%s event_id=%s err=%v",
@@ -484,6 +489,11 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 	if message.ConversationKey == "" {
 		return errors.New("handle message failed: conversation key is empty")
 	}
+	releaseWork := d.releaseClaimedConversationWork(message.ConversationKey)
+	defer func() {
+		releaseWork()
+	}()
+
 	log.Printf("dispatcher handling message: conversation=%s event_id=%s kind=%s", message.ConversationKey, message.ID, message.Kind)
 
 	messages := flattenInboundMessages(message)
@@ -530,8 +540,8 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		state = newConversationState(message)
 		log.Printf("dispatcher created conversation state: conversation=%s event_id=%s", message.ConversationKey, message.ID)
 	}
-	activeTurn, releaseTurn := d.startTurnContext(state)
-	defer releaseTurn()
+	var activeWork *activeConversationWork
+	activeWork, releaseWork = d.startActiveConversationWork(state)
 
 	if isNewConversation && message.LoadInitialContext != nil {
 		initialContext, loadErr := message.LoadInitialContext(ctx)
@@ -556,38 +566,45 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		)
 	}
 
-	if err = d.recoverDirtyConversation(ctx, &state); err != nil {
-		return err
-	}
-
 	log.Printf(
-		"dispatcher running turn: conversation=%s event_id=%s existing_session=%s dirty=%t",
+		"dispatcher running turn: conversation=%s event_id=%s existing_session=%s",
 		message.ConversationKey,
 		message.ID,
 		state.RunnerThreadID,
-		state.RunnerThreadDirty,
 	)
 	session, releaseSession, err := d.acquireConversationSession(ctx, state)
 	if err != nil {
 		return fmt.Errorf("start session failed: %w", err)
 	}
 	defer releaseSession()
-	d.finishTurnSessionLoad(activeTurn, session)
-	d.persistConversationSessionID(ctx, state, session)
-
-	result, err := session.RunTurn(ctx, TurnRequest{
+	scheduledTurn, err := session.ScheduleTurn(ctx, TurnRequest{
 		Conversation: state,
 		Message:      message,
 	})
 	if err != nil {
+		return fmt.Errorf("schedule turn failed: %w", err)
+	}
+	d.finishActiveConversationWork(activeWork, session, scheduledTurn)
+	d.persistConversationSessionID(ctx, state, session)
+	if activeWork != nil && activeWork.interrupted.Load() {
+		log.Printf(
+			"dispatcher skipping run turn for interrupted active turn: conversation=%s event_id=%s session_id=%s",
+			message.ConversationKey,
+			message.ID,
+			session.ID(),
+		)
+		return nil
+	}
+
+	result, err := scheduledTurn.Run(ctx)
+	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			state.RunnerThreadDirty = true
 			state.RunnerThreadID = session.ID()
 			putErr := d.store.PutConversation(context.WithoutCancel(ctx), state)
 			if putErr != nil {
-				log.Printf("dispatcher failed to mark conversation dirty after turn cancellation: conversation=%s session_id=%s err=%v", state.Key, state.RunnerThreadID, putErr)
+				log.Printf("dispatcher failed to persist conversation after turn cancellation: conversation=%s session_id=%s err=%v", state.Key, state.RunnerThreadID, putErr)
 			} else {
-				log.Printf("dispatcher marked conversation dirty after canceled turn: conversation=%s session_id=%s", state.Key, state.RunnerThreadID)
+				log.Printf("dispatcher persisted conversation after canceled turn: conversation=%s session_id=%s", state.Key, state.RunnerThreadID)
 			}
 		} else {
 			d.discardConversationSession(state.Key, session)
@@ -601,14 +618,13 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		session.ID(),
 		len(result.ReplyText),
 	)
-	if activeTurn != nil && activeTurn.interrupted.Load() {
+	if activeWork != nil && activeWork.interrupted.Load() {
 		log.Printf("dispatcher suppressing reply from interrupted turn: conversation=%s event_id=%s session_id=%s", message.ConversationKey, message.ID, session.ID())
 		result.ReplyText = ""
 	}
 
 	state.LastEventID = message.ID
 	state.LastActivityAt = time.Now()
-	state.RunnerThreadDirty = false
 	if sessionID := strings.TrimSpace(session.ID()); sessionID != "" {
 		state.RunnerThreadID = sessionID
 	}
@@ -1003,37 +1019,92 @@ func (d *Dispatcher) dropQueuedCommands(ctx context.Context) (int, error) {
 	return len(dropped), err
 }
 
-func (d *Dispatcher) startTurnContext(conversation ConversationState) (*activeConversationTurn, func()) {
-	d.activeTurnsMu.Lock()
-	d.activeTurnSeq++
-	turnID := d.activeTurnSeq
+func (d *Dispatcher) startActiveConversationWork(conversation ConversationState) (*activeConversationWork, func()) {
+	d.activeWorkMu.Lock()
 	conversationKey := conversation.Key
-	active := &activeConversationTurn{
-		id:           turnID,
-		conversation: conversation,
-		sessionDone:  make(chan struct{}),
-		done:         make(chan struct{}),
+	active := d.activeWorkByConversation[conversationKey]
+	if active == nil {
+		d.activeWorkSeq++
+		active = &activeConversationWork{
+			id:       d.activeWorkSeq,
+			turnDone: make(chan struct{}),
+			done:     make(chan struct{}),
+		}
+		if conversationKey != "" {
+			d.activeWorkByConversation[conversationKey] = active
+		}
 	}
-	if conversationKey != "" {
-		d.activeByConversation[conversationKey] = active
-	}
-	d.activeTurnsMu.Unlock()
+	turnID := active.id
+	active.conversation = conversation
+	d.activeWorkMu.Unlock()
 
 	return active, func() {
-		d.activeTurnsMu.Lock()
+		d.activeWorkMu.Lock()
 		if conversationKey != "" {
-			existing := d.activeByConversation[conversationKey]
+			existing := d.activeWorkByConversation[conversationKey]
 			if existing != nil && existing.id == turnID {
-				delete(d.activeByConversation, conversationKey)
+				delete(d.activeWorkByConversation, conversationKey)
 			}
 		}
-		d.activeTurnsMu.Unlock()
-		d.finishTurnSessionLoad(active, nil)
+		d.activeWorkMu.Unlock()
+		d.finishActiveConversationWork(active, nil, nil)
 		close(active.done)
 	}
 }
 
-func (d *Dispatcher) finishTurnSessionLoad(active *activeConversationTurn, session Session) {
+func (d *Dispatcher) claimConversationWork(message InboundMessage) {
+	conversationKey := strings.TrimSpace(message.ConversationKey)
+	if conversationKey == "" {
+		return
+	}
+
+	d.activeWorkMu.Lock()
+	if d.activeWorkByConversation[conversationKey] == nil {
+		d.activeWorkSeq++
+		d.activeWorkByConversation[conversationKey] = &activeConversationWork{
+			id:       d.activeWorkSeq,
+			turnDone: make(chan struct{}),
+			done:     make(chan struct{}),
+		}
+	}
+	d.activeWorkMu.Unlock()
+
+	d.activateConversation(conversationKey)
+}
+
+func (d *Dispatcher) releaseClaimedConversationWork(conversationKey string) func() {
+	conversationKey = strings.TrimSpace(conversationKey)
+	if conversationKey == "" {
+		return func() {}
+	}
+
+	d.activeWorkMu.Lock()
+	active := d.activeWorkByConversation[conversationKey]
+	if active == nil {
+		d.activeWorkMu.Unlock()
+		return func() {}
+	}
+	turnID := active.id
+	d.activeWorkMu.Unlock()
+
+	return func() {
+		d.activeWorkMu.Lock()
+		existing := d.activeWorkByConversation[conversationKey]
+		if existing != nil && existing.id == turnID {
+			delete(d.activeWorkByConversation, conversationKey)
+		} else {
+			existing = nil
+		}
+		d.activeWorkMu.Unlock()
+		if existing == nil {
+			return
+		}
+		d.finishActiveConversationWork(existing, nil, nil)
+		close(existing.done)
+	}
+}
+
+func (d *Dispatcher) finishActiveConversationWork(active *activeConversationWork, session Session, turn ScheduledTurn) {
 	if d == nil || active == nil {
 		return
 	}
@@ -1044,69 +1115,12 @@ func (d *Dispatcher) finishTurnSessionLoad(active *activeConversationTurn, sessi
 	if session != nil {
 		active.session = session
 	}
+	if turn != nil {
+		active.turn = turn
+	}
 	active.sessionOnce.Do(func() {
-		close(active.sessionDone)
+		close(active.turnDone)
 	})
-}
-
-func (d *Dispatcher) interruptActiveTurns(ctx context.Context, timeout time.Duration) {
-	activeTurns := d.activeTurnsSnapshot()
-	if len(activeTurns) == 0 {
-		return
-	}
-	if timeout <= 0 {
-		timeout = defaultShutdownInterruptTimeout
-	}
-
-	var wg sync.WaitGroup
-	for _, active := range activeTurns {
-		wg.Go(func() {
-			active.interrupted.Store(true)
-			active.mu.Lock()
-			session := active.session
-			sessionDone := active.sessionDone
-			active.mu.Unlock()
-			if session == nil && sessionDone != nil {
-				select {
-				case <-sessionDone:
-				case <-active.done:
-				case <-ctx.Done():
-				}
-				active.mu.Lock()
-				session = active.session
-				active.mu.Unlock()
-			}
-			if session == nil {
-				return
-			}
-			interruptCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			err := session.Interrupt(interruptCtx)
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				log.Printf(
-					"dispatcher implicit session interrupt failed: conversation=%s session_id=%s err=%v",
-					active.conversation.Key,
-					session.ID(),
-					err,
-				)
-			}
-		})
-	}
-	wg.Wait()
-}
-
-func (d *Dispatcher) activeTurnsSnapshot() []*activeConversationTurn {
-	d.activeTurnsMu.Lock()
-	defer d.activeTurnsMu.Unlock()
-
-	activeTurns := make([]*activeConversationTurn, 0, len(d.activeByConversation))
-	for _, active := range d.activeByConversation {
-		if active == nil {
-			continue
-		}
-		activeTurns = append(activeTurns, active)
-	}
-	return activeTurns
 }
 
 func (d *Dispatcher) acquireConversationSession(ctx context.Context, state ConversationState) (Session, func(), error) {
@@ -1573,51 +1587,56 @@ func (d *Dispatcher) buildBlockingCommandReplyLocked(ctx context.Context, req Co
 
 func (d *Dispatcher) interruptCommandConversation(ctx context.Context, req CommandRequest) (bool, error) {
 	interrupted := false
-	var activeTurn *activeConversationTurn
-	if active := d.activeConversationTurn(req.ConversationKey); active != nil {
-		activeTurn = active
+	if active := d.activeConversationWork(req.ConversationKey); active != nil {
 		interrupted = true
 		active.interrupted.Store(true)
 		active.mu.Lock()
-		session := active.session
-		sessionDone := active.sessionDone
+		turn := active.turn
+		turnDone := active.turnDone
 		active.mu.Unlock()
-		if session == nil && sessionDone != nil {
+		if turn == nil && turnDone != nil {
 			select {
-			case <-sessionDone:
+			case <-turnDone:
 			case <-active.done:
 			}
 			active.mu.Lock()
-			session = active.session
+			turn = active.turn
 			active.mu.Unlock()
 		}
-		if session != nil {
+		if turn != nil {
 			interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
 			defer interruptCancel()
-			if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
-				log.Printf("dispatcher session interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
+			if interruptErr := turn.Interrupt(interruptCtx); interruptErr != nil {
+				log.Printf("dispatcher turn interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, active.session.ID(), interruptErr)
 			}
-			<-activeTurn.done
+			d.persistConversationAfterInterrupt(ctx, req.ConversationKey, active.session)
+			<-active.done
 			return interrupted, nil
 		}
-	}
-	session, releaseSession := d.peekCommandSession(req.ConversationKey)
-
-	interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer interruptCancel()
-	if session != nil {
-		defer releaseSession()
-		interrupted = true
-		if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
-			log.Printf("dispatcher session interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
-		}
-	}
-
-	if activeTurn != nil {
-		<-activeTurn.done
+		<-active.done
 	}
 
 	return interrupted, nil
+}
+
+func (d *Dispatcher) persistConversationAfterInterrupt(ctx context.Context, conversationKey string, session Session) {
+	if d == nil || strings.TrimSpace(conversationKey) == "" || session == nil {
+		return
+	}
+
+	state, err := d.store.GetConversation(ctx, conversationKey)
+	if err != nil {
+		if !errors.Is(err, cache.ErrNotFound) {
+			log.Printf("dispatcher failed to load conversation for interrupt persistence: conversation=%s err=%v", conversationKey, err)
+		}
+		state = ConversationState{Key: conversationKey}
+	}
+	if sessionID := strings.TrimSpace(session.ID()); sessionID != "" {
+		state.RunnerThreadID = sessionID
+	}
+	if err = d.store.PutConversation(context.WithoutCancel(ctx), state); err != nil {
+		log.Printf("dispatcher failed to persist conversation after interrupt: conversation=%s session_id=%s err=%v", conversationKey, session.ID(), err)
+	}
 }
 
 func (d *Dispatcher) buildResetCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
@@ -1726,42 +1745,6 @@ func (d *Dispatcher) peekCommandSession(conversationKey string) (Session, func()
 	return nil, func() {}
 }
 
-func (d *Dispatcher) recoverDirtyConversation(ctx context.Context, state *ConversationState) error {
-	if d == nil || state == nil || !state.RunnerThreadDirty {
-		return nil
-	}
-
-	log.Printf(
-		"dispatcher recovering dirty conversation before next turn: conversation=%s session_id=%s",
-		state.Key,
-		state.RunnerThreadID,
-	)
-	session, releaseSession, err := d.acquireConversationSession(ctx, *state)
-	if err != nil {
-		return fmt.Errorf("start session for dirty recovery failed: %w", err)
-	}
-	defer releaseSession()
-	interruptCtx, cancel := context.WithTimeout(ctx, defaultShutdownInterruptTimeout)
-	defer cancel()
-	err = session.Interrupt(interruptCtx)
-	if err != nil {
-		log.Printf(
-			"dispatcher failed to interrupt dirty conversation; resetting session: conversation=%s session_id=%s err=%v",
-			state.Key,
-			state.RunnerThreadID,
-			err,
-		)
-		_ = session.Close()
-		d.dropConversationSession(state.Key)
-		state.RunnerThreadID = ""
-	}
-	state.RunnerThreadDirty = false
-	if err = d.store.PutConversation(context.WithoutCancel(ctx), *state); err != nil {
-		return fmt.Errorf("store recovered dirty conversation failed: %w", err)
-	}
-	return nil
-}
-
 func (d *Dispatcher) sendCommandReply(ctx context.Context, req CommandRequest, replyText string) {
 	if req.Responder == nil {
 		if err := (LoggingResponder{}).SendText(ctx, replyText); err != nil {
@@ -1825,7 +1808,7 @@ func (d *Dispatcher) takeCommandBriefs(conversationKey string) []string {
 }
 
 func (d *Dispatcher) activeConversationSession(conversationKey string) Session {
-	active := d.activeConversationTurn(conversationKey)
+	active := d.activeConversationWork(conversationKey)
 	if active == nil {
 		return nil
 	}
@@ -1834,11 +1817,11 @@ func (d *Dispatcher) activeConversationSession(conversationKey string) Session {
 	return active.session
 }
 
-func (d *Dispatcher) activeConversationTurn(conversationKey string) *activeConversationTurn {
-	d.activeTurnsMu.Lock()
-	defer d.activeTurnsMu.Unlock()
+func (d *Dispatcher) activeConversationWork(conversationKey string) *activeConversationWork {
+	d.activeWorkMu.Lock()
+	defer d.activeWorkMu.Unlock()
 
-	return d.activeByConversation[conversationKey]
+	return d.activeWorkByConversation[conversationKey]
 }
 
 func (d *Dispatcher) cleanupCommandResponder(ctx context.Context, req CommandRequest) {

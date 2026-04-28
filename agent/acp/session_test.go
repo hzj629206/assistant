@@ -8,10 +8,28 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestProcessExitLogDetailsIncludesSignal(t *testing.T) {
 	t.Parallel()
@@ -42,7 +60,7 @@ func TestProcessExitLogDetailsIncludesExitCode(t *testing.T) {
 }
 
 func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	session := &processSession{
 		transport: newRPCTransport(bytes.NewReader(nil), &output, nil, nil),
 		sessionID: "session-cancel",
@@ -55,6 +73,14 @@ func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
 		done <- err
 	}()
 
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(output.String(), "\"method\":\"session/prompt\"") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected session/prompt write before cancellation, got %q", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	cancel()
 
 	select {
@@ -66,7 +92,7 @@ func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
 		t.Fatal("RunTurn did not return after cancellation")
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline = time.Now().Add(time.Second)
 	for {
 		written := output.String()
 		if strings.Contains(written, "\"method\":\"session/prompt\"") && strings.Contains(written, "\"method\":\"session/cancel\"") {
@@ -88,14 +114,100 @@ func TestProcessSessionInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
 	}
 }
 
+func TestProcessSessionScheduledTurnInterruptBeforeRunCompletesImmediately(t *testing.T) {
+	session := &processSession{sessionID: "session-interrupt-before-run"}
+
+	turn, err := session.ScheduleTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	if err = turn.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt failed: %v", err)
+	}
+
+	select {
+	case <-turn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("scheduled turn did not complete after interrupt-before-run")
+	}
+
+	activeTurn := session.currentActiveTurn()
+	if activeTurn != nil {
+		t.Fatal("expected active turn to be released after interrupt-before-run")
+	}
+
+	_, err = turn.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected Run to return context.Canceled after interrupt-before-run, got %v", err)
+	}
+
+	nextTurn, err := session.ScheduleTurn(context.Background(), []ContentBlock{{"type": "text", "text": "next"}})
+	if err != nil {
+		t.Fatalf("second ScheduleTurn failed: %v", err)
+	}
+	if nextTurn == nil {
+		t.Fatal("expected second scheduled turn")
+	}
+}
+
+func TestProcessSessionScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T) {
+	var output lockedBuffer
+	reader, writer := io.Pipe()
+	session := &processSession{
+		transport: newRPCTransport(reader, &output, nil, nil),
+		sessionID: "session-concurrent-run",
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go session.transport.readLoop(ctx)
+
+	turn, err := session.ScheduleTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	firstRunErrCh := make(chan error, 1)
+	go func() {
+		_, runErr := turn.Run(context.Background())
+		firstRunErrCh <- runErr
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(output.String(), "\"method\":\"session/prompt\"") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected session/prompt write, got %q", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, err = turn.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "run already started") {
+		t.Fatalf("expected concurrent Run error, got %v", err)
+	}
+
+	_, _ = writer.Write([]byte("{\"id\":1,\"result\":{\"status\":\"ok\"}}\n"))
+	_ = writer.Close()
+
+	select {
+	case err = <-firstRunErrCh:
+		if err != nil {
+			t.Fatalf("first Run failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not complete")
+	}
+}
+
 func TestProcessSessionInterruptWaitsForTurnCompletion(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	session := &processSession{
 		transport: newRPCTransport(bytes.NewReader(nil), &output, nil, nil),
 		sessionID: "session-interrupt",
 	}
 
-	activeTurn, err := session.startActiveTurn("session-interrupt")
+	activeTurn, _, err := session.startActiveTurn("session-interrupt")
 	if err != nil {
 		t.Fatalf("startActiveTurn failed: %v", err)
 	}
@@ -128,7 +240,7 @@ func TestProcessSessionInterruptWaitsForTurnCompletion(t *testing.T) {
 }
 
 func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	reader, writer := io.Pipe()
 	session := &processSession{
 		transport: newRPCTransport(reader, &output, nil, nil),
@@ -284,7 +396,7 @@ func TestStartSessionTimesOutWhenAgentDoesNotRespond(t *testing.T) {
 }
 
 func TestProcessSessionHandleRequestUsesCustomPermissionHandler(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -315,7 +427,7 @@ func TestProcessSessionHandleRequestUsesCustomPermissionHandler(t *testing.T) {
 }
 
 func TestProcessSessionInterruptCancelsPendingPermissionRequests(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	handlerCtxDone := make(chan struct{})
 	session := &processSession{
 		lifecycleCtx: context.Background(),
@@ -327,7 +439,7 @@ func TestProcessSessionInterruptCancelsPendingPermissionRequests(t *testing.T) {
 		},
 	}
 
-	activeTurn, err := session.startActiveTurn("session-permission-cancel")
+	activeTurn, _, err := session.startActiveTurn("session-permission-cancel")
 	if err != nil {
 		t.Fatalf("startActiveTurn failed: %v", err)
 	}
@@ -430,7 +542,7 @@ func TestProcessSessionHandleNotificationPreservesWhitespaceChunks(t *testing.T)
 }
 
 func TestProcessSessionRunTurnPreservesLeadingAndTrailingWhitespace(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	reader, writer := io.Pipe()
 	session := &processSession{
 		transport: newRPCTransport(reader, &output, nil, nil),
@@ -459,7 +571,7 @@ func TestProcessSessionRunTurnPreservesLeadingAndTrailingWhitespace(t *testing.T
 }
 
 func TestProcessSessionRunTurnReturnsStructuredResult(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	reader, writer := io.Pipe()
 	session := &processSession{
 		transport: newRPCTransport(reader, &output, nil, nil),

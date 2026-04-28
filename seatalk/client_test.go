@@ -314,8 +314,6 @@ func TestClientSendInteractive(t *testing.T) {
 }
 
 func TestClientSendInteractiveRejectsEmptyElements(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret", EmployeeInfoEnabled: true})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -455,8 +453,6 @@ func TestClientSendPrivateInteractive(t *testing.T) {
 }
 
 func TestClientSendPrivateRejectsInvalidUsablePlatform(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -474,8 +470,6 @@ func TestClientSendPrivateRejectsInvalidUsablePlatform(t *testing.T) {
 }
 
 func TestClientGetEmployeeInfo(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -567,8 +561,6 @@ func TestClientGetEmployeeInfo(t *testing.T) {
 }
 
 func TestClientGetEmployeeInfoRejectsInvalidEmployeeCodes(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret", EmployeeInfoEnabled: true})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -585,8 +577,6 @@ func TestClientGetEmployeeInfoRejectsInvalidEmployeeCodes(t *testing.T) {
 }
 
 func TestClientGetEmployeeInfoReturnsDisabledErrorWhenFeatureDisabled(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -599,8 +589,6 @@ func TestClientGetEmployeeInfoReturnsDisabledErrorWhenFeatureDisabled(t *testing
 }
 
 func TestClientGetGroupInfo(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -684,8 +672,6 @@ func TestClientGetGroupInfo(t *testing.T) {
 }
 
 func TestClientGetGroupInfoRejectsInvalidPageSize(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -701,8 +687,6 @@ func TestClientGetGroupInfoRejectsInvalidPageSize(t *testing.T) {
 }
 
 func TestClientGetGroupInfoAPIError(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(getGroupInfoResponse{
@@ -736,8 +720,6 @@ func TestClientGetGroupInfoAPIError(t *testing.T) {
 }
 
 func TestClientDownload(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -777,8 +759,6 @@ func TestClientDownload(t *testing.T) {
 }
 
 func TestClientDownloadRejectsInvalidURL(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -794,8 +774,6 @@ func TestClientDownloadRejectsInvalidURL(t *testing.T) {
 }
 
 func TestClientDownloadUnexpectedStatus(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expired", http.StatusForbidden)
 	}))
@@ -823,8 +801,6 @@ func TestClientDownloadUnexpectedStatus(t *testing.T) {
 }
 
 func TestClientGetPrivateThread(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -906,8 +882,6 @@ func TestClientGetPrivateThread(t *testing.T) {
 }
 
 func TestClientGetPrivateThreadRejectsInvalidPageSize(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -923,8 +897,6 @@ func TestClientGetPrivateThreadRejectsInvalidPageSize(t *testing.T) {
 }
 
 func TestClientGetMessage(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -1001,8 +973,6 @@ func TestClientGetMessage(t *testing.T) {
 }
 
 func TestClientGetMessageRejectsEmptyMessageID(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -1016,8 +986,6 @@ func TestClientGetMessageRejectsEmptyMessageID(t *testing.T) {
 }
 
 func TestClientGetGroupThread(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -1111,8 +1079,6 @@ func TestClientGetGroupThread(t *testing.T) {
 }
 
 func TestClientGetGroupThreadRejectsInvalidPageSize(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -1128,8 +1094,6 @@ func TestClientGetGroupThreadRejectsInvalidPageSize(t *testing.T) {
 }
 
 func TestClientUpdateInteractiveMessage(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -1193,8 +1157,6 @@ func TestClientUpdateInteractiveMessage(t *testing.T) {
 }
 
 func TestClientUpdateInteractiveMessageRejectsEmptyFields(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -1213,8 +1175,6 @@ func TestClientUpdateInteractiveMessageRejectsEmptyFields(t *testing.T) {
 }
 
 func TestClientSetGroupTypingStatus(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -1261,8 +1221,6 @@ func TestClientSetGroupTypingStatus(t *testing.T) {
 }
 
 func TestClientSetGroupTypingStatusRejectsEmptyGroupID(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -1275,8 +1233,6 @@ func TestClientSetGroupTypingStatusRejectsEmptyGroupID(t *testing.T) {
 }
 
 func TestClientSetPrivateTypingStatus(t *testing.T) {
-	t.Parallel()
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("unexpected method: %s", r.Method)
@@ -1323,8 +1279,6 @@ func TestClientSetPrivateTypingStatus(t *testing.T) {
 }
 
 func TestClientSetPrivateTypingStatusRejectsEmptyEmployeeCode(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")
@@ -1337,8 +1291,6 @@ func TestClientSetPrivateTypingStatusRejectsEmptyEmployeeCode(t *testing.T) {
 }
 
 func TestClientSendTextRejectsInvalidFormat(t *testing.T) {
-	t.Parallel()
-
 	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
 	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
 		t.Fatal("token provider should not be called")

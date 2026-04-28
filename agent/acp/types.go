@@ -7,13 +7,22 @@ import (
 )
 
 // Session provides one reusable ACP subprocess session.
+//
+// ScheduleTurn should preempt any previous active turn before publishing the new turn.
 type Session interface {
-	RunTurn(ctx context.Context, blocks []ContentBlock) (TurnResult, error)
+	ScheduleTurn(ctx context.Context, blocks []ContentBlock) (ScheduledTurn, error)
 	Interrupt(ctx context.Context) error
 	SessionID() string
 	Status() SessionMetadata
 	Capabilities() AgentCapabilities
 	Close() error
+}
+
+// ScheduledTurn represents one ACP session turn that can be run or interrupted in either order.
+type ScheduledTurn interface {
+	Run(ctx context.Context) (TurnResult, error)
+	Interrupt(ctx context.Context) error
+	Done() <-chan struct{}
 }
 
 // TurnResult contains one ACP turn result.

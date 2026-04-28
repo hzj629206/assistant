@@ -50,7 +50,28 @@ type testSession struct {
 	sessionID       string
 }
 
-func startTestSession(t *testing.T, runner Runner, conversation ConversationState) Session {
+type compatSession interface {
+	Session
+	RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error)
+	Interrupt(ctx context.Context) error
+}
+
+type compatSessionAdapter struct {
+	Session
+}
+
+type testTurnInterruptor interface {
+	interruptCurrentTurn(ctx context.Context) error
+}
+
+type testScheduledTurn struct {
+	session  *testSession
+	req      TurnRequest
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func startTestSession(t *testing.T, runner Runner, conversation ConversationState) compatSession {
 	t.Helper()
 
 	session, err := runner.StartSession(context.Background(), SessionOptions{
@@ -60,29 +81,72 @@ func startTestSession(t *testing.T, runner Runner, conversation ConversationStat
 	if err != nil {
 		t.Fatalf("StartSession failed: %v", err)
 	}
-	return session
+	return mustCompatSession(t, session)
+}
+
+func mustCompatSession(t *testing.T, session Session) compatSession {
+	t.Helper()
+	compat, ok := session.(compatSession)
+	if ok {
+		return compat
+	}
+	return &compatSessionAdapter{Session: session}
 }
 
 func runTurnWithRunner(t *testing.T, runner Runner, req TurnRequest) (TurnResult, error) {
 	t.Helper()
-	return startTestSession(t, runner, req.Conversation).RunTurn(context.Background(), req)
+	return runSessionTurn(context.Background(), startTestSession(t, runner, req.Conversation), req)
 }
 
 func interruptWithRunner(t *testing.T, runner Runner, conversation ConversationState) error {
 	t.Helper()
-	return startTestSession(t, runner, conversation).Interrupt(context.Background())
+	session, err := runner.StartSession(context.Background(), SessionOptions{
+		ConversationKey: conversation.Key,
+		ResumeSessionID: conversation.RunnerThreadID,
+	})
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	return interruptSession(context.Background(), session)
+}
+
+func interruptSession(ctx context.Context, session Session) error {
+	if session == nil {
+		return nil
+	}
+	interruptible, ok := session.(testTurnInterruptor)
+	if !ok {
+		return errors.New("session interrupt is unavailable")
+	}
+	return interruptible.interruptCurrentTurn(ctx)
 }
 
 func (s *testSession) ID() string { return s.sessionID }
 
-func (s *testSession) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+func (s *testSession) ScheduleTurn(_ context.Context, req TurnRequest) (ScheduledTurn, error) {
 	req.Conversation.Key = s.conversationKey
 	req.Conversation.RunnerThreadID = s.sessionID
-	return s.runner.RunTurn(ctx, req)
+	return &testScheduledTurn{
+		session: s,
+		req:     req,
+		done:    make(chan struct{}),
+	}, nil
+}
+
+func (s *testSession) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+	turn, err := s.ScheduleTurn(ctx, req)
+	if err != nil {
+		return TurnResult{}, err
+	}
+	return turn.Run(ctx)
 }
 
 func (s *testSession) Interrupt(ctx context.Context) error {
 	return s.runner.Interrupt(ctx, ConversationState{Key: s.conversationKey, RunnerThreadID: s.sessionID})
+}
+
+func (s *testSession) interruptCurrentTurn(ctx context.Context) error {
+	return s.Interrupt(ctx)
 }
 
 func (s *testSession) Status(ctx context.Context) (SessionStatus, error) {
@@ -91,6 +155,34 @@ func (s *testSession) Status(ctx context.Context) (SessionStatus, error) {
 
 func (s *testSession) Close() error {
 	return s.runner.Close()
+}
+
+func (t *testScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
+	defer t.doneOnce.Do(func() {
+		close(t.done)
+	})
+	return t.session.runner.RunTurn(ctx, t.req)
+}
+
+func (t *testScheduledTurn) Interrupt(ctx context.Context) error {
+	defer t.doneOnce.Do(func() {
+		close(t.done)
+	})
+	return t.session.runner.Interrupt(ctx, ConversationState{Key: t.session.conversationKey, RunnerThreadID: t.session.sessionID})
+}
+
+func (t *testScheduledTurn) Done() <-chan struct{} { return t.done }
+
+func (a *compatSessionAdapter) RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error) {
+	return runSessionTurn(ctx, a.Session, req)
+}
+
+func (a *compatSessionAdapter) Interrupt(ctx context.Context) error {
+	return interruptSession(ctx, a.Session)
+}
+
+func (a *compatSessionAdapter) interruptCurrentTurn(ctx context.Context) error {
+	return interruptSession(ctx, a.Session)
 }
 
 func (r *testRunner) StartSession(ctx context.Context, options SessionOptions) (Session, error) {
@@ -474,8 +566,8 @@ func TestDispatcherShutdownCancelsRunningTurnAfterGracePeriod(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for runner cancellation")
 	}
-	if runner.InterruptCalls() == 0 {
-		t.Fatal("expected shutdown to issue an implicit runner interrupt before cancellation")
+	if runner.CloseCalls() == 0 {
+		t.Fatal("expected shutdown to close managed sessions after grace period")
 	}
 
 	if got := runner.Calls(); got != 1 {
@@ -521,14 +613,20 @@ func TestDispatcherShutdownDefersSessionCloseUntilInterruptedTurnFinishes(t *tes
 	}()
 
 	select {
+	case <-runner.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for session close start")
+	}
+
+	select {
 	case <-runner.canceled:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for runner cancellation")
 	}
 
 	select {
-	case <-runner.closeStarted:
-		t.Fatal("session close started before interrupted turn finished")
+	case err := <-done:
+		t.Fatalf("shutdown returned before running turn finished: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -542,18 +640,15 @@ func TestDispatcherShutdownDefersSessionCloseUntilInterruptedTurnFinishes(t *tes
 	case <-time.After(time.Second):
 		t.Fatal("shutdown timed out waiting for interrupted turn")
 	}
-
-	select {
-	case <-runner.closeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for deferred session close")
-	}
 }
 
 func TestDispatcherShutdownDropsQueuedCommandsAndWaitsForRunningCommand(t *testing.T) {
 	t.Parallel()
 
 	runner := &testRunner{
+		started:          make(chan struct{}, 1),
+		release:          make(chan struct{}),
+		waitForCancel:    true,
 		interruptStarted: make(chan struct{}, 2),
 		interruptRelease: make(chan struct{}),
 	}
@@ -585,6 +680,22 @@ func TestDispatcherShutdownDropsQueuedCommandsAndWaitsForRunningCommand(t *testi
 	}
 
 	firstResponder := &testResponder{}
+	if err := dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-active-shutdown",
+		ConversationKey: "private:e_shutdown:0",
+		Kind:            MessageKindText,
+		Text:            "running turn",
+		Responder:       &testResponder{},
+	}); err != nil {
+		t.Fatalf("enqueue active message failed: %v", err)
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active turn start")
+	}
+
 	if err := dispatcher.EnqueueCommand(context.Background(), CommandRequest{
 		ConversationKey: "private:e_shutdown:0",
 		EventID:         "evt-stop-running",
@@ -622,6 +733,7 @@ func TestDispatcherShutdownDropsQueuedCommandsAndWaitsForRunningCommand(t *testi
 	}
 
 	close(runner.interruptRelease)
+	close(runner.release)
 
 	select {
 	case err := <-done:
@@ -725,122 +837,6 @@ func TestDispatcherPersistsSessionIDBeforeFirstTurn(t *testing.T) {
 	close(runner.release)
 }
 
-func TestDispatcherInterruptsDirtyConversationBeforeNextTurn(t *testing.T) {
-	t.Parallel()
-
-	store := NewConversationStore(cache.NewMemoryStorage())
-	err := store.PutConversation(context.Background(), ConversationState{
-		Key:               "private:e_1:dirty",
-		RunnerThreadID:    "thread-dirty",
-		RunnerThreadDirty: true,
-	})
-	if err != nil {
-		t.Fatalf("put conversation failed: %v", err)
-	}
-
-	runner := &testRunner{}
-	dispatcher := NewDispatcher(DispatcherOptions{
-		Store:       store,
-		Runner:      runner,
-		WorkerCount: 1,
-	})
-	_ = dispatcher.Start()
-
-	if err = dispatcher.Enqueue(context.Background(), InboundMessage{
-		ID:              "evt-dirty",
-		ConversationKey: "private:e_1:dirty",
-		Text:            "hello again",
-	}); err != nil {
-		t.Fatalf("enqueue failed: %v", err)
-	}
-
-	deadline := time.Now().Add(time.Second)
-	for runner.Calls() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if runner.Calls() != 1 {
-		t.Fatal("timed out waiting for runner call")
-	}
-	if runner.InterruptCalls() != 1 {
-		t.Fatalf("expected one interrupt before reuse, got %d", runner.InterruptCalls())
-	}
-	if runner.LastInterrupt().Key != "private:e_1:dirty" {
-		t.Fatalf("unexpected interrupted conversation: %+v", runner.LastInterrupt())
-	}
-	if runner.LastRequest().Conversation.RunnerThreadID != "thread-dirty" {
-		t.Fatalf("unexpected runner thread reuse: %q", runner.LastRequest().Conversation.RunnerThreadID)
-	}
-	if runner.LastRequest().Conversation.RunnerThreadDirty {
-		t.Fatal("expected dirty flag to be cleared before RunTurn")
-	}
-
-	state, err := store.GetConversation(context.Background(), "private:e_1:dirty")
-	if err != nil {
-		t.Fatalf("get conversation failed: %v", err)
-	}
-	if state.RunnerThreadDirty {
-		t.Fatal("expected stored dirty flag to be cleared after successful recovery")
-	}
-}
-
-func TestDispatcherResetsRunnerThreadWhenDirtyInterruptFails(t *testing.T) {
-	t.Parallel()
-
-	store := NewConversationStore(cache.NewMemoryStorage())
-	err := store.PutConversation(context.Background(), ConversationState{
-		Key:               "private:e_1:dirty-fail",
-		RunnerThreadID:    "thread-stale",
-		RunnerThreadDirty: true,
-	})
-	if err != nil {
-		t.Fatalf("put conversation failed: %v", err)
-	}
-
-	runner := &testRunner{interruptErr: errors.New("interrupt failed")}
-	dispatcher := NewDispatcher(DispatcherOptions{
-		Store:       store,
-		Runner:      runner,
-		WorkerCount: 1,
-	})
-	_ = dispatcher.Start()
-
-	if err = dispatcher.Enqueue(context.Background(), InboundMessage{
-		ID:              "evt-dirty-fail",
-		ConversationKey: "private:e_1:dirty-fail",
-		Text:            "hello new thread",
-	}); err != nil {
-		t.Fatalf("enqueue failed: %v", err)
-	}
-
-	deadline := time.Now().Add(time.Second)
-	for runner.Calls() == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if runner.Calls() != 1 {
-		t.Fatal("timed out waiting for runner call")
-	}
-	if runner.InterruptCalls() != 1 {
-		t.Fatalf("expected one interrupt before reset, got %d", runner.InterruptCalls())
-	}
-	if runner.LastRequest().Conversation.RunnerThreadID != "" {
-		t.Fatalf("expected stale runner thread to be reset, got %q", runner.LastRequest().Conversation.RunnerThreadID)
-	}
-	if runner.LastRequest().Conversation.RunnerThreadDirty {
-		t.Fatal("expected dirty flag to be cleared before retry")
-	}
-
-	state, err := store.GetConversation(context.Background(), "private:e_1:dirty-fail")
-	if err != nil {
-		t.Fatalf("get conversation failed: %v", err)
-	}
-	if state.RunnerThreadDirty {
-		t.Fatal("expected stored dirty flag to be cleared after failed recovery")
-	}
-	if state.RunnerThreadID != "" {
-		t.Fatalf("expected stored runner thread to be reset, got %q", state.RunnerThreadID)
-	}
-}
-
 func TestDispatcherRejectsEnqueueAfterShutdown(t *testing.T) {
 	t.Parallel()
 
@@ -902,9 +898,8 @@ func TestDispatcherResetCommandInterruptsAndResetsConversationState(t *testing.T
 
 	store := NewConversationStore(cache.NewMemoryStorage())
 	err := store.PutConversation(context.Background(), ConversationState{
-		Key:               "private:e_1:reset",
-		RunnerThreadID:    "thread-reset",
-		RunnerThreadDirty: true,
+		Key:            "private:e_1:reset",
+		RunnerThreadID: "thread-reset",
 	})
 	if err != nil {
 		t.Fatalf("put conversation failed: %v", err)
@@ -933,11 +928,11 @@ func TestDispatcherResetCommandInterruptsAndResetsConversationState(t *testing.T
 	if err != nil {
 		t.Fatalf("build reset reply failed: %v", err)
 	}
-	if !strings.Contains(reply, "_Conversation interrupted and reset._") {
+	if !strings.Contains(reply, "_Conversation reset._") {
 		t.Fatalf("unexpected reset reply: %q", reply)
 	}
-	if runner.InterruptCalls() != 1 {
-		t.Fatalf("expected one interrupt during reset, got %d", runner.InterruptCalls())
+	if runner.InterruptCalls() != 0 {
+		t.Fatalf("expected reset without active turn to skip interrupt, got %d", runner.InterruptCalls())
 	}
 	if runner.CloseCalls() != 1 {
 		t.Fatalf("expected one close during reset, got %d", runner.CloseCalls())
@@ -1656,6 +1651,45 @@ func TestDispatcherRequeuesPendingBatchWhenInitialEnqueueFails(t *testing.T) {
 	}
 }
 
+func TestDispatcherClaimNextPublishesConversationBeforeWorkerRuns(t *testing.T) {
+	t.Parallel()
+
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store: NewConversationStore(cache.NewMemoryStorage()),
+	})
+
+	message := InboundMessage{
+		ID:              "evt-claim",
+		ConversationKey: "private:e_claim:0",
+		Text:            "hello",
+	}
+	if err := dispatcher.enqueueReadyMessage(context.Background(), message); err != nil {
+		t.Fatalf("enqueue ready message failed: %v", err)
+	}
+
+	claimed, ok := dispatcher.queue.ClaimNext(dispatcher.stopCh, dispatcher.claimConversationWork)
+	if !ok {
+		t.Fatal("expected queue claim to succeed")
+	}
+	if claimed.ID != message.ID {
+		t.Fatalf("unexpected claimed message id: %s", claimed.ID)
+	}
+
+	active := dispatcher.activeConversationWork(message.ConversationKey)
+	if active == nil {
+		t.Fatal("expected claimed conversation to be visible as active")
+	}
+
+	dispatcher.pendingMu.Lock()
+	state := dispatcher.pending[message.ConversationKey]
+	dispatcher.pendingMu.Unlock()
+	if state == nil || !state.active || state.queued {
+		t.Fatalf("unexpected pending state after claim: %+v", state)
+	}
+
+	dispatcher.releaseClaimedConversationWork(message.ConversationKey)()
+}
+
 func TestDispatcherDelaysForwardedMessageUntilFollowUpTextArrives(t *testing.T) {
 	t.Parallel()
 
@@ -1843,16 +1877,9 @@ func TestDispatcherHandleStopCancelsTurnWhileSessionStarting(t *testing.T) {
 
 	close(runner.startSessionWait)
 
-	select {
-	case <-runner.started:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for turn start after session became ready")
-	}
-
-	select {
-	case <-runner.canceled:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for runner cancellation")
+	time.Sleep(50 * time.Millisecond)
+	if got := runner.Calls(); got != 0 {
+		t.Fatalf("expected no turn start after session became ready, got %d", got)
 	}
 
 	if err := waitForResponderSend(commandResponder); err != nil {
@@ -1863,8 +1890,8 @@ func TestDispatcherHandleStopCancelsTurnWhileSessionStarting(t *testing.T) {
 	if !strings.Contains(reply, "_Conversation interrupted._") {
 		t.Fatalf("unexpected command reply: %q", reply)
 	}
-	if got := runner.Calls(); got != 1 {
-		t.Fatalf("expected one turn run after session became ready, got %d", got)
+	if got := runner.Calls(); got != 0 {
+		t.Fatalf("expected no turn run after session became ready, got %d", got)
 	}
 	if got := runner.InterruptCalls(); got != 1 {
 		t.Fatalf("expected one session interrupt after session became ready, got %d", got)
@@ -1983,9 +2010,6 @@ func TestDispatcherHandleStopPreservesDirtyConversationState(t *testing.T) {
 	state, err := store.GetConversation(context.Background(), "private:e_1:stop-dirty")
 	if err != nil {
 		t.Fatalf("get conversation failed: %v", err)
-	}
-	if !state.RunnerThreadDirty {
-		t.Fatal("expected dirty conversation state to be preserved after stop")
 	}
 	if state.RunnerThreadID != "thread-stop" {
 		t.Fatalf("unexpected runner thread id: %q", state.RunnerThreadID)
@@ -2130,6 +2154,9 @@ func TestDispatcherHandleStopDropsIncomingMessagesDuringCommand(t *testing.T) {
 	t.Parallel()
 
 	runner := &testRunner{
+		started:          make(chan struct{}, 1),
+		release:          make(chan struct{}),
+		waitForCancel:    true,
 		interruptStarted: make(chan struct{}, 1),
 		interruptRelease: make(chan struct{}),
 	}
@@ -2161,6 +2188,22 @@ func TestDispatcherHandleStopDropsIncomingMessagesDuringCommand(t *testing.T) {
 	}
 
 	commandResponder := &testResponder{}
+	if err = dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-active-stop",
+		ConversationKey: "private:e_2:0",
+		Kind:            MessageKindText,
+		Text:            "active turn",
+		Responder:       &testResponder{},
+	}); err != nil {
+		t.Fatalf("enqueue active message failed: %v", err)
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active turn")
+	}
+
 	if err = dispatcher.EnqueueCommand(context.Background(), CommandRequest{
 		ConversationKey: "private:e_2:0",
 		EventID:         "evt-stop",
@@ -2188,6 +2231,7 @@ func TestDispatcherHandleStopDropsIncomingMessagesDuringCommand(t *testing.T) {
 	}
 
 	close(runner.interruptRelease)
+	close(runner.release)
 
 	if err := waitForResponderSend(commandResponder); err != nil {
 		t.Fatalf("timed out waiting for enqueue command reply: %v", err)
@@ -2569,6 +2613,9 @@ func TestDispatcherCommandQueueBlocksConversationUntilQueuedCommandsDrain(t *tes
 	t.Parallel()
 
 	runner := &testRunner{
+		started:          make(chan struct{}, 1),
+		release:          make(chan struct{}),
+		waitForCancel:    true,
 		interruptStarted: make(chan struct{}, 2),
 		interruptRelease: make(chan struct{}),
 	}
@@ -2601,6 +2648,22 @@ func TestDispatcherCommandQueueBlocksConversationUntilQueuedCommandsDrain(t *tes
 
 	firstResponder := &testResponder{}
 	secondResponder := &testResponder{}
+	if err := dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-active-command-queue",
+		ConversationKey: "private:e_3:0",
+		Kind:            MessageKindText,
+		Text:            "active turn",
+		Responder:       &testResponder{},
+	}); err != nil {
+		t.Fatalf("enqueue active message failed: %v", err)
+	}
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active turn")
+	}
+
 	if err := dispatcher.EnqueueCommand(context.Background(), CommandRequest{
 		ConversationKey: "private:e_3:0",
 		EventID:         "evt-stop-1",
@@ -2637,6 +2700,7 @@ func TestDispatcherCommandQueueBlocksConversationUntilQueuedCommandsDrain(t *tes
 	}
 
 	close(runner.interruptRelease)
+	close(runner.release)
 
 	if err := waitForResponderSend(firstResponder); err != nil {
 		t.Fatalf("timed out waiting for first command reply: %v", err)

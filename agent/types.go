@@ -119,11 +119,49 @@ func (m InboundMessage) MergedMessages() []InboundMessage {
 
 // ConversationState stores the mapping between a source conversation and a runner thread.
 type ConversationState struct {
-	Key               string    `json:"key"`
-	RunnerThreadID    string    `json:"runner_thread_id,omitempty"`
-	RunnerThreadDirty bool      `json:"runner_thread_dirty,omitempty"`
-	LastEventID       string    `json:"last_event_id,omitempty"`
-	LastActivityAt    time.Time `json:"last_activity_at"`
+	Key            string    `json:"key"`
+	RunnerThreadID string    `json:"runner_thread_id,omitempty"`
+	LastEventID    string    `json:"last_event_id,omitempty"`
+	LastActivityAt time.Time `json:"last_activity_at"`
+}
+
+// SessionMode describes one runner-backed mode exposed for the current conversation.
+type SessionMode struct {
+	ID    string
+	Label string
+}
+
+// SessionModes describes the runner-backed mode state for the current conversation.
+type SessionModes struct {
+	CurrentModeID  string
+	AvailableModes []SessionMode
+}
+
+// SessionConfigOptionChoice describes one allowed value for a session config option.
+type SessionConfigOptionChoice struct {
+	Name        string
+	Description string
+}
+
+// SessionConfigOption describes one runner-backed configuration option.
+type SessionConfigOption struct {
+	Name         string
+	CurrentValue string
+	Options      []SessionConfigOptionChoice
+}
+
+// SessionStatus describes the effective runner-backed session settings for the current conversation.
+type SessionStatus struct {
+	Agent              string
+	WorkingDirectories []string
+	Modes              SessionModes
+	ConfigOptions      []SessionConfigOption
+}
+
+// SessionOptions configures one runner-backed session instance.
+type SessionOptions struct {
+	ConversationKey string
+	ResumeSessionID string
 }
 
 // TurnRequest contains the state and new user input for one agent turn.

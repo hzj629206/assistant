@@ -3,10 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 )
-
-type turnRequestContextKey struct{}
 
 // Tool describes one server-side capability exposed through the prompt-based tool loop.
 type Tool interface {
@@ -17,71 +14,37 @@ type Tool interface {
 	Call(ctx context.Context, input json.RawMessage) (any, error)
 }
 
-// SessionMode describes one runner-backed mode exposed for the current conversation.
-type SessionMode struct {
-	ID    string
-	Label string
+// ScheduledTurn represents one session-managed turn that can be run or interrupted in either order.
+//
+// Contract:
+//   - Run and Interrupt must be safe to call in either order and concurrently.
+//   - Run should be able to return once Interrupt is called.
+//   - Run must not return until the turn has fully completed and all cleanup is done.
+//   - Interrupt must be safe to call repeatedly and concurrently.
+//   - If Interrupt is requested for the turn, Run must not return a
+//     successful TurnResult. It should return an interruption or cancellation error instead,
+//     even if the backing runner produced a partial or final reply.
+//   - Done must close at the same completion point as Run returns and is provided for asynchronous waiting.
+type ScheduledTurn interface {
+	Run(ctx context.Context) (TurnResult, error)
+	Interrupt(ctx context.Context) error
+	Done() <-chan struct{}
 }
-
-// SessionModes describes the runner-backed mode state for the current conversation.
-type SessionModes struct {
-	CurrentModeID  string
-	AvailableModes []SessionMode
-}
-
-// SessionConfigOptionChoice describes one allowed value for a session config option.
-type SessionConfigOptionChoice struct {
-	Name        string
-	Description string
-}
-
-// SessionConfigOption describes one runner-backed configuration option.
-type SessionConfigOption struct {
-	Name         string
-	CurrentValue string
-	Options      []SessionConfigOptionChoice
-}
-
-// SessionStatus describes the effective runner-backed session settings for the current conversation.
-type SessionStatus struct {
-	Agent              string
-	WorkingDirectories []string
-	Modes              SessionModes
-	ConfigOptions      []SessionConfigOption
-}
-
-// ErrSessionInterruptUnavailable indicates the runner currently cannot issue an interrupt for the active turn.
-var ErrSessionInterruptUnavailable = errors.New("session interrupt is unavailable")
-
-// ErrSessionBusy indicates the session already has an active turn in progress.
-var ErrSessionBusy = errors.New("session already has an active turn")
 
 // Session executes agent turns against one runner-managed agent thread/session.
 //
 // Contract:
-//   - RunTurn calls on the same session must not overlap. Implementations should reject
-//     overlapping calls with ErrSessionBusy.
-//   - RunTurn should be able to return once Interrupt or Close is called.
-//   - Interrupt must be safe to call repeatedly and concurrently. It should return nil when
-//     no turn is active, and return ErrSessionInterruptUnavailable when a turn is active but
-//     the backing runner cannot issue an interrupt.
-//   - If Interrupt is requested while RunTurn is active, that RunTurn call must not return a
-//     successful TurnResult. It should return an interruption or cancellation error instead,
-//     even if the backing runner produced a partial or final reply.
+//   - ScheduleTurn publishes one new active turn and returns its handle.
+//   - If a previous turn is still active, ScheduleTurn should interrupt it, wait for it
+//     to finish, and then publish the new turn.
 //   - Close must be safe to call repeatedly and concurrently.
-//   - Status must be safe to call concurrently with RunTurn, Interrupt, and Close.
+//   - Status must be safe to call concurrently with ScheduleTurn, ScheduledTurn.Run,
+//     ScheduledTurn.Interrupt, and Close.
 type Session interface {
 	ID() string
-	RunTurn(ctx context.Context, req TurnRequest) (TurnResult, error)
-	Interrupt(ctx context.Context) error
+	ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error)
 	Close() error
 	Status(ctx context.Context) (SessionStatus, error)
-}
-
-// SessionOptions configures one runner-backed session instance.
-type SessionOptions struct {
-	ConversationKey string
-	ResumeSessionID string
 }
 
 // Runner creates sessions that execute agent turns.
@@ -91,6 +54,8 @@ type Runner interface {
 	RegisterSystemPrompt(prompt string)
 	RegisterTools(tools ...Tool)
 }
+
+type turnRequestContextKey struct{}
 
 // ContextWithTurnRequest stores the current turn request in context for tool calls.
 func ContextWithTurnRequest(ctx context.Context, req TurnRequest) context.Context {
@@ -105,20 +70,4 @@ func TurnRequestFromContext(ctx context.Context) (TurnRequest, bool) {
 
 	req, ok := ctx.Value(turnRequestContextKey{}).(TurnRequest)
 	return req, ok
-}
-
-func joinRunnerContext(ctx context.Context, runnerCtx context.Context) (context.Context, func()) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if runnerCtx == nil {
-		return context.WithCancel(ctx)
-	}
-
-	joinedCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(runnerCtx, cancel)
-	return joinedCtx, func() {
-		stop()
-		cancel()
-	}
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -22,8 +23,11 @@ import (
 
 const testDefaultModel = "gpt-5.4"
 
+var testAppServerLogMu sync.Mutex
+
 type fakeAppServerThread struct {
-	id string
+	id            string
+	runStreamedFn func(context.Context, []appcodex.Input, *appcodex.TurnOptions) (appServerTurnStream, error)
 }
 
 type fakeAppServerTurnStream struct {
@@ -36,8 +40,39 @@ func (t *fakeAppServerThread) ID() string {
 	return t.id
 }
 
-func (t *fakeAppServerThread) RunStreamed(context.Context, []appcodex.Input, *appcodex.TurnOptions) (appServerTurnStream, error) {
+func (t *fakeAppServerThread) RunStreamed(ctx context.Context, inputs []appcodex.Input, options *appcodex.TurnOptions) (appServerTurnStream, error) {
+	if t.runStreamedFn != nil {
+		return t.runStreamedFn(ctx, inputs, options)
+	}
 	return nil, errors.New("unexpected streamed turn")
+}
+
+type blockingAppServerTurnStream struct {
+	turnID      string
+	interruptCh <-chan struct{}
+	interrupted bool
+}
+
+func (s *blockingAppServerTurnStream) Next(context.Context) (apprpc.Notification, error) {
+	if s.interrupted {
+		return apprpc.Notification{}, errors.New("stream exhausted")
+	}
+	<-s.interruptCh
+	s.interrupted = true
+	return apprpc.Notification{}, context.Canceled
+}
+
+func (s *blockingAppServerTurnStream) TurnID() string { return s.turnID }
+
+func (s *blockingAppServerTurnStream) Close() {}
+
+func mustMarshalJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	return data
 }
 
 func (s *fakeAppServerTurnStream) Next(context.Context) (apprpc.Notification, error) {
@@ -84,7 +119,15 @@ func driveTestAppServerInterrupt(session *appServerSession, active *appServerAct
 	}()
 }
 
+func markTestAppServerTurnRunning(active *appServerActiveTurn) *appServerActiveTurn {
+	active.runStarted = true
+	return active
+}
+
 func TestLogAppServerProcessExitIncludesSignal(t *testing.T) {
+	testAppServerLogMu.Lock()
+	defer testAppServerLogMu.Unlock()
+
 	var output bytes.Buffer
 	originalWriter := log.Writer()
 	originalFlags := log.Flags()
@@ -112,6 +155,9 @@ func TestLogAppServerProcessExitIncludesSignal(t *testing.T) {
 }
 
 func TestLogAppServerProcessExitIncludesExitCode(t *testing.T) {
+	testAppServerLogMu.Lock()
+	defer testAppServerLogMu.Unlock()
+
 	var output bytes.Buffer
 	originalWriter := log.Writer()
 	originalFlags := log.Flags()
@@ -300,7 +346,7 @@ func TestAppServerSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T)
 		threadID:        "thread-live",
 	}
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{
+	_, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-2",
 			RunnerThreadID: "thread-live",
@@ -311,7 +357,7 @@ func TestAppServerSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T)
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-1",
 			RunnerThreadID: "thread-other",
@@ -334,6 +380,7 @@ func TestAppServerRunTurnStartsThreadAndReturnsReply(t *testing.T) {
 			startedOptions = options
 			return thread, nil
 		},
+		interruptTurnFn: func(context.Context, string, string) error { return nil },
 		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, inputs []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 			receivedInputs = append(receivedInputs, inputs...)
 			return &appcodex.TurnResult{
@@ -379,6 +426,7 @@ func TestAppServerRunTurnPassesSystemPromptAsDeveloperInstructions(t *testing.T)
 			startedOptions = options
 			return thread, nil
 		},
+		interruptTurnFn: func(context.Context, string, string) error { return nil },
 		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, inputs []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 			receivedInputs = append(receivedInputs, inputs...)
 			return &appcodex.TurnResult{FinalResponse: "hello back"}, nil
@@ -416,6 +464,7 @@ func TestAppServerRunTurnResumesExistingThreadAndFallsBackToConversationID(t *te
 			resumedThreadID = options.ThreadID
 			return thread, nil
 		},
+		interruptTurnFn: func(context.Context, string, string) error { return nil },
 		runThreadTurnFn: func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 			return &appcodex.TurnResult{
 				FinalResponse: "welcome back",
@@ -459,6 +508,7 @@ func TestAppServerRunTurnDoesNotPassSystemPromptAsDeveloperInstructionsOnResume(
 			resumedOptions = options
 			return thread, nil
 		},
+		interruptTurnFn: func(context.Context, string, string) error { return nil },
 		runThreadTurnFn: func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 			return &appcodex.TurnResult{FinalResponse: "welcome back"}, nil
 		},
@@ -490,8 +540,9 @@ func TestAppServerRunTurnInvalidatesRecoverableRPCClientError(t *testing.T) {
 
 	clientClosed := false
 	runner := &AppServerRunner{
-		rpcClient: &apprpc.Client{},
-		closeFn:   func() error { clientClosed = true; return nil },
+		rpcClient:       &apprpc.Client{},
+		closeFn:         func() error { clientClosed = true; return nil },
+		interruptTurnFn: func(context.Context, string, string) error { return nil },
 		resumeThread: func(_ context.Context, _ appcodex.ThreadResumeOptions) (appServerThread, error) {
 			return nil, errors.New("connection closed")
 		},
@@ -564,6 +615,7 @@ func TestAppServerRunTurnUsesFrozenPromptSnapshotForNewThread(t *testing.T) {
 			runner.RegisterSystemPrompt("Prompt B")
 			return thread, nil
 		},
+		interruptTurnFn: func(context.Context, string, string) error { return nil },
 		runThreadTurnFn: func(_ context.Context, _ TurnRequest, _ appServerThread, _ []appcodex.Input, _ *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
 			return &appcodex.TurnResult{FinalResponse: "ok"}, nil
 		},
@@ -1277,6 +1329,7 @@ func TestAppServerInterruptUsesTurnInterruptAndWaitsForCompletion(t *testing.T) 
 	active := newTestAppServerActiveTurn(TurnRequest{
 		Conversation: ConversationState{Key: "conv-1"},
 	}, nil, "thread-1", "turn-1")
+	markTestAppServerTurnRunning(active)
 	var interruptedThreadID string
 	var interruptedTurnID string
 	interruptCalled := make(chan struct{})
@@ -1298,7 +1351,7 @@ func TestAppServerInterruptUsesTurnInterruptAndWaitsForCompletion(t *testing.T) 
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.Interrupt(context.Background())
+		done <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -1356,7 +1409,7 @@ func TestInterruptedAppServerTurnDoesNotReturnSuccessfulResult(t *testing.T) {
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-interrupt-success"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -1367,7 +1420,7 @@ func TestInterruptedAppServerTurnDoesNotReturnSuccessfulResult(t *testing.T) {
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	close(release)
@@ -1417,7 +1470,7 @@ func TestInterruptedAppServerTurnReturnsCanceledAfterActiveTurnClears(t *testing
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-interrupt-cleared"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -1428,7 +1481,7 @@ func TestInterruptedAppServerTurnReturnsCanceledAfterActiveTurnClears(t *testing
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	close(release)
@@ -1458,6 +1511,7 @@ func TestAppServerInterruptIsIdempotentForConcurrentCallers(t *testing.T) {
 	active := newTestAppServerActiveTurn(TurnRequest{
 		Conversation: ConversationState{Key: "conv-1"},
 	}, nil, "thread-1", "turn-1")
+	markTestAppServerTurnRunning(active)
 	interruptCalls := 0
 	interruptCalled := make(chan struct{}, 1)
 	runner := &AppServerRunner{
@@ -1484,10 +1538,10 @@ func TestAppServerInterruptIsIdempotentForConcurrentCallers(t *testing.T) {
 	doneA := make(chan error, 1)
 	doneB := make(chan error, 1)
 	go func() {
-		doneA <- session.Interrupt(context.Background())
+		doneA <- interruptSession(context.Background(), session)
 	}()
 	go func() {
-		doneB <- session.Interrupt(context.Background())
+		doneB <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -1529,7 +1583,7 @@ func TestAppServerInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
 		conversationKey: "conv-idle",
 	}
 
-	err := session.Interrupt(context.Background())
+	err := interruptSession(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected nil interrupt on idle session, got %v", err)
 	}
@@ -1543,15 +1597,112 @@ func TestAppServerInterruptReturnsUnavailableWhenInterruptFunctionMissing(t *tes
 		runner:          runner,
 		conversationKey: "conv-1",
 		threadID:        "thread-1",
-		activeTurn: newTestAppServerActiveTurn(TurnRequest{
+		activeTurn: markTestAppServerTurnRunning(newTestAppServerActiveTurn(TurnRequest{
 			Conversation: ConversationState{Key: "conv-1"},
-		}, nil, "thread-1", "turn-1"),
+		}, nil, "thread-1", "turn-1")),
 	}
 	driveTestAppServerInterrupt(session, session.activeTurn)
 
-	err := session.Interrupt(context.Background())
-	if !errors.Is(err, ErrSessionInterruptUnavailable) {
-		t.Fatalf("expected ErrSessionInterruptUnavailable, got %v", err)
+	err := interruptSession(context.Background(), session)
+	if err == nil || err.Error() != "app-server runner interrupt function is nil" {
+		t.Fatalf("unexpected interrupt error: %v", err)
+	}
+}
+
+func TestAppServerScheduledTurnInterruptBeforeRunCompletesImmediately(t *testing.T) {
+	t.Parallel()
+
+	session := &appServerSession{
+		runner:          &AppServerRunner{},
+		conversationKey: "conv-pre-run",
+		threadID:        "thread-pre-run",
+		thread:          &fakeAppServerThread{id: "thread-pre-run"},
+	}
+
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-pre-run"},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	if err = turn.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt failed: %v", err)
+	}
+
+	select {
+	case <-turn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("turn did not complete after interrupt-before-run")
+	}
+
+	_, err = turn.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	if active, ok := session.activeTurnSnapshot(); ok || active != nil {
+		t.Fatal("expected active turn to be released")
+	}
+}
+
+func TestAppServerScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	thread := &fakeAppServerThread{
+		id: "thread-concurrent-run",
+		runStreamedFn: func(ctx context.Context, _ []appcodex.Input, _ *appcodex.TurnOptions) (appServerTurnStream, error) {
+			close(started)
+			return &blockingAppServerTurnStream{
+				turnID:      "turn-concurrent-run",
+				interruptCh: release,
+			}, nil
+		},
+	}
+	session := &appServerSession{
+		runner:          &AppServerRunner{},
+		conversationKey: "conv-concurrent-run",
+		threadID:        "thread-concurrent-run",
+		thread:          thread,
+	}
+
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-concurrent-run"},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	firstRunDone := make(chan error, 1)
+	go func() {
+		_, runErr := turn.Run(context.Background())
+		firstRunDone <- runErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not start")
+	}
+
+	_, err = turn.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "turn run already started") {
+		t.Fatalf("expected concurrent Run error, got %v", err)
+	}
+
+	close(release)
+
+	select {
+	case err = <-firstRunDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected first Run to end with context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not complete")
 	}
 }
 
@@ -1561,6 +1712,7 @@ func TestAppServerSessionCloseInterruptsActiveTurnBeforeReturning(t *testing.T) 
 	active := newTestAppServerActiveTurn(TurnRequest{
 		Conversation: ConversationState{Key: "conv-close"},
 	}, nil, "thread-close", "turn-close")
+	markTestAppServerTurnRunning(active)
 
 	interruptCalled := make(chan struct{})
 	unsubscribeCalled := make(chan struct{})
@@ -1733,32 +1885,75 @@ func TestClosedAppServerSessionRejectsRunTurn(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{})
+	_, err := runSessionTurn(context.Background(), session, TurnRequest{})
 	if err == nil || err.Error() != "run app-server turn failed: session is closed" {
 		t.Fatalf("unexpected run turn error: %v", err)
 	}
 }
 
-func TestAppServerSessionRejectsConcurrentRunTurn(t *testing.T) {
+func TestAppServerSessionScheduleTurnInterruptsPreviousTurn(t *testing.T) {
 	t.Parallel()
 
 	started := make(chan struct{})
-	release := make(chan struct{})
+	interruptRequested := make(chan struct{})
 	session := &appServerSession{
 		runner:          &AppServerRunner{},
 		conversationKey: "conv-busy",
 		threadID:        "thread-busy",
-		thread:          &fakeAppServerThread{id: "thread-busy"},
+		thread: &fakeAppServerThread{
+			id: "thread-busy",
+			runStreamedFn: func(context.Context, []appcodex.Input, *appcodex.TurnOptions) (appServerTurnStream, error) {
+				select {
+				case <-started:
+				default:
+					close(started)
+					return &blockingAppServerTurnStream{
+						turnID:      "turn-1",
+						interruptCh: interruptRequested,
+					}, nil
+				}
+				return &fakeAppServerTurnStream{
+					notifications: []apprpc.Notification{
+						{
+							Method: "item/completed",
+							Params: mustMarshalJSON(t, map[string]any{
+								"item": map[string]any{
+									"type": "message",
+									"role": "assistant",
+									"content": []map[string]any{
+										{
+											"type": "output_text",
+											"text": "done",
+										},
+									},
+								},
+							}),
+						},
+						{
+							Method: "turn/completed",
+							Params: mustMarshalJSON(t, map[string]any{
+								"turnId": "turn-2",
+								"status": "completed",
+							}),
+						},
+					},
+					turnID: "turn-2",
+				}, nil
+			},
+		},
 	}
-	session.runner.runThreadTurnFn = func(context.Context, TurnRequest, appServerThread, []appcodex.Input, *appcodex.TurnOptions) (*appcodex.TurnResult, error) {
-		close(started)
-		<-release
-		return &appcodex.TurnResult{FinalResponse: "done"}, nil
+	session.runner.interruptTurnFn = func(context.Context, string, string) error {
+		select {
+		case <-interruptRequested:
+		default:
+			close(interruptRequested)
+		}
+		return nil
 	}
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-busy"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -1767,18 +1962,22 @@ func TestAppServerSessionRejectsConcurrentRunTurn(t *testing.T) {
 
 	<-started
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{
+	result, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conv-busy"},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
 	})
-	if !errors.Is(err, ErrSessionBusy) {
-		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
+	}
+	if result.RunnerThreadID != "thread-busy" {
+		t.Fatalf("unexpected second thread id: %q", result.RunnerThreadID)
 	}
 
-	close(release)
-
 	select {
-	case <-runErrCh:
+	case err = <-runErrCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected first run error: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("first run turn did not finish")
 	}

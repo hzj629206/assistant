@@ -932,10 +932,11 @@ func TestCodexStartSessionStartsThreadImmediately(t *testing.T) {
 		},
 	}
 
-	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conversation-1"})
 	if err != nil {
 		t.Fatalf("start session failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 	if got := startCalls; got != 1 {
 		t.Fatalf("unexpected start call count: %d", got)
 	}
@@ -958,13 +959,14 @@ func TestCodexStartSessionResumesThreadImmediately(t *testing.T) {
 		},
 	}
 
-	session, err := runner.StartSession(context.Background(), SessionOptions{
+	rawSession, err := runner.StartSession(context.Background(), SessionOptions{
 		ConversationKey: "conversation-1",
 		ResumeSessionID: "thread-existing",
 	})
 	if err != nil {
 		t.Fatalf("start session failed: %v", err)
 	}
+	session := mustCompatSession(t, rawSession)
 	if got := resumeCalls; got != 1 {
 		t.Fatalf("unexpected resume call count: %d", got)
 	}
@@ -985,7 +987,7 @@ func TestCodexSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T) {
 		threadID:        "thread-live",
 	}
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{
+	_, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-2",
 			RunnerThreadID: "thread-live",
@@ -996,7 +998,7 @@ func TestCodexSessionRunTurnReturnsErrorOnConversationMismatch(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = session.RunTurn(context.Background(), TurnRequest{
+	_, err = runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{
 			Key:            "conversation-1",
 			RunnerThreadID: "thread-other",
@@ -1504,7 +1506,7 @@ func TestInterruptWaitsForActiveCodexSessionTurn(t *testing.T) {
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-interrupt"},
 			Message: InboundMessage{
 				Kind: MessageKindText,
@@ -1518,7 +1520,7 @@ func TestInterruptWaitsForActiveCodexSessionTurn(t *testing.T) {
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	select {
@@ -1545,6 +1547,115 @@ func TestInterruptWaitsForActiveCodexSessionTurn(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("run turn did not finish")
+	}
+}
+
+func TestCodexScheduledTurnInterruptBeforeRunCompletesImmediately(t *testing.T) {
+	t.Parallel()
+
+	thread := &fakeCodexThread{id: "thread-pre-run"}
+	session := &codexRunnerSession{
+		runner:          &CodexRunner{},
+		conversationKey: "conv-pre-run",
+		threadID:        "thread-pre-run",
+		thread:          thread,
+	}
+
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-pre-run"},
+		Message: InboundMessage{
+			Kind: MessageKindText,
+			Text: "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	if err = turn.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt failed: %v", err)
+	}
+
+	select {
+	case <-turn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("turn did not complete after interrupt-before-run")
+	}
+
+	result, err := turn.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got result=%+v err=%v", result, err)
+	}
+
+	if active, ok := session.activeSessionTurn(); ok || active != nil {
+		t.Fatal("expected active turn to be released")
+	}
+}
+
+func TestCodexScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	thread := &fakeCodexThread{
+		id: "thread-concurrent-run",
+		runStreamedFn: func(_ codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
+			close(started)
+			events := make(chan codex.ThreadEvent)
+			done := make(chan error, 1)
+			go func() {
+				<-release
+				close(events)
+				done <- nil
+				close(done)
+			}()
+			return &codex.StreamedTurn{
+				Events: events,
+				Done:   done,
+			}, nil
+		},
+	}
+	session := &codexRunnerSession{
+		runner:          &CodexRunner{},
+		conversationKey: "conv-concurrent-run",
+		threadID:        "thread-concurrent-run",
+		thread:          thread,
+	}
+
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-concurrent-run"},
+		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
+	firstRunDone := make(chan error, 1)
+	go func() {
+		_, runErr := turn.Run(context.Background())
+		firstRunDone <- runErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not start")
+	}
+
+	_, err = turn.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "turn run already started") {
+		t.Fatalf("expected concurrent Run error, got %v", err)
+	}
+
+	close(release)
+
+	select {
+	case err = <-firstRunDone:
+		if err != nil {
+			t.Fatalf("first Run failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Run did not complete")
 	}
 }
 
@@ -1592,7 +1703,7 @@ func TestInterruptedCodexSessionTurnDoesNotReturnSuccessfulResult(t *testing.T) 
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-interrupt-success"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -1603,7 +1714,7 @@ func TestInterruptedCodexSessionTurnDoesNotReturnSuccessfulResult(t *testing.T) 
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- interruptSession(context.Background(), session)
 	}()
 
 	close(release)
@@ -1682,7 +1793,7 @@ func TestSessionCloseCancelsActiveCodexSessionTurn(t *testing.T) {
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-close"},
 			Message: InboundMessage{
 				Kind: MessageKindText,
@@ -1730,28 +1841,34 @@ func TestClosedCodexSessionRejectsRunTurn(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{})
+	_, err := runSessionTurn(context.Background(), session, TurnRequest{})
 	if err == nil || err.Error() != "run codex turn failed: session is closed" {
 		t.Fatalf("unexpected run turn error: %v", err)
 	}
 }
 
-func TestCodexSessionRejectsConcurrentRunTurn(t *testing.T) {
+func TestCodexSessionScheduleTurnInterruptsPreviousTurn(t *testing.T) {
 	t.Parallel()
 
 	started := make(chan struct{})
-	release := make(chan struct{})
+	runCount := 0
 	thread := &fakeCodexThread{
 		id: "thread-busy",
 		runStreamedFn: func(_ codex.Input, options codex.TurnOptions) (*codex.StreamedTurn, error) {
-			close(started)
+			runCount++
 			events := make(chan codex.ThreadEvent)
 			done := make(chan error, 1)
 			go func() {
-				<-options.Context.Done()
-				<-release
+				if runCount == 1 {
+					close(started)
+					<-options.Context.Done()
+					close(events)
+					done <- options.Context.Err()
+					close(done)
+					return
+				}
 				close(events)
-				done <- options.Context.Err()
+				done <- nil
 				close(done)
 			}()
 			return &codex.StreamedTurn{Events: events, Done: done}, nil
@@ -1766,7 +1883,7 @@ func TestCodexSessionRejectsConcurrentRunTurn(t *testing.T) {
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), TurnRequest{
+		_, err := runSessionTurn(context.Background(), session, TurnRequest{
 			Conversation: ConversationState{Key: "conv-busy"},
 			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 		})
@@ -1775,21 +1892,25 @@ func TestCodexSessionRejectsConcurrentRunTurn(t *testing.T) {
 
 	<-started
 
-	_, err := session.RunTurn(context.Background(), TurnRequest{
+	result, err := runSessionTurn(context.Background(), session, TurnRequest{
 		Conversation: ConversationState{Key: "conv-busy"},
 		Message:      InboundMessage{Kind: MessageKindText, Text: "again"},
 	})
-	if !errors.Is(err, ErrSessionBusy) {
-		t.Fatalf("expected ErrSessionBusy, got %v", err)
+	if err != nil {
+		t.Fatalf("second RunTurn failed: %v", err)
 	}
-
-	close(release)
+	if result.RunnerThreadID != "thread-busy" {
+		t.Fatalf("unexpected second thread id: %q", result.RunnerThreadID)
+	}
 	if err = session.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 
 	select {
-	case <-runErrCh:
+	case err = <-runErrCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected first run error: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("first run turn did not finish")
 	}

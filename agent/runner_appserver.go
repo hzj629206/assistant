@@ -62,11 +62,6 @@ type appServerTurnStream interface {
 	Close()
 }
 
-type appServerTurnContext struct {
-	prompts []string
-	tools   []Tool
-}
-
 // SandboxPolicy is the app-server sandbox policy payload used by this project.
 type SandboxPolicy map[string]any
 
@@ -209,6 +204,9 @@ func (r *AppServerRunner) StartSession(ctx context.Context, options SessionOptio
 	if err != nil {
 		return nil, fmt.Errorf("start app-server session failed: %w", err)
 	}
+	if err = r.ensureInterruptSupport(); err != nil {
+		return nil, fmt.Errorf("start app-server session failed: %w", err)
+	}
 
 	conversationKey := strings.TrimSpace(options.ConversationKey)
 	sessionID := strings.TrimSpace(options.ResumeSessionID)
@@ -240,6 +238,19 @@ func (r *AppServerRunner) StartSession(ctx context.Context, options SessionOptio
 		threadID,
 	)
 	return session, nil
+}
+
+func (r *AppServerRunner) ensureInterruptSupport() error {
+	if r == nil {
+		return errors.New("app-server runner is nil")
+	}
+	r.mu.RLock()
+	interruptTurnFn := r.interruptTurnFn
+	r.mu.RUnlock()
+	if interruptTurnFn == nil {
+		return errors.New("app-server runner interrupt function is nil")
+	}
+	return nil
 }
 
 func defaultAppServerConfig(config map[string]any) map[string]any {
