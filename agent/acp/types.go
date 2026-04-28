@@ -10,16 +10,18 @@ import (
 //
 // ScheduleTurn should preempt any previous active turn before publishing the new turn.
 type Session interface {
-	ScheduleTurn(ctx context.Context, blocks []ContentBlock) (ScheduledTurn, error)
-	Interrupt(ctx context.Context) error
+	ScheduleTurn(ctx context.Context, blocks []ContentBlock) (Turn, error)
 	SessionID() string
 	Status() SessionMetadata
 	Capabilities() AgentCapabilities
 	Close() error
 }
 
-// ScheduledTurn represents one ACP session turn that can be run or interrupted in either order.
-type ScheduledTurn interface {
+// Turn represents one ACP session turn that can be run or interrupted in either order.
+//
+// Interrupt must not return until the active turn has completed.
+// Done must close at the same completion point as Run returns and Interrupt returns.
+type Turn interface {
 	Run(ctx context.Context) (TurnResult, error)
 	Interrupt(ctx context.Context) error
 	Done() <-chan struct{}

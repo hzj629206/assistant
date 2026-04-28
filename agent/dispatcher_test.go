@@ -123,7 +123,7 @@ func interruptSession(ctx context.Context, session Session) error {
 
 func (s *testSession) ID() string { return s.sessionID }
 
-func (s *testSession) ScheduleTurn(_ context.Context, req TurnRequest) (ScheduledTurn, error) {
+func (s *testSession) ScheduleTurn(_ context.Context, req TurnRequest) (Turn, error) {
 	req.Conversation.Key = s.conversationKey
 	req.Conversation.RunnerThreadID = s.sessionID
 	return &testScheduledTurn{

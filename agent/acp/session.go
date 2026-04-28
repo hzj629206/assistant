@@ -332,7 +332,7 @@ func (s *processSession) newSession(ctx context.Context, workDir string, mcpServ
 }
 
 //nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
-func (s *processSession) ScheduleTurn(ctx context.Context, blocks []ContentBlock) (ScheduledTurn, error) {
+func (s *processSession) ScheduleTurn(ctx context.Context, blocks []ContentBlock) (Turn, error) {
 	sessionID := s.SessionID()
 	if sessionID == "" {
 		return nil, errors.New("acp session id is empty")
@@ -363,14 +363,6 @@ func (s *processSession) ScheduleTurn(ctx context.Context, blocks []ContentBlock
 		activeTurn: activeTurn,
 		blocks:     copied,
 	}, nil
-}
-
-func (s *processSession) RunTurn(ctx context.Context, blocks []ContentBlock) (TurnResult, error) {
-	turn, err := s.ScheduleTurn(ctx, blocks)
-	if err != nil {
-		return TurnResult{}, err
-	}
-	return turn.Run(ctx)
 }
 
 func (t *scheduledTurn) Run(ctx context.Context) (TurnResult, error) {
@@ -468,42 +460,6 @@ func (t *scheduledTurn) Done() <-chan struct{} {
 		return nil
 	}
 	return t.activeTurn.done
-}
-
-//nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
-func (s *processSession) Interrupt(ctx context.Context) error {
-	activeTurn := s.currentActiveTurn()
-	if activeTurn == nil {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	done := s.signalTurnInterrupt(activeTurn)
-	if done != nil {
-		select {
-		case <-done:
-		case <-activeTurn.done:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	s.turnMu.Lock()
-	interruptErr := activeTurn.interruptErr
-	s.turnMu.Unlock()
-	if interruptErr != nil {
-		return interruptErr
-	}
-
-	select {
-	case <-activeTurn.done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func (s *processSession) Capabilities() AgentCapabilities {

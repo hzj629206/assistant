@@ -49,7 +49,7 @@ func (s *codexRunnerSession) interruptCurrentTurn(ctx context.Context) error {
 }
 
 //nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
-func (s *codexRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error) {
+func (s *codexRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (Turn, error) {
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run codex turn failed: session is nil")
 	}

@@ -28,7 +28,7 @@ type acpRunnerSession struct {
 type acpScheduledTurn struct {
 	session     *acpRunnerSession
 	req         TurnRequest
-	turn        acp.ScheduledTurn
+	turn        acp.Turn
 	interrupted atomic.Bool
 }
 
@@ -49,14 +49,10 @@ func (s *acpRunnerSession) interruptCurrentTurn(ctx context.Context) error {
 	if currentTurn != nil {
 		return currentTurn.Interrupt(ctx)
 	}
-	session, _, err := s.currentSessionForInterrupt()
-	if err != nil || session == nil {
-		return err
-	}
-	return mapACPSessionError(session.Interrupt(ctx))
+	return nil
 }
 
-func (s *acpRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error) {
+func (s *acpRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (Turn, error) {
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run acp turn failed: session is nil")
 	}
@@ -143,7 +139,16 @@ func (t *acpScheduledTurn) Interrupt(ctx context.Context) error {
 	if err != nil {
 		return mapACPSessionError(err)
 	}
-	return nil
+	done := t.turn.Done()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (t *acpScheduledTurn) Done() <-chan struct{} {
@@ -175,7 +180,7 @@ func (s *acpRunnerSession) Close() error {
 	return session.Close()
 }
 
-func (s *acpRunnerSession) scheduleACPturn(ctx context.Context, req TurnRequest) (acp.ScheduledTurn, error) {
+func (s *acpRunnerSession) scheduleACPturn(ctx context.Context, req TurnRequest) (acp.Turn, error) {
 	if s == nil {
 		return nil, errors.New("acp session is nil")
 	}
@@ -262,18 +267,6 @@ func (s *acpRunnerSession) currentSessionState() (acp.Session, string, error) {
 		return nil, "", errors.New("session is nil")
 	}
 	return s.session, s.token, nil
-}
-
-func (s *acpRunnerSession) currentSessionForInterrupt() (acp.Session, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, "", nil
-	}
-	if s.session == nil {
-		return nil, "", nil
-	}
-	return s.session, s.currentSessionIDLocked(), nil
 }
 
 func (s *acpRunnerSession) closeState() (acp.Session, string) {

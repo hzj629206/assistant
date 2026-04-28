@@ -67,10 +67,14 @@ func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	turn, err := session.ScheduleTurn(ctx, []ContentBlock{{"type": "text", "text": "hello"}})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(ctx, []ContentBlock{{"type": "text", "text": "hello"}})
-		done <- err
+		_, runErr := turn.Run(ctx)
+		done <- runErr
 	}()
 
 	deadline := time.Now().Add(time.Second)
@@ -86,10 +90,10 @@ func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("expected RunTurn to fail after cancellation")
+			t.Fatal("expected Run to fail after cancellation")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("RunTurn did not return after cancellation")
+		t.Fatal("Run did not return after cancellation")
 	}
 
 	deadline = time.Now().Add(time.Second)
@@ -102,15 +106,6 @@ func TestProcessSessionRunTurnSendsSessionCancelOnContextCancel(t *testing.T) {
 			t.Fatalf("expected session/prompt and session/cancel writes, got %q", written)
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func TestProcessSessionInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
-	session := &processSession{}
-
-	err := session.Interrupt(context.Background())
-	if err != nil {
-		t.Fatalf("expected nil interrupt without active turn, got %v", err)
 	}
 }
 
@@ -211,10 +206,12 @@ func TestProcessSessionInterruptWaitsForTurnCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("startActiveTurn failed: %v", err)
 	}
+	activeTurn.runStarted = true
 
 	interruptDone := make(chan error, 1)
+	turn := &scheduledTurn{session: session, activeTurn: activeTurn}
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- turn.Interrupt(context.Background())
 	}()
 
 	select {
@@ -252,10 +249,15 @@ func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes
 	defer cancel()
 	go session.transport.readLoop(ctx)
 
+	turn, err := session.ScheduleTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := session.RunTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
-		runErrCh <- err
+		_, runErr := turn.Run(context.Background())
+		runErrCh <- runErr
 	}()
 
 	deadline := time.Now().Add(time.Second)
@@ -268,7 +270,7 @@ func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- session.Interrupt(context.Background())
+		interruptDone <- turn.Interrupt(context.Background())
 	}()
 
 	for !strings.Contains(output.String(), "\"method\":\"session/cancel\"") {
@@ -561,9 +563,13 @@ func TestProcessSessionRunTurnPreservesLeadingAndTrailingWhitespace(t *testing.T
 		_ = writer.Close()
 	}()
 
-	result, err := session.RunTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
+	turn, err := session.ScheduleTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
 	if err != nil {
-		t.Fatalf("RunTurn failed: %v", err)
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+	result, err := turn.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
 	}
 	if result.ReplyText != "\n  reply with preserved whitespace  \n" {
 		t.Fatalf("unexpected reply text: %q", result.ReplyText)
@@ -587,9 +593,13 @@ func TestProcessSessionRunTurnReturnsStructuredResult(t *testing.T) {
 		_ = writer.Close()
 	}()
 
-	result, err := session.RunTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
+	turn, err := session.ScheduleTurn(context.Background(), []ContentBlock{{"type": "text", "text": "hello"}})
 	if err != nil {
-		t.Fatalf("RunTurn failed: %v", err)
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+	result, err := turn.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
 	}
 	if result.SessionID != "session-result" {
 		t.Fatalf("unexpected session id: %q", result.SessionID)

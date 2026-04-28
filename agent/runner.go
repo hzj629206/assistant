@@ -5,27 +5,20 @@ import (
 	"encoding/json"
 )
 
-// Tool describes one server-side capability exposed through the prompt-based tool loop.
-type Tool interface {
-	Name() string
-	Description() string
-	InputSchema() any
-	OutputSchema() any
-	Call(ctx context.Context, input json.RawMessage) (any, error)
-}
-
-// ScheduledTurn represents one session-managed turn that can be run or interrupted in either order.
+// Turn represents one session-managed turn that can be run or interrupted in either order.
 //
 // Contract:
 //   - Run and Interrupt must be safe to call in either order and concurrently.
 //   - Run should be able to return once Interrupt is called.
 //   - Run must not return until the turn has fully completed and all cleanup is done.
 //   - Interrupt must be safe to call repeatedly and concurrently.
+//   - Interrupt must not return until the active turn has fully completed and all cleanup is done.
 //   - If Interrupt is requested for the turn, Run must not return a
 //     successful TurnResult. It should return an interruption or cancellation error instead,
 //     even if the backing runner produced a partial or final reply.
-//   - Done must close at the same completion point as Run returns and is provided for asynchronous waiting.
-type ScheduledTurn interface {
+//   - Done must close at the same completion point as Run returns and Interrupt returns,
+//     and is provided for asynchronous waiting.
+type Turn interface {
 	Run(ctx context.Context) (TurnResult, error)
 	Interrupt(ctx context.Context) error
 	Done() <-chan struct{}
@@ -38,11 +31,11 @@ type ScheduledTurn interface {
 //   - If a previous turn is still active, ScheduleTurn should interrupt it, wait for it
 //     to finish, and then publish the new turn.
 //   - Close must be safe to call repeatedly and concurrently.
-//   - Status must be safe to call concurrently with ScheduleTurn, ScheduledTurn.Run,
-//     ScheduledTurn.Interrupt, and Close.
+//   - Status must be safe to call concurrently with ScheduleTurn, Turn.Run,
+//     Turn.Interrupt, and Close.
 type Session interface {
 	ID() string
-	ScheduleTurn(ctx context.Context, req TurnRequest) (ScheduledTurn, error)
+	ScheduleTurn(ctx context.Context, req TurnRequest) (Turn, error)
 	Close() error
 	Status(ctx context.Context) (SessionStatus, error)
 }
@@ -53,6 +46,15 @@ type Runner interface {
 	Close() error
 	RegisterSystemPrompt(prompt string)
 	RegisterTools(tools ...Tool)
+}
+
+// Tool describes one server-side capability exposed through the prompt-based tool loop.
+type Tool interface {
+	Name() string
+	Description() string
+	InputSchema() any
+	OutputSchema() any
+	Call(ctx context.Context, input json.RawMessage) (any, error)
 }
 
 type turnRequestContextKey struct{}

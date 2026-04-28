@@ -4832,7 +4832,7 @@ type runnerScheduledTurn struct {
 
 func (s *runnerSession) ID() string { return "" }
 
-func (s *runnerSession) ScheduleTurn(_ context.Context, req agent.TurnRequest) (agent.ScheduledTurn, error) {
+func (s *runnerSession) ScheduleTurn(_ context.Context, req agent.TurnRequest) (agent.Turn, error) {
 	return &runnerScheduledTurn{
 		run:       s.run,
 		interrupt: s.interrupt,

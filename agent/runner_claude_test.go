@@ -735,7 +735,7 @@ func TestClaudeScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T)
 
 	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{Key: "conversation-concurrent-run"},
-		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("ScheduleTurn failed: %v", err)
@@ -1096,13 +1096,13 @@ func (t *fakeClaudeScheduledTurn) Run(ctx context.Context) (*claudecode.ClaudeRe
 }
 
 func (t *fakeClaudeScheduledTurn) Interrupt(ctx context.Context) error {
-	return t.session.Interrupt(ctx)
+	return t.session.interruptTurn(ctx)
 }
 
 func (t *fakeClaudeScheduledTurn) Done() <-chan struct{} { return t.done }
 
 //nolint:contextcheck // Test fake uses the caller context only to wait for preemption of the previous turn.
-func (s *fakeClaudePersistentSession) ScheduleTurn(ctx context.Context, blocks []map[string]any) (claudecode.ScheduledTurn, error) {
+func (s *fakeClaudePersistentSession) ScheduleTurn(ctx context.Context, blocks []map[string]any) (claudecode.Turn, error) {
 	s.mu.Lock()
 	currentTurn := s.currentTurn
 	s.mu.Unlock()
@@ -1142,7 +1142,7 @@ func (s *fakeClaudePersistentSession) SessionID() string {
 	return s.currentSessionID
 }
 
-func (s *fakeClaudePersistentSession) Interrupt(ctx context.Context) error {
+func (s *fakeClaudePersistentSession) interruptTurn(ctx context.Context) error {
 	if s.interruptCurrentTurn == nil {
 		return nil
 	}

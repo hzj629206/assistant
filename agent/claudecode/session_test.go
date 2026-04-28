@@ -274,8 +274,9 @@ func TestPersistentProcessSessionInterruptWritesInterruptRequest(t *testing.T) {
 
 	done := make(chan error, 1)
 	go session.watchTurnInterrupt(context.Background(), turn)
+	scheduled := &scheduledTurn{session: session, turn: turn}
 	go func() {
-		done <- session.Interrupt(context.Background())
+		done <- scheduled.Interrupt(context.Background())
 	}()
 
 	select {
@@ -335,11 +336,12 @@ func TestPersistentProcessSessionInterruptIsIdempotentForConcurrentCallers(t *te
 	doneA := make(chan error, 1)
 	doneB := make(chan error, 1)
 	go session.watchTurnInterrupt(context.Background(), turn)
+	scheduled := &scheduledTurn{session: session, turn: turn}
 	go func() {
-		doneA <- session.Interrupt(context.Background())
+		doneA <- scheduled.Interrupt(context.Background())
 	}()
 	go func() {
-		doneB <- session.Interrupt(context.Background())
+		doneB <- scheduled.Interrupt(context.Background())
 	}()
 
 	select {

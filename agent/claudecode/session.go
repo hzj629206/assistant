@@ -57,14 +57,16 @@ type SessionOptions struct {
 //
 // ScheduleTurn should preempt any previous active turn before publishing the new turn.
 type Session interface {
-	ScheduleTurn(ctx context.Context, blocks []map[string]any) (ScheduledTurn, error)
-	Interrupt(ctx context.Context) error
+	ScheduleTurn(ctx context.Context, blocks []map[string]any) (Turn, error)
 	SessionID() string
 	Close() error
 }
 
-// ScheduledTurn represents one Claude session turn that can be run or interrupted in either order.
-type ScheduledTurn interface {
+// Turn represents one Claude session turn that can be run or interrupted in either order.
+//
+// Interrupt must not return until the active turn has completed.
+// Done must close at the same completion point as Run returns and Interrupt returns.
+type Turn interface {
 	Run(ctx context.Context) (*ClaudeResult, error)
 	Interrupt(ctx context.Context) error
 	Done() <-chan struct{}
@@ -160,16 +162,7 @@ func (s *persistentProcessSession) SessionID() string {
 	return s.sessionID
 }
 
-// RunTurn runs one stream-json turn against the persistent Claude session.
-func (s *persistentProcessSession) RunTurn(ctx context.Context, blocks []map[string]any) (*ClaudeResult, error) {
-	turn, err := s.ScheduleTurn(ctx, blocks)
-	if err != nil {
-		return nil, err
-	}
-	return turn.Run(ctx)
-}
-
-func (s *persistentProcessSession) ScheduleTurn(ctx context.Context, blocks []map[string]any) (ScheduledTurn, error) {
+func (s *persistentProcessSession) ScheduleTurn(ctx context.Context, blocks []map[string]any) (Turn, error) {
 	inputBytes, err := MarshalStreamJSONUserInput(blocks)
 	if err != nil {
 		return nil, err
@@ -178,7 +171,7 @@ func (s *persistentProcessSession) ScheduleTurn(ctx context.Context, blocks []ma
 }
 
 //nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
-func (s *persistentProcessSession) scheduleTurnWithInput(ctx context.Context, inputBytes []byte) (ScheduledTurn, error) {
+func (s *persistentProcessSession) scheduleTurnWithInput(ctx context.Context, inputBytes []byte) (Turn, error) {
 	if s == nil {
 		return nil, errors.New("claude session is nil")
 	}
@@ -220,7 +213,7 @@ func (s *persistentProcessSession) ensureStarted(ctx context.Context) error {
 	defer s.stateMu.Unlock()
 
 	if s.closed {
-		return errors.New("claude session is closed")
+		return ErrSessionClosed
 	}
 	if s.waitErr != nil {
 		return s.waitErr
@@ -377,7 +370,7 @@ func (t *scheduledTurn) Interrupt(ctx context.Context) error {
 	s.stateMu.Lock()
 	if s.closed {
 		s.stateMu.Unlock()
-		return errors.New("claude session is closed")
+		return ErrSessionClosed
 	}
 	if s.waitErr != nil {
 		waitErr := s.waitErr
@@ -408,52 +401,11 @@ func (t *scheduledTurn) Done() <-chan struct{} {
 	return t.turn.done
 }
 
-//nolint:contextcheck // Interrupt accepts a caller-owned context for cancellation while waiting on the active turn.
-func (s *persistentProcessSession) Interrupt(ctx context.Context) error {
-	if s == nil {
-		return errors.New("claude session is nil")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	s.stateMu.Lock()
-	if s.closed {
-		s.stateMu.Unlock()
-		return errors.New("claude session is closed")
-	}
-	if s.waitErr != nil {
-		waitErr := s.waitErr
-		s.stateMu.Unlock()
-		return waitErr
-	}
-	turn := s.currentTurn
-	if turn == nil {
-		s.stateMu.Unlock()
-		return nil
-	}
-	interruptDone := s.signalTurnInterruptLocked(turn)
-	done := turn.done
-	s.stateMu.Unlock()
-
-	select {
-	case <-interruptDone:
-		s.stateMu.Lock()
-		err := turn.interruptErr
-		s.stateMu.Unlock()
-		return err
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 func (s *persistentProcessSession) setCurrentTurn(turn *turnState) (*turnState, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.closed {
-		return nil, errors.New("claude session is closed")
+		return nil, ErrSessionClosed
 	}
 	if s.waitErr != nil {
 		return nil, s.waitErr

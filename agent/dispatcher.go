@@ -91,7 +91,7 @@ type activeConversationWork struct {
 	conversation ConversationState
 	mu           sync.Mutex
 	session      Session
-	turn         ScheduledTurn
+	turn         Turn
 	turnDone     chan struct{}
 	sessionOnce  sync.Once
 	done         chan struct{}
@@ -1104,7 +1104,7 @@ func (d *Dispatcher) releaseClaimedConversationWork(conversationKey string) func
 	}
 }
 
-func (d *Dispatcher) finishActiveConversationWork(active *activeConversationWork, session Session, turn ScheduledTurn) {
+func (d *Dispatcher) finishActiveConversationWork(active *activeConversationWork, session Session, turn Turn) {
 	if d == nil || active == nil {
 		return
 	}

@@ -43,13 +43,13 @@ func (t *fakeACPScheduledTurn) Run(ctx context.Context) (acp.TurnResult, error) 
 }
 
 func (t *fakeACPScheduledTurn) Interrupt(ctx context.Context) error {
-	return t.session.Interrupt(ctx)
+	return t.session.interruptTurn(ctx)
 }
 
 func (t *fakeACPScheduledTurn) Done() <-chan struct{} { return t.done }
 
 //nolint:contextcheck // Test fake uses the caller context only to wait for preemption of the previous turn.
-func (s *fakeACPSession) ScheduleTurn(ctx context.Context, blocks []acp.ContentBlock) (acp.ScheduledTurn, error) {
+func (s *fakeACPSession) ScheduleTurn(ctx context.Context, blocks []acp.ContentBlock) (acp.Turn, error) {
 	s.mu.Lock()
 	currentTurn := s.currentTurn
 	s.mu.Unlock()
@@ -106,7 +106,7 @@ func (s *fakeACPSession) Capabilities() acp.AgentCapabilities {
 	return s.caps
 }
 
-func (s *fakeACPSession) Interrupt(ctx context.Context) error {
+func (s *fakeACPSession) interruptTurn(ctx context.Context) error {
 	if s.interrupt != nil {
 		return s.interrupt(ctx)
 	}
