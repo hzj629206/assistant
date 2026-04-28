@@ -15,6 +15,8 @@ type testRunner struct {
 	mu                sync.Mutex
 	startSessionCalls int
 	startSessionID    string
+	startSessionStart chan struct{}
+	startSessionWait  chan struct{}
 	calls             int
 	lastReq           TurnRequest
 	activeCancel      context.CancelFunc
@@ -91,7 +93,21 @@ func (s *testSession) Close() error {
 	return s.runner.Close()
 }
 
-func (r *testRunner) StartSession(_ context.Context, options SessionOptions) (Session, error) {
+func (r *testRunner) StartSession(ctx context.Context, options SessionOptions) (Session, error) {
+	if r.startSessionStart != nil {
+		select {
+		case r.startSessionStart <- struct{}{}:
+		default:
+		}
+	}
+	if r.startSessionWait != nil {
+		select {
+		case <-r.startSessionWait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	r.mu.Lock()
 	r.startSessionCalls++
 	sessionID := strings.TrimSpace(options.ResumeSessionID)
@@ -1776,6 +1792,88 @@ func TestDispatcherHandleStopCancelsTurnAndRepliesWithDiscardedMessages(t *testi
 	}
 }
 
+func TestDispatcherHandleStopCancelsTurnWhileSessionStarting(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{
+		startSessionStart: make(chan struct{}, 1),
+		startSessionWait:  make(chan struct{}),
+		started:           make(chan struct{}, 1),
+		canceled:          make(chan struct{}, 1),
+		waitForCancel:     true,
+	}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       NewConversationStore(cache.NewMemoryStorage()),
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	activeResponder := &testResponder{}
+	if err := dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-active-starting",
+		ConversationKey: "private:e_1:stop-starting",
+		Kind:            MessageKindText,
+		Text:            "turn is still starting",
+		Responder:       activeResponder,
+	}); err != nil {
+		t.Fatalf("enqueue active message failed: %v", err)
+	}
+
+	select {
+	case <-runner.startSessionStart:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for start session")
+	}
+
+	commandResponder := &testResponder{}
+	if err := dispatcher.EnqueueCommand(context.Background(), CommandRequest{
+		ConversationKey: "private:e_1:stop-starting",
+		EventID:         "evt-stop-starting",
+		Responder:       commandResponder,
+		Command:         SlashCommand{Name: "stop", Raw: "/stop"},
+	}); err != nil {
+		t.Fatalf("enqueue command failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if got := commandResponder.SendCalls(); got != 0 {
+		t.Fatalf("stop reply sent before session became ready, got %d", got)
+	}
+
+	close(runner.startSessionWait)
+
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for turn start after session became ready")
+	}
+
+	select {
+	case <-runner.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for runner cancellation")
+	}
+
+	if err := waitForResponderSend(commandResponder); err != nil {
+		t.Fatalf("timed out waiting for command reply: %v", err)
+	}
+
+	reply := commandResponder.Reply().text
+	if !strings.Contains(reply, "_Conversation interrupted._") {
+		t.Fatalf("unexpected command reply: %q", reply)
+	}
+	if got := runner.Calls(); got != 1 {
+		t.Fatalf("expected one turn run after session became ready, got %d", got)
+	}
+	if got := runner.InterruptCalls(); got != 1 {
+		t.Fatalf("expected one session interrupt after session became ready, got %d", got)
+	}
+	if got := activeResponder.SendCalls(); got != 0 {
+		t.Fatalf("expected no reply from canceled turn, got %d", got)
+	}
+}
+
 func TestDispatcherHandleStopSuppressesReplyFromInterruptedTurn(t *testing.T) {
 	t.Parallel()
 
@@ -2160,6 +2258,43 @@ func TestDispatcherHelpDoesNotInterruptRunningTurn(t *testing.T) {
 	}
 
 	close(runner.release)
+}
+
+func TestDispatcherStopCommandDoesNotWaitForConversationLock(t *testing.T) {
+	t.Parallel()
+
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:  NewConversationStore(cache.NewMemoryStorage()),
+		Runner: &testRunner{},
+	})
+
+	unlock := dispatcher.locks.Lock("private:e_1:stop-unlocked")
+	defer unlock()
+
+	replyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		reply, err := dispatcher.executeBlockingCommand(context.Background(), CommandRequest{
+			ConversationKey: "private:e_1:stop-unlocked",
+			Command:         SlashCommand{Name: "stop", Raw: "/stop"},
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		replyCh <- reply
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("stop command failed: %v", err)
+	case reply := <-replyCh:
+		if !strings.Contains(reply, "_Conversation is not running._") {
+			t.Fatalf("unexpected stop reply: %q", reply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stop command waited on conversation lock")
+	}
 }
 
 func TestDispatcherStatusDoesNotDropInboundMessages(t *testing.T) {

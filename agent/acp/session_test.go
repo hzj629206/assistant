@@ -373,8 +373,9 @@ func TestProcessSessionInterruptCancelsPendingPermissionRequests(t *testing.T) {
 	if !strings.Contains(written, `"method":"session/cancel"`) {
 		t.Fatalf("expected session/cancel write, got %q", written)
 	}
+	//nolint:misspell // "cancelled" is the protocol's literal outcome value.
 	if !strings.Contains(written, `"id":7`) || !strings.Contains(written, `"outcome":"cancelled"`) {
-		t.Fatalf("expected cancelled permission response, got %q", written)
+		t.Fatalf("expected canceled permission response, got %q", written)
 	}
 }
 

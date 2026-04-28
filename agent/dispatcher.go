@@ -89,7 +89,10 @@ type commandConversation struct {
 type activeConversationTurn struct {
 	id           uint64
 	conversation ConversationState
+	mu           sync.Mutex
 	session      Session
+	sessionDone  chan struct{}
+	sessionOnce  sync.Once
 	done         chan struct{}
 	interrupted  atomic.Bool
 }
@@ -527,6 +530,9 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		state = newConversationState(message)
 		log.Printf("dispatcher created conversation state: conversation=%s event_id=%s", message.ConversationKey, message.ID)
 	}
+	activeTurn, releaseTurn := d.startTurnContext(state)
+	defer releaseTurn()
+
 	if isNewConversation && message.LoadInitialContext != nil {
 		initialContext, loadErr := message.LoadInitialContext(ctx)
 		if loadErr != nil {
@@ -566,9 +572,8 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		return fmt.Errorf("start session failed: %w", err)
 	}
 	defer releaseSession()
+	d.finishTurnSessionLoad(activeTurn, session)
 	d.persistConversationSessionID(ctx, state, session)
-	activeTurn, releaseTurn := d.startTurnContext(state, session)
-	defer releaseTurn()
 
 	result, err := session.RunTurn(ctx, TurnRequest{
 		Conversation: state,
@@ -998,11 +1003,7 @@ func (d *Dispatcher) dropQueuedCommands(ctx context.Context) (int, error) {
 	return len(dropped), err
 }
 
-func (d *Dispatcher) startTurnContext(conversation ConversationState, session Session) (*activeConversationTurn, func()) {
-	if session == nil {
-		return nil, func() {}
-	}
-
+func (d *Dispatcher) startTurnContext(conversation ConversationState) (*activeConversationTurn, func()) {
 	d.activeTurnsMu.Lock()
 	d.activeTurnSeq++
 	turnID := d.activeTurnSeq
@@ -1010,7 +1011,7 @@ func (d *Dispatcher) startTurnContext(conversation ConversationState, session Se
 	active := &activeConversationTurn{
 		id:           turnID,
 		conversation: conversation,
-		session:      session,
+		sessionDone:  make(chan struct{}),
 		done:         make(chan struct{}),
 	}
 	if conversationKey != "" {
@@ -1027,21 +1028,25 @@ func (d *Dispatcher) startTurnContext(conversation ConversationState, session Se
 			}
 		}
 		d.activeTurnsMu.Unlock()
+		d.finishTurnSessionLoad(active, nil)
 		close(active.done)
 	}
 }
 
-func (d *Dispatcher) markConversationTurnInterrupted(conversationKey string) {
-	if d == nil || strings.TrimSpace(conversationKey) == "" {
+func (d *Dispatcher) finishTurnSessionLoad(active *activeConversationTurn, session Session) {
+	if d == nil || active == nil {
 		return
 	}
 
-	d.activeTurnsMu.Lock()
-	active := d.activeByConversation[conversationKey]
-	d.activeTurnsMu.Unlock()
-	if active != nil {
-		active.interrupted.Store(true)
+	active.mu.Lock()
+	defer active.mu.Unlock()
+
+	if session != nil {
+		active.session = session
 	}
+	active.sessionOnce.Do(func() {
+		close(active.sessionDone)
+	})
 }
 
 func (d *Dispatcher) interruptActiveTurns(ctx context.Context, timeout time.Duration) {
@@ -1057,14 +1062,31 @@ func (d *Dispatcher) interruptActiveTurns(ctx context.Context, timeout time.Dura
 	for _, active := range activeTurns {
 		wg.Go(func() {
 			active.interrupted.Store(true)
+			active.mu.Lock()
+			session := active.session
+			sessionDone := active.sessionDone
+			active.mu.Unlock()
+			if session == nil && sessionDone != nil {
+				select {
+				case <-sessionDone:
+				case <-active.done:
+				case <-ctx.Done():
+				}
+				active.mu.Lock()
+				session = active.session
+				active.mu.Unlock()
+			}
+			if session == nil {
+				return
+			}
 			interruptCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			err := active.session.Interrupt(interruptCtx)
+			err := session.Interrupt(interruptCtx)
 			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				log.Printf(
 					"dispatcher implicit session interrupt failed: conversation=%s session_id=%s err=%v",
 					active.conversation.Key,
-					active.session.ID(),
+					session.ID(),
 					err,
 				)
 			}
@@ -1506,16 +1528,27 @@ func (d *Dispatcher) executeBlockingCommand(ctx context.Context, req CommandRequ
 		return "", err
 	}
 
+	if req.Command.IsStop() {
+		return d.buildStopCommandReply(ctx, req, interrupted)
+	}
+
 	unlock := d.locks.Lock(req.ConversationKey)
 	defer unlock()
 
-	state, _, err := d.loadCommandConversationState(ctx, req)
-	if err != nil {
-		return "", err
-	}
-	interrupted = interrupted || state.RunnerThreadDirty
-
 	return d.buildBlockingCommandReplyLocked(ctx, req, interrupted)
+}
+
+func (d *Dispatcher) buildStopCommandReply(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
+	clearedMessages, cleanupErr := d.dropConversationQueuedWork(ctx, req.ConversationKey)
+	if cleanupErr != nil {
+		return "", cleanupErr
+	}
+
+	for _, message := range clearedMessages {
+		d.recordCommandMessage(req.ConversationKey, message)
+	}
+
+	return buildStopReply(interrupted, d.takeCommandBriefs(req.ConversationKey)), nil
 }
 
 func (d *Dispatcher) buildCommandReply(ctx context.Context, req CommandRequest) (string, error) {
@@ -1531,8 +1564,6 @@ func (d *Dispatcher) buildCommandReply(ctx context.Context, req CommandRequest) 
 
 func (d *Dispatcher) buildBlockingCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
 	switch {
-	case req.Command.IsStop():
-		return d.buildStopCommandReplyLocked(ctx, req, interrupted)
 	case req.Command.IsReset():
 		return d.buildResetCommandReplyLocked(ctx, req, interrupted)
 	default:
@@ -1541,7 +1572,35 @@ func (d *Dispatcher) buildBlockingCommandReplyLocked(ctx context.Context, req Co
 }
 
 func (d *Dispatcher) interruptCommandConversation(ctx context.Context, req CommandRequest) (bool, error) {
-	interrupted := d.hasActiveConversationTurn(req.ConversationKey)
+	interrupted := false
+	var activeTurn *activeConversationTurn
+	if active := d.activeConversationTurn(req.ConversationKey); active != nil {
+		activeTurn = active
+		interrupted = true
+		active.interrupted.Store(true)
+		active.mu.Lock()
+		session := active.session
+		sessionDone := active.sessionDone
+		active.mu.Unlock()
+		if session == nil && sessionDone != nil {
+			select {
+			case <-sessionDone:
+			case <-active.done:
+			}
+			active.mu.Lock()
+			session = active.session
+			active.mu.Unlock()
+		}
+		if session != nil {
+			interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
+			defer interruptCancel()
+			if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
+				log.Printf("dispatcher session interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
+			}
+			<-activeTurn.done
+			return interrupted, nil
+		}
+	}
 	session, releaseSession := d.peekCommandSession(req.ConversationKey)
 
 	interruptCtx, interruptCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -1549,26 +1608,16 @@ func (d *Dispatcher) interruptCommandConversation(ctx context.Context, req Comma
 	if session != nil {
 		defer releaseSession()
 		interrupted = true
-		d.markConversationTurnInterrupted(req.ConversationKey)
 		if interruptErr := session.Interrupt(interruptCtx); interruptErr != nil {
 			log.Printf("dispatcher session interrupt failed: conversation=%s session_id=%s err=%v", req.ConversationKey, session.ID(), interruptErr)
 		}
 	}
 
+	if activeTurn != nil {
+		<-activeTurn.done
+	}
+
 	return interrupted, nil
-}
-
-func (d *Dispatcher) buildStopCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
-	clearedMessages, cleanupErr := d.dropConversationQueuedWork(ctx, req.ConversationKey)
-	if cleanupErr != nil {
-		return "", cleanupErr
-	}
-
-	for _, message := range clearedMessages {
-		d.recordCommandMessage(req.ConversationKey, message)
-	}
-
-	return buildStopReply(interrupted, d.takeCommandBriefs(req.ConversationKey)), nil
 }
 
 func (d *Dispatcher) buildResetCommandReplyLocked(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
@@ -1775,23 +1824,21 @@ func (d *Dispatcher) takeCommandBriefs(conversationKey string) []string {
 	return briefs
 }
 
-func (d *Dispatcher) hasActiveConversationTurn(conversationKey string) bool {
-	d.activeTurnsMu.Lock()
-	defer d.activeTurnsMu.Unlock()
-
-	active := d.activeByConversation[conversationKey]
-	return active != nil
-}
-
 func (d *Dispatcher) activeConversationSession(conversationKey string) Session {
-	d.activeTurnsMu.Lock()
-	defer d.activeTurnsMu.Unlock()
-
-	active := d.activeByConversation[conversationKey]
+	active := d.activeConversationTurn(conversationKey)
 	if active == nil {
 		return nil
 	}
+	active.mu.Lock()
+	defer active.mu.Unlock()
 	return active.session
+}
+
+func (d *Dispatcher) activeConversationTurn(conversationKey string) *activeConversationTurn {
+	d.activeTurnsMu.Lock()
+	defer d.activeTurnsMu.Unlock()
+
+	return d.activeByConversation[conversationKey]
 }
 
 func (d *Dispatcher) cleanupCommandResponder(ctx context.Context, req CommandRequest) {
