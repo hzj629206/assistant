@@ -2491,6 +2491,129 @@ func TestDispatcherStatusWithoutConversationThreadDoesNotStartSession(t *testing
 	}
 }
 
+func TestDispatcherStatusReportsStartingWhenActiveSessionIsStillLoading(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{
+		startSessionStart: make(chan struct{}, 1),
+		startSessionWait:  make(chan struct{}),
+		statusStarted:     make(chan struct{}, 1),
+	}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       NewConversationStore(cache.NewMemoryStorage()),
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	activeResponder := &testResponder{}
+	if err := dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-active-status-starting",
+		ConversationKey: "private:e_status_starting:0",
+		Kind:            MessageKindText,
+		Text:            "turn is still starting",
+		Responder:       activeResponder,
+	}); err != nil {
+		t.Fatalf("enqueue active message failed: %v", err)
+	}
+
+	select {
+	case <-runner.startSessionStart:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for start session")
+	}
+
+	commandResponder := &testResponder{}
+	err := dispatcher.EnqueueCommand(context.Background(), CommandRequest{
+		ConversationKey: "private:e_status_starting:0",
+		EventID:         "evt-status-starting",
+		Responder:       commandResponder,
+		Command:         SlashCommand{Name: "status", Raw: "/status"},
+	})
+	if err != nil {
+		t.Fatalf("enqueue status command failed: %v", err)
+	}
+
+	if err = waitForResponderSend(commandResponder); err != nil {
+		t.Fatalf("timed out waiting for status reply: %v", err)
+	}
+
+	select {
+	case <-runner.statusStarted:
+		t.Fatal("unexpected status call")
+	default:
+	}
+	if got := runner.StartSessionCalls(); got != 0 {
+		t.Fatalf("status should not start or wait for another session, got start session calls: %d", got)
+	}
+	reply := commandResponder.Reply().text
+	if !strings.Contains(reply, "_Current conversation status:_ _starting_") {
+		t.Fatalf("unexpected status reply: %q", reply)
+	}
+
+	close(runner.startSessionWait)
+}
+
+func TestDispatcherStatusUsesManagedSessionWhenActiveWorkHasNotPublishedSession(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{
+		status: SessionStatus{
+			Agent:              "codex",
+			WorkingDirectories: []string{"/workspace"},
+		},
+		statusStarted: make(chan struct{}, 1),
+	}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       NewConversationStore(cache.NewMemoryStorage()),
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	conversation := ConversationState{
+		Key:            "private:e_status_managed_starting:0",
+		RunnerThreadID: "thread-status-managed-starting",
+	}
+	managedSession, err := dispatcher.ensureConversationSession(context.Background(), conversation)
+	if err != nil {
+		t.Fatalf("ensure managed session failed: %v", err)
+	}
+	if managedSession == nil {
+		t.Fatal("expected managed session")
+	}
+	activeWork, releaseWork := dispatcher.startActiveConversationWork(conversation)
+	defer releaseWork()
+	if activeWork == nil {
+		t.Fatal("expected active work")
+	}
+
+	commandResponder := &testResponder{}
+	err = dispatcher.EnqueueCommand(context.Background(), CommandRequest{
+		ConversationKey: conversation.Key,
+		EventID:         "evt-status-managed-starting",
+		Responder:       commandResponder,
+		Command:         SlashCommand{Name: "status", Raw: "/status"},
+	})
+	if err != nil {
+		t.Fatalf("enqueue status command failed: %v", err)
+	}
+
+	if err = waitForResponderSend(commandResponder); err != nil {
+		t.Fatalf("timed out waiting for status reply: %v", err)
+	}
+
+	select {
+	case <-runner.statusStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for status call")
+	}
+	reply := commandResponder.Reply().text
+	if strings.Contains(reply, "_starting_") || !strings.Contains(reply, "- _Agent_: `codex`") {
+		t.Fatalf("unexpected status reply: %q", reply)
+	}
+}
+
 func TestDispatcherStatusLoadsPersistedSessionWhenConversationIsIdle(t *testing.T) {
 	t.Parallel()
 

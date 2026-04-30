@@ -1663,11 +1663,18 @@ func (d *Dispatcher) buildResetCommandReplyLocked(ctx context.Context, req Comma
 
 func (d *Dispatcher) buildStatusReply(ctx context.Context, req CommandRequest) (string, error) {
 	var err error
-	session, releaseSession := d.peekCommandSession(req.ConversationKey)
-	if session == nil {
-		session, releaseSession, err = d.tryLoadStatusSession(ctx, req)
+	session, releaseSession, starting := d.peekStatusMemorySession(req.ConversationKey)
+	switch {
+	case starting:
+		return "_Current conversation status:_ _starting_", nil
+	case session != nil:
+	default:
+		session, releaseSession, starting, err = d.tryLoadStatusSession(ctx, req)
 		if err != nil {
 			return "", err
+		}
+		if starting {
+			return "_Current conversation status:_ _starting_", nil
 		}
 	}
 	if session != nil {
@@ -1682,39 +1689,36 @@ func (d *Dispatcher) buildStatusReply(ctx context.Context, req CommandRequest) (
 	return "_Current conversation status:_ _inactive_", nil
 }
 
-func (d *Dispatcher) tryLoadStatusSession(ctx context.Context, req CommandRequest) (Session, func(), error) {
+func (d *Dispatcher) tryLoadStatusSession(ctx context.Context, req CommandRequest) (Session, func(), bool, error) {
 	if d == nil {
-		return nil, func() {}, nil
+		return nil, func() {}, false, nil
 	}
 
 	conversationKey := req.ConversationKey
 	unlock := d.locks.TryLock(conversationKey)
 	if unlock == nil {
-		return nil, func() {}, nil
+		return nil, func() {}, false, nil
 	}
 	defer unlock()
 
-	if active := d.activeConversationSession(conversationKey); active != nil {
-		return active, func() {}, nil
-	}
-	if managed := d.managedConversationSession(conversationKey); managed != nil {
-		d.beginConversationSessionUse(conversationKey, managed)
-		return managed, d.releaseConversationSessionFunc(conversationKey, managed), nil
+	session, releaseSession, starting := d.peekStatusMemorySession(conversationKey)
+	if starting || session != nil {
+		return session, releaseSession, starting, nil
 	}
 
 	state, stateExists, err := d.loadCommandConversationState(ctx, req)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, func() {}, false, err
 	}
 	if !stateExists || strings.TrimSpace(state.RunnerThreadID) == "" {
-		return nil, func() {}, nil
+		return nil, func() {}, false, nil
 	}
 
-	session, releaseSession, err := d.acquireConversationSession(ctx, state)
+	session, releaseSession, err = d.acquireConversationSession(ctx, state)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, func() {}, false, err
 	}
-	return session, releaseSession, nil
+	return session, releaseSession, false, nil
 }
 
 func (d *Dispatcher) loadCommandConversationState(ctx context.Context, req CommandRequest) (ConversationState, bool, error) {
@@ -1732,17 +1736,17 @@ func (d *Dispatcher) loadCommandConversationState(ctx context.Context, req Comma
 	}, false, nil
 }
 
-func (d *Dispatcher) peekCommandSession(conversationKey string) (Session, func()) {
-	if active := d.activeConversationSession(conversationKey); active != nil {
-		return active, func() {}
-	}
-
+func (d *Dispatcher) peekStatusMemorySession(conversationKey string) (Session, func(), bool) {
 	if managed := d.managedConversationSession(conversationKey); managed != nil {
 		d.beginConversationSessionUse(conversationKey, managed)
-		return managed, d.releaseConversationSessionFunc(conversationKey, managed)
+		return managed, d.releaseConversationSessionFunc(conversationKey, managed), false
 	}
 
-	return nil, func() {}
+	if session, active, starting := d.activeWorkStatusSession(conversationKey); active {
+		return session, func() {}, starting
+	}
+
+	return nil, func() {}, false
 }
 
 func (d *Dispatcher) sendCommandReply(ctx context.Context, req CommandRequest, replyText string) {
@@ -1807,14 +1811,18 @@ func (d *Dispatcher) takeCommandBriefs(conversationKey string) []string {
 	return briefs
 }
 
-func (d *Dispatcher) activeConversationSession(conversationKey string) Session {
+func (d *Dispatcher) activeWorkStatusSession(conversationKey string) (Session, bool, bool) {
 	active := d.activeConversationWork(conversationKey)
 	if active == nil {
-		return nil
+		return nil, false, false
 	}
-	active.mu.Lock()
-	defer active.mu.Unlock()
-	return active.session
+
+	select {
+	case <-active.turnDone:
+		return active.session, true, false
+	default:
+		return nil, true, true
+	}
 }
 
 func (d *Dispatcher) activeConversationWork(conversationKey string) *activeConversationWork {
