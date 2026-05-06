@@ -127,7 +127,7 @@ The process loads configuration in this order:
 
 Later sources override earlier ones.
 
-See [config.yaml.example](./config.yaml.example) for a complete example with all supported fields and inline descriptions.
+See [config.yml.example](./config.yml.example) for a complete example with all supported fields and inline descriptions.
 
 Use `<daemon> -h` to see the supported flags.
 
