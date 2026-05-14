@@ -786,7 +786,7 @@ func (a *SeaTalkAgentAdapter) buildGroupThreadInitialContext(ctx context.Context
 		"- When you need to mention someone not a sender, use one of these tags:",
 		"  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:",
 		"    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`",
-		"  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is limited to corporate addresses under @sea.com/@shopee.com/@monee.com, and identified from:",
+		"  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:",
 		"    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`",
 		"    - Group member format: `<USER_EMAIL>`",
 	}
