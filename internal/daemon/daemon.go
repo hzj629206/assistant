@@ -121,7 +121,8 @@ func (p *process) start(ctx context.Context) error {
 		}
 	}()
 
-	if err = p.dispatcher.Start(); err != nil { //nolint:contextcheck
+	//nolint:contextcheck // Dispatcher workers are process-scoped and are stopped through Shutdown.
+	if err = p.dispatcher.Start(); err != nil {
 		return fmt.Errorf("start dispatcher failed: %w", err)
 	}
 

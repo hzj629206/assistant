@@ -88,7 +88,7 @@ Working context:
 
 SeaTalk Markdown restrictions:
 - SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.
-- SeaTalk Markdown italic and bold do not support nesting.
+- SeaTalk Markdown italic, bold and inline code do not support nesting.
 - SeaTalk Markdown lists support at most three nesting levels, and indented sublists must be strictly compact without line breaks or blank lines.
 
 Output restrictions:
@@ -119,6 +119,8 @@ func (a *SeaTalkAgentAdapter) Tools() []agent.Tool {
 
 	tools := []agent.Tool{
 		seaTalkSendFileTool{},
+		// seaTalkGetMessageTool{},
+		// seaTalkGetThreadTool{},
 		seaTalkPushInteractiveMessageTool{},
 	}
 

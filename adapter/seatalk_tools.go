@@ -22,7 +22,20 @@ import (
 
 type seaTalkSendFileTool struct{}
 
+type seaTalkGetMessageTool struct{}
+
+type seaTalkGetThreadTool struct{}
+
 type seaTalkPushInteractiveMessageTool struct{}
+
+type seaTalkGetThreadPayload struct {
+	TargetType   string `json:"target_type"`
+	GroupID      string `json:"group_id"`
+	EmployeeCode string `json:"employee_code"`
+	ThreadID     string `json:"thread_id"`
+	PageSize     int    `json:"page_size"`
+	Cursor       string `json:"cursor"`
+}
 
 type interactiveToolPayload struct {
 	Mode      string                    `json:"mode,omitempty"`
@@ -192,6 +205,310 @@ func (seaTalkSendFileTool) Call(ctx context.Context, input json.RawMessage) (any
 		"message_id": result.MessageID,
 		"filename":   filename,
 	}, nil
+}
+
+func (seaTalkGetMessageTool) Name() string {
+	return "seatalk_get_message"
+}
+
+func (seaTalkGetMessageTool) Description() string {
+	return strings.TrimSpace(`
+Retrieve a SeaTalk message by message ID.
+This can only retrieve messages visible to the SeaTalk bot.
+`)
+}
+
+func (seaTalkGetMessageTool) InputSchema() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"message_id": map[string]any{
+				"type": "string",
+			},
+		},
+		"required":             []any{"message_id"},
+		"additionalProperties": false,
+	}
+}
+
+func (seaTalkGetMessageTool) OutputSchema() any {
+	return seaTalkMessageToolSchema()
+}
+
+func seaTalkMessageToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"message_id":        map[string]any{"type": "string"},
+			"quoted_message_id": map[string]any{"type": "string"},
+			"thread_id":         map[string]any{"type": "string"},
+			"sender": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"seatalk_id":    map[string]any{"type": "string"},
+					"employee_code": map[string]any{"type": "string"},
+					"email":         map[string]any{"type": "string"},
+					"sender_type":   map[string]any{"type": "integer"},
+				},
+				"additionalProperties": false,
+			},
+			"message_sent_time":               map[string]any{"type": "integer"},
+			"tag":                             map[string]any{"type": "string"},
+			"text":                            map[string]any{"type": "object"},
+			"combined_forwarded_chat_history": map[string]any{"type": "object"},
+			"image":                           map[string]any{"type": "object"},
+			"file":                            map[string]any{"type": "object"},
+			"video":                           map[string]any{"type": "object"},
+			"interactive_message":             map[string]any{"type": "object"},
+		},
+		"required":             []any{"message_id", "tag"},
+		"additionalProperties": false,
+	}
+}
+
+func (seaTalkGetMessageTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
+	responder, turnReq, err := seaTalkResponderFromToolContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		MessageID string `json:"message_id"`
+	}
+	if err = json.Unmarshal(input, &payload); err != nil {
+		return nil, fmt.Errorf("seatalk get message tool failed: decode input: %w", err)
+	}
+
+	messageID := strings.TrimSpace(payload.MessageID)
+	if messageID == "" {
+		return nil, errors.New("seatalk get message tool failed: message_id is empty")
+	}
+
+	log.Printf(
+		"seatalk tool get_message: conversation=%s target=%s message_id=%s",
+		turnReq.Conversation.Key,
+		responder.target.logValue(),
+		messageID,
+	)
+
+	result, err := responder.client.GetMessage(ctx, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("seatalk get message tool failed: %w", err)
+	}
+
+	output, err := seaTalkGetMessageToolOutput(result)
+	if err != nil {
+		return nil, fmt.Errorf("seatalk get message tool failed: encode result: %w", err)
+	}
+
+	return output, nil
+}
+
+func seaTalkGetMessageToolOutput(result seatalk.GetMessageResult) (map[string]any, error) {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+
+	var output map[string]any
+	if err = json.Unmarshal(data, &output); err != nil {
+		return nil, err
+	}
+	pruneNilJSONFields(output)
+
+	return output, nil
+}
+
+func pruneNilJSONFields(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			if item == nil {
+				delete(typed, key)
+				continue
+			}
+			pruneNilJSONFields(item)
+		}
+	case []any:
+		for _, item := range typed {
+			pruneNilJSONFields(item)
+		}
+	}
+}
+
+func (seaTalkGetThreadTool) Name() string {
+	return "seatalk_get_thread"
+}
+
+func (seaTalkGetThreadTool) Description() string {
+	return strings.TrimSpace(`
+Retrieve messages from a SeaTalk group-chat or private-chat thread by target and thread ID.
+Set target_type="group" with group_id for group chats, or target_type="private" with employee_code for private chats.
+This can only retrieve messages visible to the SeaTalk bot.
+`)
+}
+
+func (seaTalkGetThreadTool) InputSchema() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target_type": map[string]any{
+				"type":        "string",
+				"enum":        []any{"group", "private"},
+				"description": `Thread target type. Use "group" with group_id, or "private" with employee_code.`,
+			},
+			"group_id": map[string]any{
+				"type":        "string",
+				"description": `Required when target_type="group".`,
+			},
+			"employee_code": map[string]any{
+				"type":        "string",
+				"description": `Required when target_type="private".`,
+			},
+			"thread_id": map[string]any{
+				"type":        "string",
+				"description": "SeaTalk thread ID to retrieve.",
+			},
+			"page_size": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     100,
+				"description": "Optional page size from 1 to 100. SeaTalk defaults to 50.",
+			},
+			"cursor": map[string]any{
+				"type":        "string",
+				"description": "Optional cursor from a previous seatalk_get_thread result.",
+			},
+		},
+		"required":             []any{"target_type", "thread_id"},
+		"additionalProperties": false,
+	}
+}
+
+func (seaTalkGetThreadTool) OutputSchema() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"next_cursor": map[string]any{"type": "string"},
+			"thread_messages": map[string]any{
+				"type":  "array",
+				"items": seaTalkMessageToolSchema(),
+			},
+		},
+		"required":             []any{"thread_messages"},
+		"additionalProperties": false,
+	}
+}
+
+func (seaTalkGetThreadTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
+	responder, turnReq, err := seaTalkResponderFromToolContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload seaTalkGetThreadPayload
+	if err = json.Unmarshal(input, &payload); err != nil {
+		return nil, fmt.Errorf("seatalk get thread tool failed: decode input: %w", err)
+	}
+
+	targetType := strings.TrimSpace(payload.TargetType)
+	if targetType == "" {
+		return nil, errors.New("seatalk get thread tool failed: target_type is empty")
+	}
+	threadID := strings.TrimSpace(payload.ThreadID)
+	if threadID == "" {
+		return nil, errors.New("seatalk get thread tool failed: thread_id is empty")
+	}
+	if payload.PageSize < 0 || payload.PageSize > 100 {
+		return nil, errors.New("seatalk get thread tool failed: page_size must be between 1 and 100")
+	}
+
+	log.Printf(
+		"seatalk tool get_thread: conversation=%s target_type=%s target=%s thread_id=%s page_size=%d cursor=%s",
+		turnReq.Conversation.Key,
+		targetType,
+		seaTalkGetThreadTargetLogValue(payload),
+		threadID,
+		payload.PageSize,
+		strings.TrimSpace(payload.Cursor),
+	)
+
+	var result any
+	switch targetType {
+	case "group":
+		groupID := strings.TrimSpace(payload.GroupID)
+		if groupID == "" {
+			return nil, errors.New(`seatalk get thread tool failed: group_id is required when target_type is "group"`)
+		}
+		result, err = responder.client.GetGroupThread(ctx, groupID, threadID, seatalk.GetGroupThreadOptions{
+			PageSize: payload.PageSize,
+			Cursor:   strings.TrimSpace(payload.Cursor),
+		})
+	case "private":
+		employeeCode := strings.TrimSpace(payload.EmployeeCode)
+		if employeeCode == "" {
+			return nil, errors.New(`seatalk get thread tool failed: employee_code is required when target_type is "private"`)
+		}
+		result, err = responder.client.GetPrivateThread(ctx, employeeCode, threadID, seatalk.GetPrivateThreadOptions{
+			PageSize: payload.PageSize,
+			Cursor:   strings.TrimSpace(payload.Cursor),
+		})
+	default:
+		return nil, fmt.Errorf("seatalk get thread tool failed: unsupported target_type %q", targetType)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("seatalk get thread tool failed: %w", err)
+	}
+
+	output, err := seaTalkThreadToolOutput(result)
+	if err != nil {
+		return nil, fmt.Errorf("seatalk get thread tool failed: encode result: %w", err)
+	}
+
+	return output, nil
+}
+
+func seaTalkGetThreadTargetLogValue(payload seaTalkGetThreadPayload) string {
+	switch strings.TrimSpace(payload.TargetType) {
+	case "group":
+		return "group:" + strings.TrimSpace(payload.GroupID)
+	case "private":
+		return "private:" + strings.TrimSpace(payload.EmployeeCode)
+	default:
+		return ""
+	}
+}
+
+func seaTalkThreadToolOutput(result any) (map[string]any, error) {
+	var nextCursor string
+	var messages any
+	switch typed := result.(type) {
+	case seatalk.GetGroupThreadResult:
+		nextCursor = typed.NextCursor
+		messages = typed.ThreadMessages
+	case seatalk.GetPrivateThreadResult:
+		nextCursor = typed.NextCursor
+		messages = typed.ThreadMessages
+	default:
+		return nil, fmt.Errorf("unsupported thread result type %T", result)
+	}
+
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return nil, err
+	}
+
+	var threadMessages []any
+	if err = json.Unmarshal(data, &threadMessages); err != nil {
+		return nil, err
+	}
+	output := map[string]any{
+		"next_cursor":     nextCursor,
+		"thread_messages": threadMessages,
+	}
+	pruneNilJSONFields(output)
+
+	return output, nil
 }
 
 func (seaTalkPushInteractiveMessageTool) Name() string {

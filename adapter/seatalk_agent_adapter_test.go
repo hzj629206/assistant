@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -152,7 +153,7 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	if !strings.Contains(prompt, "SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.") {
 		t.Fatalf("system prompt missing SeaTalk markdown guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown italic and bold do not support nesting.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown italic, bold and inline code do not support nesting.") {
 		t.Fatalf("system prompt missing nested emphasis guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
@@ -751,7 +752,7 @@ func TestSeaTalkAgentAdapterLoadsInitialContextForFirstGroupInteractiveClickEven
 
 	reqCall := runner.LastRequest()
 	expected := "Group profile:\n- name: Demo Group\n" +
-		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is limited to corporate addresses under @sea.com/@shopee.com/@monee.com, and identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
+		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
 	if reqCall.Message.InitialContext() != expected {
 		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
 	}
@@ -999,7 +1000,7 @@ func TestSeaTalkAgentAdapterLoadsInitialContextForFirstMentionedThreadMessage(t 
 
 	reqCall := runner.LastRequest()
 	expectedInitialContext := "Group profile:\n- name: Demo Group\n" +
-		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is limited to corporate addresses under @sea.com/@shopee.com/@monee.com, and identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
+		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
 	if reqCall.Message.InitialContext() != expectedInitialContext {
 		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
 	}
@@ -1199,7 +1200,7 @@ func TestSeaTalkAgentAdapterLoadsGroupContextWithoutThreadHistoryForTopLevelMent
 
 	reqCall := runner.LastRequest()
 	expectedInitialContext := "Group profile:\n- name: Demo Group\n" +
-		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is limited to corporate addresses under @sea.com/@shopee.com/@monee.com, and identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
+		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
 	if reqCall.Message.InitialContext() != expectedInitialContext {
 		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
 	}
@@ -1509,7 +1510,7 @@ func TestSeaTalkAgentAdapterAddsReplyDecisionGuidanceForFirstGroupThreadEvent(t 
 
 	reqCall := runner.LastRequest()
 	expected := "Group profile:\n- name: Demo Group\n" +
-		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is limited to corporate addresses under @sea.com/@shopee.com/@monee.com, and identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
+		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
 	if reqCall.Message.InitialContext() != expected {
 		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
 	}
@@ -3907,6 +3908,302 @@ func TestSeaTalkSendFileToolUsesCurrentGroupConversationTarget(t *testing.T) {
 	}
 	if body["filename"] != "custom-report.csv" {
 		t.Fatalf("unexpected filename: %#v", body["filename"])
+	}
+}
+
+func TestSeaTalkGetMessageToolRetrievesMessageByID(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodGet {
+				t.Fatalf("unexpected method: %s", req.Method)
+			}
+			if req.URL.Path != "/messaging/v2/get_message_by_message_id" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			if req.URL.Query().Get("message_id") != "message-1" {
+				t.Fatalf("unexpected message id: %q", req.URL.Query().Get("message_id"))
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer token-123" {
+				t.Fatalf("unexpected authorization header: %s", got)
+			}
+
+			return jsonResponse(t, map[string]any{
+				"code":              0,
+				"message_id":        "message-1",
+				"quoted_message_id": "quoted-1",
+				"thread_id":         "thread-1",
+				"sender": map[string]any{
+					"seatalk_id":    "seatalk-user-1",
+					"employee_code": "emp-1",
+					"email":         "alice@example.com",
+					"sender_type":   1,
+				},
+				"message_sent_time": 1700000000,
+				"tag":               "text",
+				"text": map[string]any{
+					"plain_text":       "hello",
+					"last_edited_time": 1700000010,
+				},
+			}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+
+	tool := seaTalkGetMessageTool{}
+	ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
+		Conversation: agent.ConversationState{Key: "seatalk:group:group-1:thread-1"},
+		Message: agent.InboundMessage{
+			Responder: &SeaTalkResponder{
+				client: client,
+				target: seaTalkReplyTarget{
+					isGroup:  true,
+					groupID:  "group-1",
+					threadID: "thread-1",
+				},
+			},
+		},
+	})
+
+	result, err := tool.Call(ctx, json.RawMessage(`{"message_id":"message-1"}`))
+	if err != nil {
+		t.Fatalf("tool call failed: %v", err)
+	}
+
+	message, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected tool result type: %T", result)
+	}
+	if message["message_id"] != "message-1" {
+		t.Fatalf("unexpected message id: %q", message["message_id"])
+	}
+	if message["quoted_message_id"] != "quoted-1" {
+		t.Fatalf("unexpected quoted message id: %q", message["quoted_message_id"])
+	}
+	text, ok := message["text"].(map[string]any)
+	if !ok || text["plain_text"] != "hello" {
+		t.Fatalf("unexpected text payload: %+v", message["text"])
+	}
+	if _, ok = message["image"]; ok {
+		t.Fatalf("unexpected nil image field: %+v", message["image"])
+	}
+}
+
+func TestSeaTalkGetThreadToolRetrievesGroupThreadByID(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodGet {
+				t.Fatalf("unexpected method: %s", req.Method)
+			}
+			if req.URL.Path != "/messaging/v2/group_chat/get_thread_by_thread_id" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			query := req.URL.Query()
+			if query.Get("group_id") != "group-1" {
+				t.Fatalf("unexpected group id: %q", query.Get("group_id"))
+			}
+			if query.Get("thread_id") != "thread-1" {
+				t.Fatalf("unexpected thread id: %q", query.Get("thread_id"))
+			}
+			if query.Get("page_size") != "10" {
+				t.Fatalf("unexpected page size: %q", query.Get("page_size"))
+			}
+			if query.Get("cursor") != "cursor-1" {
+				t.Fatalf("unexpected cursor: %q", query.Get("cursor"))
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer token-123" {
+				t.Fatalf("unexpected authorization header: %s", got)
+			}
+
+			return jsonResponse(t, map[string]any{
+				"code":        0,
+				"next_cursor": "cursor-2",
+				"thread_messages": []map[string]any{
+					{
+						"message_id":        "message-1",
+						"quoted_message_id": "",
+						"thread_id":         "thread-1",
+						"sender": map[string]any{
+							"seatalk_id":    "seatalk-user-1",
+							"employee_code": "emp-1",
+							"email":         "alice@example.com",
+							"sender_type":   1,
+						},
+						"message_sent_time": 1700000000,
+						"tag":               "text",
+						"text": map[string]any{
+							"plain_text": "hello",
+						},
+					},
+				},
+			}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+
+	tool := seaTalkGetThreadTool{}
+	ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
+		Conversation: agent.ConversationState{Key: "seatalk:group:group-1:thread-1"},
+		Message: agent.InboundMessage{
+			Responder: &SeaTalkResponder{
+				client: client,
+				target: seaTalkReplyTarget{
+					employeeCode: "other-employee",
+					threadID:     "other-thread",
+				},
+			},
+		},
+	})
+
+	result, err := tool.Call(ctx, json.RawMessage(`{"target_type":"group","group_id":"group-1","thread_id":"thread-1","page_size":10,"cursor":"cursor-1"}`))
+	if err != nil {
+		t.Fatalf("tool call failed: %v", err)
+	}
+
+	thread, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected tool result type: %T", result)
+	}
+	if thread["next_cursor"] != "cursor-2" {
+		t.Fatalf("unexpected next cursor: %q", thread["next_cursor"])
+	}
+	messages, ok := thread["thread_messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("unexpected thread messages: %+v", thread["thread_messages"])
+	}
+	message, ok := messages[0].(map[string]any)
+	if !ok || message["message_id"] != "message-1" {
+		t.Fatalf("unexpected message payload: %+v", messages[0])
+	}
+}
+
+func TestSeaTalkGetThreadToolRetrievesPrivateThreadByTarget(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodGet {
+				t.Fatalf("unexpected method: %s", req.Method)
+			}
+			if req.URL.Path != "/messaging/v2/single_chat/get_thread_by_thread_id" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			query := req.URL.Query()
+			if query.Get("employee_code") != "e_1" {
+				t.Fatalf("unexpected employee code: %q", query.Get("employee_code"))
+			}
+			if query.Get("thread_id") != "thread-override" {
+				t.Fatalf("unexpected thread id: %q", query.Get("thread_id"))
+			}
+
+			return jsonResponse(t, map[string]any{
+				"code":            0,
+				"thread_messages": []map[string]any{},
+			}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+
+	tool := seaTalkGetThreadTool{}
+	ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
+		Conversation: agent.ConversationState{Key: "seatalk:private:e_1:thread-1"},
+		Message: agent.InboundMessage{
+			Responder: &SeaTalkResponder{
+				client: client,
+				target: seaTalkReplyTarget{
+					isGroup:  true,
+					groupID:  "other-group",
+					threadID: "other-thread",
+				},
+			},
+		},
+	})
+
+	result, err := tool.Call(ctx, json.RawMessage(`{"target_type":"private","employee_code":"e_1","thread_id":"thread-override"}`))
+	if err != nil {
+		t.Fatalf("tool call failed: %v", err)
+	}
+
+	thread, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected tool result type: %T", result)
+	}
+	messages, ok := thread["thread_messages"].([]any)
+	if !ok || len(messages) != 0 {
+		t.Fatalf("unexpected thread messages: %+v", thread["thread_messages"])
+	}
+}
+
+func TestSeaTalkGetThreadToolRequiresThreadID(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+			return nil, nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			t.Fatal("token provider should not be called")
+			return "", nil
+		}),
+	)
+
+	tool := seaTalkGetThreadTool{}
+	ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
+		Conversation: agent.ConversationState{Key: "seatalk:group:group-1:thread-1"},
+		Message: agent.InboundMessage{
+			Responder: &SeaTalkResponder{
+				client: client,
+				target: seaTalkReplyTarget{
+					isGroup:  true,
+					groupID:  "group-1",
+					threadID: "thread-1",
+				},
+			},
+		},
+	})
+
+	_, err := tool.Call(ctx, json.RawMessage(`{"target_type":"group","group_id":"group-1"}`))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "thread_id is empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSeaTalkGetMessageAndGetThreadUseSameMessageOutputSchema(t *testing.T) {
+	t.Parallel()
+
+	messageSchema := seaTalkGetMessageTool{}.OutputSchema()
+	threadSchema, ok := seaTalkGetThreadTool{}.OutputSchema().(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected get thread output schema type: %T", seaTalkGetThreadTool{}.OutputSchema())
+	}
+	properties, ok := threadSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected get thread properties type: %T", threadSchema["properties"])
+	}
+	threadMessages, ok := properties["thread_messages"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected thread_messages schema type: %T", properties["thread_messages"])
+	}
+	itemSchema := threadMessages["items"]
+	if !reflect.DeepEqual(itemSchema, messageSchema) {
+		t.Fatalf("message output schema differs from thread message item schema:\nmessage=%#v\nitem=%#v", messageSchema, itemSchema)
 	}
 }
 
