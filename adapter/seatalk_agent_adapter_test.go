@@ -153,7 +153,7 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	if !strings.Contains(prompt, "SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.") {
 		t.Fatalf("system prompt missing SeaTalk markdown guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown italic, bold and inline code do not support nesting.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown italic, bold and inline code must not be nested.") {
 		t.Fatalf("system prompt missing nested emphasis guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
