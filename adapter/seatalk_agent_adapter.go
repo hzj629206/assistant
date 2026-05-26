@@ -1434,6 +1434,7 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 			}
 			edits = append(edits, seaTalkMarkdownUnorderedListMarkerEdits(list, source)...)
 			edits = append(edits, seaTalkMarkdownListMarkerSpacingEdits(list, source)...)
+			edits = append(edits, seaTalkMarkdownPromoteLooseTopLevelUnorderedListItemContinuationEdits(list, source)...)
 			edits = append(edits, seaTalkMarkdownListSpacingEdits(list, source)...)
 		}
 
@@ -1582,16 +1583,16 @@ func seaTalkMarkdownPromoteLooseTopLevelOrderedListItemContinuationEdits(list *g
 			continue
 		}
 
-		edits = append(edits, seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits(listItem, source)...)
+		edits = append(edits, seaTalkMarkdownPromoteListItemContinuationLineEdits(listItem, source)...)
 	}
 
 	return edits
 }
 
-// seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits rewrites every
-// continuation line after the ordered item's first line with one less indent
+// seaTalkMarkdownPromoteListItemContinuationLineEdits rewrites every
+// continuation line after the list item's first line with one less indent
 // level, removing either one leading tab or up to four leading spaces.
-func seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits(listItem *goldmarkast.ListItem, source []byte) []seaTalkMarkdownEdit {
+func seaTalkMarkdownPromoteListItemContinuationLineEdits(listItem *goldmarkast.ListItem, source []byte) []seaTalkMarkdownEdit {
 	edits := make([]seaTalkMarkdownEdit, 0)
 	if listItem == nil {
 		return edits
@@ -1606,7 +1607,7 @@ func seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits(listItem *goldma
 	stop := seaTalkMarkdownNodeStop(listItem, source)
 	for position < stop {
 		lineStart := position
-		edit, ok := seaTalkMarkdownPromoteOrderedListItemLineIndentationEdit(lineStart, source)
+		edit, ok := seaTalkMarkdownPromoteListItemLineIndentationEdit(lineStart, source)
 		if ok {
 			edits = append(edits, edit)
 		}
@@ -1620,7 +1621,7 @@ func seaTalkMarkdownPromoteOrderedListItemContinuationLineEdits(listItem *goldma
 	return edits
 }
 
-func seaTalkMarkdownPromoteOrderedListItemLineIndentationEdit(lineStart int, source []byte) (seaTalkMarkdownEdit, bool) {
+func seaTalkMarkdownPromoteListItemLineIndentationEdit(lineStart int, source []byte) (seaTalkMarkdownEdit, bool) {
 	if lineStart < 0 || lineStart >= len(source) {
 		return seaTalkMarkdownEdit{}, false
 	}
@@ -1995,6 +1996,99 @@ func seaTalkMarkdownListNeedsCompaction(list *goldmarkast.List) bool {
 	return !seaTalkMarkdownListIsTopLevel(list)
 }
 
+// seaTalkMarkdownPromoteLooseTopLevelUnorderedListItemContinuationEdits shifts
+// continuation lines inside loose top-level unordered items one level left.
+func seaTalkMarkdownPromoteLooseTopLevelUnorderedListItemContinuationEdits(list *goldmarkast.List, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if list == nil || list.IsOrdered() || !seaTalkMarkdownListIsTopLevel(list) || seaTalkMarkdownListIsStrictTight(list) {
+		return edits
+	}
+
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		listItem, ok := item.(*goldmarkast.ListItem)
+		if !ok {
+			continue
+		}
+
+		edits = append(edits, seaTalkMarkdownPromoteLooseTopLevelUnorderedListItemChildEdits(listItem, source)...)
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownPromoteLooseTopLevelUnorderedListItemChildEdits(listItem *goldmarkast.ListItem, source []byte) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if listItem == nil {
+		return edits
+	}
+
+	firstChild := true
+	for child := listItem.FirstChild(); child != nil; child = child.NextSibling() {
+		if _, ok := child.(*goldmarkast.List); ok {
+			firstChild = false
+			continue
+		}
+
+		edits = append(edits, seaTalkMarkdownPromoteNodeContinuationLineEdits(child, source, !firstChild)...)
+		firstChild = false
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownPromoteNodeContinuationLineEdits(node goldmarkast.Node, source []byte, includeFirstLine bool) []seaTalkMarkdownEdit {
+	edits := make([]seaTalkMarkdownEdit, 0)
+	if node == nil {
+		return edits
+	}
+
+	lineStart := seaTalkMarkdownLineStart(source, node.Pos())
+	if lineStart < 0 || lineStart >= len(source) {
+		return edits
+	}
+
+	position := lineStart
+	if !includeFirstLine {
+		position = seaTalkMarkdownLineEnd(source, lineStart)
+		if position < len(source) && source[position] == '\n' {
+			position++
+		}
+	}
+
+	stop := seaTalkMarkdownNodeStop(node, source)
+	if _, ok := node.(*goldmarkast.FencedCodeBlock); ok {
+		stop = seaTalkMarkdownFencedCodeBlockStop(node, source)
+	}
+	for position < stop {
+		edit, ok := seaTalkMarkdownPromoteListItemLineIndentationEdit(position, source)
+		if ok {
+			edits = append(edits, edit)
+		}
+
+		position = seaTalkMarkdownLineEnd(source, position)
+		if position < len(source) && source[position] == '\n' {
+			position++
+		}
+	}
+
+	return edits
+}
+
+func seaTalkMarkdownFencedCodeBlockStop(node goldmarkast.Node, source []byte) int {
+	stop := seaTalkMarkdownNodeStop(node, source)
+	if stop < 0 {
+		return stop
+	}
+
+	lineStart := seaTalkMarkdownLineStart(source, stop)
+	lineEnd := seaTalkMarkdownLineEnd(source, lineStart)
+	if lineEnd < len(source) {
+		lineEnd++
+	}
+
+	return lineEnd
+}
+
 func seaTalkMarkdownListIsTopLevel(list *goldmarkast.List) bool {
 	if list == nil {
 		return false
@@ -2173,6 +2267,7 @@ func seaTalkMarkdownBlankLineEditBeforePosition(source []byte, position int) (se
 
 	return seaTalkMarkdownEdit{start: blankStart, stop: lineStart}, true
 }
+
 
 func applySeaTalkMarkdownEdits(source []byte, edits []seaTalkMarkdownEdit) string {
 	if len(edits) == 0 {

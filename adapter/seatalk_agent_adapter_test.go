@@ -2128,7 +2128,7 @@ func TestSeaTalkResponderSendTextCollapsesLineBreaksInsideSingleListItem(t *test
 				t.Fatalf("unexpected group message format: %d", body.Message.Text.Format)
 			}
 
-			expected := "- item 1\n  continued line\n- item 2"
+				expected := "- item 1\ncontinued line\n- item 2"
 			if body.Message.Text.Content != expected {
 				t.Fatalf("unexpected group message content: %q", body.Message.Text.Content)
 			}
@@ -2164,7 +2164,7 @@ func TestNormalizeSeaTalkMarkdownPreservesParagraphAndCodeFenceBlankLines(t *tes
 	text := "intro\n\n- item 1\n\n\tcontinued paragraph\n\n- item 2\n\n```go\n- code 1\n\n- code 2\n```\noutro"
 	got := normalizeSeaTalkMarkdown(text)
 
-	want := "intro\n\n- item 1\n\n\tcontinued paragraph\n\n- item 2\n\n```\n- code 1\n\n- code 2\n```\noutro"
+	want := "intro\n\n- item 1\n\ncontinued paragraph\n\n- item 2\n\n```\n- code 1\n\n- code 2\n```\noutro"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
 	}
@@ -2201,6 +2201,90 @@ func TestNormalizeSeaTalkMarkdownPreservesTightTopLevelOrderedListMarkers(t *tes
 	got := normalizeSeaTalkMarkdown(text)
 
 	want := "1. first item\n2. second item"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownDoesNotAddBlankLinesBetweenLooseTopLevelUnorderedListItems(t *testing.T) {
+	t.Parallel()
+
+	text := "- item1\nContent\n- item2\n- item3"
+	got := normalizeSeaTalkMarkdown(text)
+
+	if got != text {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPreservesTightTopLevelUnorderedListSpacing(t *testing.T) {
+	t.Parallel()
+
+	text := "- item1\n- item2\n- item3"
+	got := normalizeSeaTalkMarkdown(text)
+
+	if got != text {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPromotesLooseTopLevelUnorderedListItemContinuationLines(t *testing.T) {
+	t.Parallel()
+
+	text := "- item1\n\n    continuation line\n\n- item2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- item1\n\ncontinuation line\n\n- item2"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPromotesLooseTopLevelUnorderedListItemBlockquoteAndCodeFence(t *testing.T) {
+	t.Parallel()
+
+	text := "- item1\n\n    > quote line\n\n    ```text\n    code line\n    ```\n\n- item2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- item1\n\n> quote line\n\n```\ncode line\n```\n\n- item2"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPromotesStrictGoldmarkTightTopLevelUnorderedListItemCodeFence(t *testing.T) {
+	t.Parallel()
+
+	//nolint:gosmopolitan // This test intentionally covers SeaTalk markdown normalization with Han text.
+	text := "- 第一项：\n  ```text\n  example code\n  line 2\n  ```\n- 第二项\n- 第三项"
+	got := normalizeSeaTalkMarkdown(text)
+
+	//nolint:gosmopolitan // This test intentionally covers SeaTalk markdown normalization with Han text.
+	want := "- 第一项：\n```\nexample code\nline 2\n```\n- 第二项\n- 第三项"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownPreservesNestedChildListInsideLooseTopLevelUnorderedListItem(t *testing.T) {
+	t.Parallel()
+
+	text := "- item1\n\n    - child item\n\n- item2"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- item1\n\n    - child item\n\n- item2"
+	if got != want {
+		t.Fatalf("unexpected normalized text: %q", got)
+	}
+}
+
+func TestNormalizeSeaTalkMarkdownDoesNotInsertCrossBlockSpacingAfterLooseTopLevelUnorderedList(t *testing.T) {
+	t.Parallel()
+
+	text := "- item1\nContent\n\n```text\ncode line\n```\n\n> quoted line\n- item2\n- item3"
+	got := normalizeSeaTalkMarkdown(text)
+
+	want := "- item1\nContent\n\n```\ncode line\n```\n\n> quoted line\n- item2\n- item3"
 	if got != want {
 		t.Fatalf("unexpected normalized text: %q", got)
 	}
