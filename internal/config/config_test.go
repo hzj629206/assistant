@@ -71,6 +71,17 @@ func TestNormalizeACPConfig(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfigRestoresDefaultListenAddr(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{ListenAddr: "  "}
+	normalizeConfig(&cfg)
+
+	if cfg.ListenAddr != defaultListenAddr {
+		t.Fatalf("unexpected listen addr: %q", cfg.ListenAddr)
+	}
+}
+
 func TestNormalizeClaudeConfig(t *testing.T) {
 	t.Parallel()
 
@@ -293,7 +304,7 @@ func TestDefaultConfigUsesBuiltInDefaults(t *testing.T) {
 		t.Fatalf("defaultConfig failed: %v", err)
 	}
 
-	if cfg.ListenAddr != ":8421" {
+	if cfg.ListenAddr != defaultListenAddr {
 		t.Fatalf("unexpected listen addr: %s", cfg.ListenAddr)
 	}
 	if cfg.Tunnel.SSHAddr != "" {
@@ -308,7 +319,7 @@ func TestDefaultConfigUsesBuiltInDefaults(t *testing.T) {
 	if cfg.Tunnel.CloudflaredToken != "" {
 		t.Fatalf("unexpected cloudflared token: %s", cfg.Tunnel.CloudflaredToken)
 	}
-	if cfg.Codex.Backend != "appserver" || cfg.Codex.Model != "" || cfg.Codex.ReasoningEffort != "" || cfg.Codex.Sandbox != "" {
+	if cfg.Codex.Backend != defaultCodexBackend || cfg.Codex.Model != "" || cfg.Codex.ReasoningEffort != "" || cfg.Codex.Sandbox != "" {
 		t.Fatalf("unexpected codex defaults: %+v", cfg.Codex)
 	}
 	if cfg.ACP.Command != "" || cfg.ACP.Args != nil || cfg.ACP.Env != nil || cfg.ACP.AuthMethod != "" {
@@ -541,6 +552,74 @@ func TestParseConfigExplicitFileOverridesDefaultPath(t *testing.T) {
 
 	if cfg.ListenAddr != "127.0.0.1:9191" {
 		t.Fatalf("unexpected listen addr: %s", cfg.ListenAddr)
+	}
+}
+
+func TestParseConfigRestoresDefaultSSHKeyWhenConfigValueIsEmpty(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(configPath, []byte(`tunnel:
+  ssh_key: ""
+seatalk:
+  app_id: app-id
+  app_secret: app-secret
+  signing_secret: signing-secret
+`), 0o600); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := ParseConfig("assistant-test", []string{"-f", configPath})
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+
+	want := filepath.Join(homeDir, ".ssh", "id_rsa")
+	if cfg.Tunnel.SSHKey != want {
+		t.Fatalf("unexpected ssh key: got %q want %q", cfg.Tunnel.SSHKey, want)
+	}
+}
+
+func TestParseConfigRestoresDefaultListenAddrWhenConfigValueIsEmpty(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(configPath, []byte(`listen_addr: ""
+seatalk:
+  app_id: app-id
+  app_secret: app-secret
+  signing_secret: signing-secret
+`), 0o600); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := ParseConfig("assistant-test", []string{"-f", configPath})
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+
+	if cfg.ListenAddr != defaultListenAddr {
+		t.Fatalf("unexpected listen addr: got %q want %q", cfg.ListenAddr, defaultListenAddr)
+	}
+}
+
+func TestParseConfigRestoresDefaultListenAddrWhenFlagValueIsEmpty(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(configPath, []byte(`listen_addr: "127.0.0.1:8421"
+seatalk:
+  app_id: app-id
+  app_secret: app-secret
+  signing_secret: signing-secret
+`), 0o600); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := ParseConfig("assistant-test", []string{"-f", configPath, "--listen-addr", "   "})
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+
+	if cfg.ListenAddr != defaultListenAddr {
+		t.Fatalf("unexpected listen addr: got %q want %q", cfg.ListenAddr, defaultListenAddr)
 	}
 }
 

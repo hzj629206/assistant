@@ -15,6 +15,11 @@ import (
 	"github.com/hzj629206/assistant/seatalk"
 )
 
+const (
+	defaultListenAddr   = ":8421"
+	defaultCodexBackend = "appserver"
+)
+
 // Config contains the process-wide runtime configuration.
 type Config struct {
 	ListenAddr string         `json:"listen_addr" yaml:"listen_addr"`
@@ -107,15 +112,15 @@ func ParseConfig(programName string, args []string) (Config, error) {
 	} else if err = loadOptionalConfigFile(configPath, &cfg); err != nil {
 		return Config{}, err
 	}
-	normalizeCodexConfig(&cfg.Codex)
-	normalizeClaudeConfig(&cfg.Claude)
-	normalizeACPConfig(&cfg.ACP)
+	if err = normalizeAllConfig(&cfg); err != nil {
+		return Config{}, err
+	}
 	fs.Visit(func(f *flag.Flag) {
 		applyFlagOverride(&cfg, overlay, f.Name)
 	})
-	normalizeCodexConfig(&cfg.Codex)
-	normalizeClaudeConfig(&cfg.Claude)
-	normalizeACPConfig(&cfg.ACP)
+	if err = normalizeAllConfig(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err = validateSeaTalkConfig(&cfg.SeaTalk); err != nil {
 		return Config{}, err
 	}
@@ -124,24 +129,17 @@ func ParseConfig(programName string, args []string) (Config, error) {
 }
 
 func defaultConfig() (Config, error) {
-	homeDir, err := os.UserHomeDir()
+	tunnelConfig, err := defaultTunnelConfig()
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve home dir failed: %w", err)
+		return Config{}, err
 	}
 
 	return Config{
-		ListenAddr: ":8421",
-		Tunnel: TunnelConfig{
-			SSHAddr:          "",
-			SSHUser:          "",
-			SSHKey:           filepath.Join(homeDir, ".ssh", "id_rsa"),
-			CloudflaredToken: "",
-		},
-		ACP: ACPConfig{},
-		Codex: CodexConfig{
-			Backend: "appserver",
-		},
-		Claude: ClaudeConfig{},
+		ListenAddr: defaultListenAddr,
+		Tunnel:     tunnelConfig,
+		ACP:        ACPConfig{},
+		Codex:      defaultCodexConfig(),
+		Claude:     ClaudeConfig{},
 		SeaTalk: seatalk.Config{
 			AppID:               "",
 			AppSecret:           "",
@@ -149,6 +147,61 @@ func defaultConfig() (Config, error) {
 			EmployeeInfoEnabled: false,
 		},
 	}, nil
+}
+
+func defaultCodexConfig() CodexConfig {
+	return CodexConfig{
+		Backend: defaultCodexBackend,
+	}
+}
+
+func defaultTunnelConfig() (TunnelConfig, error) {
+	sshKeyPath, err := defaultTunnelSSHKeyPath()
+	if err != nil {
+		return TunnelConfig{}, err
+	}
+
+	return TunnelConfig{
+		SSHAddr:          "",
+		SSHUser:          "",
+		SSHKey:           sshKeyPath,
+		CloudflaredToken: "",
+	}, nil
+}
+
+func defaultTunnelSSHKeyPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir failed: %w", err)
+	}
+
+	return filepath.Join(homeDir, ".ssh", "id_rsa"), nil
+}
+
+func normalizeConfig(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	cfg.ListenAddr = strings.TrimSpace(cfg.ListenAddr)
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = defaultListenAddr
+	}
+}
+
+func normalizeAllConfig(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+
+	normalizeConfig(cfg)
+	if err := normalizeTunnelConfig(&cfg.Tunnel); err != nil {
+		return err
+	}
+	normalizeCodexConfig(&cfg.Codex)
+	normalizeClaudeConfig(&cfg.Claude)
+	normalizeACPConfig(&cfg.ACP)
+	return nil
 }
 
 func newFlagSet(programName string, overlay *flagOverlay, configPath *string) *flag.FlagSet {
@@ -247,14 +300,14 @@ func normalizeCodexConfig(cfg *CodexConfig) {
 	cfg.AdditionalWritableRoots = normalizeCodexAdditionalWritableRoots(cfg.AdditionalWritableRoots)
 
 	if cfg.Backend == "" {
-		cfg.Backend = "appserver"
+		cfg.Backend = defaultCodexBackend
 	}
 
 	switch cfg.Backend {
 	case "appserver", "exec":
 	default:
 		log.Printf("ignoring unsupported codex backend %q", cfg.Backend)
-		cfg.Backend = "appserver"
+		cfg.Backend = defaultCodexBackend
 	}
 
 	switch cfg.ReasoningEffort {
@@ -372,6 +425,27 @@ func normalizeACPConfig(cfg *ACPConfig) {
 	cfg.AuthMethod = strings.TrimSpace(cfg.AuthMethod)
 	cfg.Args = normalizeACPStringSlice(cfg.Args)
 	cfg.Env = normalizeACPStringSlice(cfg.Env)
+}
+
+func normalizeTunnelConfig(cfg *TunnelConfig) error {
+	if cfg == nil {
+		return nil
+	}
+
+	cfg.SSHAddr = strings.TrimSpace(cfg.SSHAddr)
+	cfg.SSHUser = strings.TrimSpace(cfg.SSHUser)
+	cfg.SSHKey = strings.TrimSpace(cfg.SSHKey)
+	cfg.CloudflaredToken = strings.TrimSpace(cfg.CloudflaredToken)
+
+	if cfg.SSHKey == "" {
+		var err error
+		cfg.SSHKey, err = defaultTunnelSSHKeyPath()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func normalizeACPStringSlice(values []string) []string {
