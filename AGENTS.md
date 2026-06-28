@@ -10,7 +10,6 @@ This is a backend-only Golang project for integrating SeaTalk with Codex CLI, Cl
 - Prefer the Go standard library. Avoid unnecessary third-party dependencies.
 - Add logs for important actions and events to support tracing and troubleshooting.
 - When importing third-party Go packages, group imports by domain name, and place this project's own packages in the last import group.
-- When using foundational variable names like `err` and `ok`, do not implicitly redeclare them with `:=` within the same visible scope. Declare them once and reuse them with `=` afterward. For example, prefer `var err error; a, err = funA(); b, err = funB()` over `a, err := funA(); b, err := funB()`.
 - Use `go run`, `go build`, and `go install` for build and execution workflows.
 - When using `go build`, always set the output path with `-o` so the generated binary is placed under the project `bin` directory, regardless of the current working directory.
 - Use `golangci-lint` **v2.11.4+** for linting and code checks.
@@ -19,7 +18,6 @@ This is a backend-only Golang project for integrating SeaTalk with Codex CLI, Cl
 - When installing a global Python CLI package, use `uv tool install`.
 - When only executing a Python CLI package, use `uvx`.
 - When reviewing SeaTalk Open Platform docs under `https://open.seatalk.io/docs/`, use `chrome-devtools-mcp` to inspect the rendered page content instead of relying on raw HTTP fetches.
-- When working in JetBrains IDEs, write jump locations in responses as `[file.go:line](/absolute/path/to/file.go)`, don't include line number in the actual path.
 
 ## Directory Structure
 
