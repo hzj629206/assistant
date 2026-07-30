@@ -22,7 +22,7 @@ import (
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/seatalk"
 
-	seatalkoapisdk "git.garena.com/seatalk/seatalk-oapi-sdk-go"
+	seatalkoapisdk "github.com/hzj629206/assistant/seatalk-oapi-sdk-go"
 )
 
 func TestSeaTalkAgentAdapterEnqueuesSupportedEvent(t *testing.T) {

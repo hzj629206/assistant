@@ -7,6 +7,10 @@ run:
 # see: https://golangci-lint.run/docs/linters/
 linters:
     default: all
+    exclusions:
+        paths:
+            # This bundled third-party SDK is not maintained under this project's lint policy.
+            - seatalk-oapi-sdk-go/.*
     settings:
         # Finds commonly misspelled English words.
         misspell:

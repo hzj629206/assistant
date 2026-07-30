@@ -19,7 +19,7 @@ import (
 	"github.com/hzj629206/assistant/internal/config"
 	"github.com/hzj629206/assistant/internal/tunnel"
 
-	seatalkoapisdk "git.garena.com/seatalk/seatalk-oapi-sdk-go"
+	seatalkoapisdk "github.com/hzj629206/assistant/seatalk-oapi-sdk-go"
 )
 
 // RunnerFactory creates the runner for one daemon process.
