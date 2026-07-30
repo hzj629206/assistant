@@ -8,13 +8,18 @@ require github.com/godeps/codex-sdk-go v0.1.1
 
 require github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d
 
+require git.garena.com/seatalk/seatalk-oapi-sdk-go v0.0.0
+
 require (
 	github.com/modelcontextprotocol/go-sdk v1.5.0
 	github.com/yuin/goldmark v1.8.2
 )
 
+replace git.garena.com/seatalk/seatalk-oapi-sdk-go => ./seatalk-oapi-sdk-go
+
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect

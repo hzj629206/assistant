@@ -1,6 +1,9 @@
 package seatalk
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // Event is a decoded SeaTalk event payload.
 type Event interface {
@@ -15,10 +18,12 @@ const (
 	EventTypeUserEnterChatroomWithBot         = "user_enter_chatroom_with_bot"
 	EventTypeMessageFromBotSubscriber         = "message_from_bot_subscriber"
 	EventTypeNewMentionedMessageFromGroupChat = "new_mentioned_message_received_from_group_chat"
+	EventTypeNewMessageReceivedFromGroupChat  = "new_message_received_from_group_chat"
 	EventTypeInteractiveMessageClick          = "interactive_message_click"
 	EventTypeNewMessageReceivedFromThread     = "new_message_received_from_thread"
 	EventTypeBotAddedToGroupChat              = "bot_added_to_group_chat"
 	EventTypeBotRemovedFromGroupChat          = "bot_removed_from_group_chat"
+	EventTypeGroupChatConvertedToExternal     = "group_chat_converted_to_external_group"
 )
 
 var eventFactories = map[string]func() Event{
@@ -26,10 +31,12 @@ var eventFactories = map[string]func() Event{
 	EventTypeUserEnterChatroomWithBot:         func() Event { return &UserEnterChatroomWithBotEvent{} },
 	EventTypeMessageFromBotSubscriber:         func() Event { return &MessageFromBotSubscriberEvent{} },
 	EventTypeNewMentionedMessageFromGroupChat: func() Event { return &NewMentionedMessageReceivedFromGroupChatEvent{} },
+	EventTypeNewMessageReceivedFromGroupChat:  func() Event { return &NewMessageReceivedFromGroupChatEvent{} },
 	EventTypeInteractiveMessageClick:          func() Event { return &InteractiveMessageClickEvent{} },
 	EventTypeNewMessageReceivedFromThread:     func() Event { return &NewMessageReceivedFromThreadEvent{} },
 	EventTypeBotAddedToGroupChat:              func() Event { return &BotAddedToGroupChatEvent{} },
 	EventTypeBotRemovedFromGroupChat:          func() Event { return &BotRemovedFromGroupChatEvent{} },
+	EventTypeGroupChatConvertedToExternal:     func() Event { return &GroupChatConvertedToExternalGroupEvent{} },
 }
 
 type VerificationEvent struct {
@@ -205,11 +212,77 @@ type NewMentionedMessageReceivedFromGroupChatEvent struct {
 				// Mention specific bot:  Empty
 				// Mention all: Empty
 				Email string `json:"email"`
+				// Location is the byte offset of the mention in the plain text message.
+				Location *uint32 `json:"location,omitempty"`
+				// Length is the byte length of the mention in the plain text message.
+				Length *uint32 `json:"length,omitempty"`
 			} `json:"mentioned_list"`
 		} `json:"text"`
 		// The interactive card payload when Tag is "interactive_message".
 		InteractiveMessage *ThreadInteractiveMessage `json:"interactive_message"`
 	} `json:"message"`
+}
+
+// NewMessageReceivedFromGroupChatEvent is sent when a new group chat message is received.
+// This requires special privilege for the bots.
+type NewMessageReceivedFromGroupChatEvent struct {
+	GroupID string `json:"group_id"`
+	Message struct {
+		MessageID       string `json:"message_id"`
+		QuotedMessageID string `json:"quoted_message_id"`
+		ThreadID        string `json:"thread_id"`
+		Sender          struct {
+			SeatalkID    string `json:"seatalk_id"`
+			EmployeeCode string `json:"employee_code"`
+			Email        string `json:"email"`
+			SenderType   int    `json:"sender_type"`
+		} `json:"sender"`
+		MessageSentTime int64  `json:"message_sent_time"`
+		Tag             string `json:"tag"`
+		Text            struct {
+			PlainText     string `json:"plain_text"`
+			MentionedList []struct {
+				Username     string  `json:"username"`
+				SeatalkID    string  `json:"seatalk_id"`
+				EmployeeCode string  `json:"employee_code"`
+				Email        string  `json:"email"`
+				Location     *uint32 `json:"location,omitempty"`
+				Length       *uint32 `json:"length,omitempty"`
+			} `json:"mentioned_list"`
+		} `json:"text"`
+		CombinedForwardedChatHistory *CombinedForwardedChatHistoryMessage `json:"combined_forwarded_chat_history"`
+		Image                        struct {
+			Content string `json:"content"`
+		} `json:"image"`
+		File struct {
+			Content  string `json:"content"`
+			Filename string `json:"filename"`
+		} `json:"file"`
+		Video struct {
+			Content string `json:"content"`
+		} `json:"video"`
+		InteractiveMessage *ThreadInteractiveMessage `json:"interactive_message"`
+		ChangeMembers      json.RawMessage           `json:"change_members"`
+		RecallMsgs         json.RawMessage           `json:"recall_msgs"`
+		GroupRemoved       json.RawMessage           `json:"group_removed"`
+		Edit               json.RawMessage           `json:"edit"`
+	} `json:"message"`
+}
+
+// EventType returns the SeaTalk event type.
+func (*NewMessageReceivedFromGroupChatEvent) EventType() string {
+	return EventTypeNewMessageReceivedFromGroupChat
+}
+
+// String returns the log summary for the group message event.
+func (e *NewMessageReceivedFromGroupChatEvent) String() string {
+	return fmt.Sprintf(
+		"message_id=%s sender=%s thread_id=%s group_id=%s",
+		e.Message.MessageID,
+		e.Message.Sender.SeatalkID,
+		e.Message.ThreadID,
+		e.GroupID,
+	)
 }
 
 // EventType returns the SeaTalk event type.
@@ -281,6 +354,10 @@ type NewMessageReceivedFromThreadEvent struct {
 				// Mention specific bot:  Empty
 				// Mention all: Empty
 				Email string `json:"email"`
+				// Location is the byte offset of the mention in the plain text message.
+				Location *uint32 `json:"location,omitempty"`
+				// Length is the byte length of the mention in the plain text message.
+				Length *uint32 `json:"length,omitempty"`
 			} `json:"mentioned_list"`
 		} `json:"text"`
 		CombinedForwardedChatHistory *CombinedForwardedChatHistoryMessage `json:"combined_forwarded_chat_history"`
@@ -364,6 +441,8 @@ type BotAddedToGroupChatEvent struct {
 		GroupID string `json:"group_id"`
 		// Group name when the bot is added
 		GroupName string `json:"group_name"`
+		// The groud is external group or not
+		External bool `json:"external"`
 		// Current group settings when the bot is added
 		GroupSettings struct {
 			// The extent to which the bot can access the chat histories sent prior to joining.
@@ -430,6 +509,31 @@ func (e *BotRemovedFromGroupChatEvent) String() string {
 		e.GroupID,
 		e.Remover.SeatalkID,
 		e.Remover.Email,
+	)
+}
+
+// GroupChatConvertedToExternalGroupEvent is sent when a group chat becomes an external group.
+type GroupChatConvertedToExternalGroupEvent struct {
+	GroupID  string `json:"group_id"`
+	Operator struct {
+		SeatalkID    string `json:"seatalk_id"`
+		EmployeeCode string `json:"employee_code"`
+		Email        string `json:"email"`
+	} `json:"operator"`
+}
+
+// EventType returns the SeaTalk event type.
+func (*GroupChatConvertedToExternalGroupEvent) EventType() string {
+	return EventTypeGroupChatConvertedToExternal
+}
+
+// String returns the log summary for the group-converted event.
+func (e *GroupChatConvertedToExternalGroupEvent) String() string {
+	return fmt.Sprintf(
+		"group_id=%s operator_seatalk_id=%s operator_email=%s",
+		e.GroupID,
+		e.Operator.SeatalkID,
+		e.Operator.Email,
 	)
 }
 

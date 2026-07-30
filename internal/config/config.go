@@ -477,9 +477,6 @@ func validateSeaTalkConfig(cfg *seatalk.Config) error {
 	if strings.TrimSpace(cfg.AppSecret) == "" {
 		return errors.New("seatalk app_secret is required")
 	}
-	if strings.TrimSpace(cfg.SigningSecret) == "" {
-		return errors.New("seatalk signing_secret is required")
-	}
 	return nil
 }
 

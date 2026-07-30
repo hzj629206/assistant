@@ -502,7 +502,7 @@ seatalk:
 	}
 }
 
-func TestParseConfigRejectsMissingSeaTalkSigningSecret(t *testing.T) {
+func TestParseConfigAllowsMissingSeaTalkSigningSecretForWebSocketDelivery(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
 
@@ -518,12 +518,12 @@ seatalk:
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	_, err := ParseConfig("assistant-test", nil)
-	if err == nil {
-		t.Fatal("expected missing seatalk signing_secret error")
+	cfg, err := ParseConfig("assistant-test", nil)
+	if err != nil {
+		t.Fatalf("parse config failed: %v", err)
 	}
-	if err.Error() != "seatalk signing_secret is required" {
-		t.Fatalf("unexpected error: %v", err)
+	if cfg.SeaTalk.SigningSecret != "" {
+		t.Fatalf("unexpected signing secret: %q", cfg.SeaTalk.SigningSecret)
 	}
 }
 

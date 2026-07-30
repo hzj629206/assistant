@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,6 +25,8 @@ import (
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/seatalk"
+
+	seatalkoapisdk "git.garena.com/seatalk/seatalk-oapi-sdk-go"
 )
 
 const (
@@ -55,15 +59,6 @@ func newSeaTalkAgentAdapterWithClient(dispatcher *agent.Dispatcher, client *seat
 		client:                 client,
 		interactiveActionStore: cache.NewMemoryStorage(),
 	}
-}
-
-// NewCallbackHandler builds the HTTP handler for SeaTalk callback requests.
-func (a *SeaTalkAgentAdapter) NewCallbackHandler() http.Handler {
-	if a == nil {
-		return seatalk.NewCallbackHandler(seatalk.Config{}, nil)
-	}
-
-	return seatalk.NewCallbackHandler(a.cfg, a)
 }
 
 // SystemPrompt returns SeaTalk-specific operating guidance for the model.
@@ -124,32 +119,100 @@ func (a *SeaTalkAgentAdapter) Tools() []agent.Tool {
 	return tools
 }
 
+// NewCallbackHandler builds the HTTP handler for SeaTalk callback requests.
+func (a *SeaTalkAgentAdapter) NewCallbackHandler() http.Handler {
+	if a == nil {
+		return seatalk.NewCallbackHandler(seatalk.Config{}, nil)
+	}
+
+	return seatalk.NewCallbackHandler(a.cfg, a)
+}
+
 // ProcessEvent routes supported SeaTalk events into the agent dispatcher.
 func (a *SeaTalkAgentAdapter) ProcessEvent(ctx context.Context, req seatalk.EventRequest, event seatalk.Event) (any, error) {
+	return nil, a.processEvent(ctx, req, event)
+}
+
+// NewWebSocketEventDispatcher builds the SDK event handler for this adapter.
+func (a *SeaTalkAgentAdapter) NewWebSocketEventDispatcher() *seatalkoapisdk.EventDispatcher {
+	return seatalkoapisdk.NewEventDispatcher().
+		OnEnvelope(func(ctx context.Context, env *seatalkoapisdk.Envelope) error {
+			return nil
+		}).
+		OnInvalidFrame(func(ctx context.Context, payload []byte, err error) error {
+			log.Printf("received invalid WebSocket frame: %q, err=%v", payload, err)
+			return nil
+		}).
+		OnUserEnterChatroomWithBot(func(ctx context.Context, event *seatalkoapisdk.UserEnterChatroomWithBotEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.UserEnterChatroomWithBotEvent{})
+		}).
+		OnMessageFromBotSubscriber(func(ctx context.Context, event *seatalkoapisdk.MessageFromBotSubscriberEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.MessageFromBotSubscriberEvent{})
+		}).
+		OnNewMentionedMessageReceivedFromGroupChat(func(ctx context.Context, event *seatalkoapisdk.NewMentionedMessageReceivedFromGroupChatEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.NewMentionedMessageReceivedFromGroupChatEvent{})
+		}).
+		OnInteractiveMessageClick(func(ctx context.Context, event *seatalkoapisdk.InteractiveMessageClickEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.InteractiveMessageClickEvent{})
+		}).
+		OnNewMessageReceivedFromThread(func(ctx context.Context, event *seatalkoapisdk.NewMessageReceivedFromThreadEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.NewMessageReceivedFromThreadEvent{})
+		}).
+		OnBotAddedToGroupChat(func(ctx context.Context, event *seatalkoapisdk.BotAddedToGroupChatEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.BotAddedToGroupChatEvent{})
+		}).
+		OnBotRemovedFromGroupChat(func(ctx context.Context, event *seatalkoapisdk.BotRemovedFromGroupChatEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.BotRemovedFromGroupChatEvent{})
+		}).
+		OnGroupChatConvertedToExternalGroup(func(ctx context.Context, event *seatalkoapisdk.GroupChatConvertedToExternalGroupEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.GroupChatConvertedToExternalGroupEvent{})
+		}).
+		OnNewMessageReceivedFromGroupChat(func(ctx context.Context, event *seatalkoapisdk.NewMessageReceivedFromGroupChatEvent) error {
+			return a.processWebSocketEvent(ctx, event, &seatalk.NewMessageReceivedFromGroupChatEvent{})
+		})
+}
+
+// processWebSocketEvent converts an SDK event to the existing callback event model.
+// Keeping conversion at this boundary lets routing and agent handling remain unchanged.
+func (a *SeaTalkAgentAdapter) processWebSocketEvent(ctx context.Context, source any, target seatalk.Event) error {
+	payload, err := json.Marshal(source)
+	if err != nil {
+		return fmt.Errorf("marshal SeaTalk WebSocket event: %w", err)
+	}
+
+	var req seatalk.EventRequest
+	if err = json.Unmarshal(payload, &req); err != nil {
+		return fmt.Errorf("decode SeaTalk WebSocket event envelope: %w", err)
+	}
+	if err = json.Unmarshal(req.Event, target); err != nil {
+		return fmt.Errorf("decode SeaTalk WebSocket event payload: %w", err)
+	}
+
+	log.Printf("received WebSocket event: event_id=%s event_type=%s %s",
+		strconv.Quote(req.EventID), strconv.Quote(target.EventType()), strconv.Quote(target.String()))
+
+	return a.processEvent(ctx, req, target)
+}
+
+func (a *SeaTalkAgentAdapter) processEvent(ctx context.Context, req seatalk.EventRequest, event seatalk.Event) error {
 	switch e := event.(type) {
 	case *seatalk.MessageFromBotSubscriberEvent, *seatalk.NewMentionedMessageReceivedFromGroupChatEvent, *seatalk.NewMessageReceivedFromThreadEvent:
 		if a == nil || a.dispatcher == nil {
-			return nil, errors.New("process callback event failed: dispatcher is nil")
+			return errors.New("process callback event failed: dispatcher is nil")
 		}
 
 		route, ok, err := a.router.Route(req, event)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !ok {
 			log.Printf("seatalk adapter ignored event: event_id=%s type=%T", req.EventID, event)
-			return nil, nil
+			return nil
 		}
 		log.Printf(
 			"seatalk adapter accepted event: event_id=%s type=%T conversation=%s kind=%s quoted_message_id=%s has_image=%t has_file=%t has_video=%t",
-			req.EventID,
-			event,
-			route.message.ConversationKey,
-			route.message.Kind,
-			route.quotedMessageID,
-			len(route.imageURLs) > 0,
-			len(route.fileAttachments) > 0,
-			len(route.videoAttachments) > 0,
+			req.EventID, event, route.message.ConversationKey, route.message.Kind, route.quotedMessageID,
+			len(route.imageURLs) > 0, len(route.fileAttachments) > 0, len(route.videoAttachments) > 0,
 		)
 		responder := &SeaTalkResponder{
 			client:             a.client,
@@ -158,13 +221,13 @@ func (a *SeaTalkAgentAdapter) ProcessEvent(ctx context.Context, req seatalk.Even
 			typingAllowedUntil: typingAllowedUntil(route.message.SentAtUnix),
 		}
 		if err = a.populateReplyMention(ctx, responder); err != nil {
-			return nil, err
+			return err
 		}
 		if !responder.target.mentionTarget.IsZero() {
 			route.message.SenderMentionHint = responder.target.mentionTarget.MarkdownTag()
 		}
 		if err = a.prepareMessageAssets(ctx, &route, responder); err != nil {
-			return nil, err
+			return err
 		}
 		if privateEvent, ok := e.(*seatalk.MessageFromBotSubscriberEvent); ok {
 			a.attachInitialPrivateThreadLoaders(&route, privateEvent, responder)
@@ -178,55 +241,35 @@ func (a *SeaTalkAgentAdapter) ProcessEvent(ctx context.Context, req seatalk.Even
 		route.message.Responder = responder
 
 		if command, ok := seatalkSlashCommand(event); ok {
-			if err = a.dispatcher.EnqueueCommand(ctx, agent.CommandRequest{
-				ConversationKey: route.message.ConversationKey,
-				EventID:         route.message.ID,
-				Responder:       responder,
-				Command:         command,
-			}); err != nil {
+			if err = a.dispatcher.EnqueueCommand(ctx, agent.CommandRequest{ConversationKey: route.message.ConversationKey, EventID: route.message.ID, Responder: responder, Command: command}); err != nil {
 				_ = responder.Cleanup(context.Background()) //nolint:contextcheck
-				return nil, err
+				return err
 			}
-			log.Printf(
-				"seatalk adapter enqueued slash command: event_id=%s conversation=%s command=%s",
-				req.EventID,
-				route.message.ConversationKey,
-				command.Name,
-			)
-			return nil, nil
+			log.Printf("seatalk adapter enqueued slash command: event_id=%s conversation=%s command=%s", req.EventID, route.message.ConversationKey, command.Name)
+			return nil
 		}
 
 		if err = a.dispatcher.Enqueue(ctx, route.message); err != nil {
 			_ = responder.Cleanup(context.Background()) //nolint:contextcheck
-			return nil, err
+			return err
 		}
-		log.Printf(
-			"seatalk adapter enqueued event: event_id=%s conversation=%s target=%s",
-			req.EventID,
-			route.message.ConversationKey,
-			route.replyTarget.logValue(),
-		)
-		return nil, nil
+		log.Printf("seatalk adapter enqueued event: event_id=%s conversation=%s target=%s", req.EventID, route.message.ConversationKey, route.replyTarget.logValue())
+		return nil
 	case *seatalk.InteractiveMessageClickEvent:
 		log.Printf("seatalk adapter received interactive event: event_id=%s message_id=%s value=%q", req.EventID, e.MessageID, e.Value)
-		if err := a.ProcessInteractiveEvent(ctx, req, e); err != nil {
-			return nil, fmt.Errorf(
-				"process interactive message click event failed: %w. message_id=%s value=%q",
-				err,
-				e.MessageID,
-				e.Value,
-			)
+		if err := a.processInteractiveEvent(ctx, req, e); err != nil {
+			return fmt.Errorf("process interactive message click event failed: %w. message_id=%s value=%q", err, e.MessageID, e.Value)
 		}
-		return nil, nil
-	case *seatalk.UserEnterChatroomWithBotEvent, *seatalk.BotAddedToGroupChatEvent, *seatalk.BotRemovedFromGroupChatEvent:
-		return nil, nil
+		return nil
+	case *seatalk.UserEnterChatroomWithBotEvent, *seatalk.NewMessageReceivedFromGroupChatEvent, *seatalk.BotAddedToGroupChatEvent, *seatalk.BotRemovedFromGroupChatEvent, *seatalk.GroupChatConvertedToExternalGroupEvent:
+		return nil
 	default:
-		return nil, nil
+		return nil
 	}
 }
 
-// ProcessInteractiveEvent handles interactive message click events.
-func (a *SeaTalkAgentAdapter) ProcessInteractiveEvent(ctx context.Context, req seatalk.EventRequest, event *seatalk.InteractiveMessageClickEvent) error {
+// processInteractiveEvent handles interactive message click events.
+func (a *SeaTalkAgentAdapter) processInteractiveEvent(ctx context.Context, req seatalk.EventRequest, event *seatalk.InteractiveMessageClickEvent) error {
 	if a == nil || a.dispatcher == nil {
 		return errors.New("process interactive event failed: dispatcher is nil")
 	}

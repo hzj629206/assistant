@@ -3,7 +3,8 @@
 # Copy the fields you need into your real config file.
 # The default lookup path at runtime is: ~/.assistant/config.yml
 
-# HTTP listen address for the local callback server.
+# HTTP listen address for the local server.
+# SeaTalk callback endpoint is registered only when seatalk.signing_secret is configured.
 # Default: ":8421"
 listen_addr: ":8421"
 
@@ -107,7 +108,9 @@ seatalk:
   # Required SeaTalk app secret.
   app_secret: ""
 
-  # Required SeaTalk callback signing secret.
+  # Optional SeaTalk callback signing secret.
+  # Leave empty to receive events through SeaTalk WebSocket (recommended).
+  # Set it to use the legacy HTTP callback delivery instead.
   signing_secret: ""
 
   # Whether employee profile lookup APIs are allowed.

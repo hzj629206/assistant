@@ -91,10 +91,12 @@ func TestSeaTalkRouterRoutesGroupThreadMessage(t *testing.T) {
 	event.Message.Tag = "text"
 	event.Message.Text.PlainText = "ask @Alice about this"
 	event.Message.Text.MentionedList = []struct {
-		Username     string `json:"username"`
-		SeatalkID    string `json:"seatalk_id"`
-		EmployeeCode string `json:"employee_code"`
-		Email        string `json:"email"`
+		Username     string  `json:"username"`
+		SeatalkID    string  `json:"seatalk_id"`
+		EmployeeCode string  `json:"employee_code"`
+		Email        string  `json:"email"`
+		Location     *uint32 `json:"location,omitempty"`
+		Length       *uint32 `json:"length,omitempty"`
 	}{
 		{
 			Username:  "Alice",
@@ -208,10 +210,12 @@ func TestSeaTalkRouterRoutesMentionedGroupMessage(t *testing.T) {
 	event.Message.Tag = "text"
 	event.Message.Text.PlainText = "@bot ask @Carol hi"
 	event.Message.Text.MentionedList = []struct {
-		Username     string `json:"username"`
-		SeatalkID    string `json:"seatalk_id"`
-		EmployeeCode string `json:"employee_code"`
-		Email        string `json:"email"`
+		Username     string  `json:"username"`
+		SeatalkID    string  `json:"seatalk_id"`
+		EmployeeCode string  `json:"employee_code"`
+		Email        string  `json:"email"`
+		Location     *uint32 `json:"location,omitempty"`
+		Length       *uint32 `json:"length,omitempty"`
 	}{
 		{
 			Username:  "bot",
@@ -318,10 +322,12 @@ func TestSeaTalkRouterTagsUpdatedMentionedGroupTextMessage(t *testing.T) {
 	event.Message.Text.PlainText = "@bot patched"
 	event.Message.Text.LastEditedTime = 1_700_000_250
 	event.Message.Text.MentionedList = []struct {
-		Username     string `json:"username"`
-		SeatalkID    string `json:"seatalk_id"`
-		EmployeeCode string `json:"employee_code"`
-		Email        string `json:"email"`
+		Username     string  `json:"username"`
+		SeatalkID    string  `json:"seatalk_id"`
+		EmployeeCode string  `json:"employee_code"`
+		Email        string  `json:"email"`
+		Location     *uint32 `json:"location,omitempty"`
+		Length       *uint32 `json:"length,omitempty"`
 	}{
 		{
 			Username:  "bot",
@@ -372,10 +378,12 @@ func TestSeaTalkRouterRoutesMentionedGroupThreadMessage(t *testing.T) {
 	event.Message.Tag = "text"
 	event.Message.Text.PlainText = "@bot please help"
 	event.Message.Text.MentionedList = []struct {
-		Username     string `json:"username"`
-		SeatalkID    string `json:"seatalk_id"`
-		EmployeeCode string `json:"employee_code"`
-		Email        string `json:"email"`
+		Username     string  `json:"username"`
+		SeatalkID    string  `json:"seatalk_id"`
+		EmployeeCode string  `json:"employee_code"`
+		Email        string  `json:"email"`
+		Location     *uint32 `json:"location,omitempty"`
+		Length       *uint32 `json:"length,omitempty"`
 	}{
 		{
 			Username:  "bot",

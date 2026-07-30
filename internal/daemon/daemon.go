@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/internal/config"
 	"github.com/hzj629206/assistant/internal/tunnel"
+
+	seatalkoapisdk "git.garena.com/seatalk/seatalk-oapi-sdk-go"
 )
 
 // RunnerFactory creates the runner for one daemon process.
@@ -76,6 +79,9 @@ type process struct {
 	errCh         chan error
 	dispatcher    *agent.Dispatcher
 	runner        agent.Runner
+	wsClient      *seatalkoapisdk.Client
+	wsCancel      context.CancelFunc
+	httpServerMux *http.ServeMux
 	httpServer    *http.Server
 	remoteTunnel  tunnel.Tunnel
 	runnerFactory RunnerFactory
@@ -86,6 +92,7 @@ func newProcess(cfg config.Config, factory RunnerFactory) *process {
 		cfg:           cfg,
 		errCh:         make(chan error, 3),
 		runnerFactory: factory,
+		httpServerMux: http.NewServeMux(),
 	}
 }
 
@@ -130,11 +137,43 @@ func (p *process) start(ctx context.Context) error {
 	p.runner.RegisterSystemPrompt(seaTalkAdapter.SystemPrompt())
 	p.runner.RegisterTools(seaTalkAdapter.Tools()...)
 
-	p.httpServer = newHTTPServer(seaTalkAdapter.NewCallbackHandler())
+	if strings.TrimSpace(p.cfg.SeaTalk.SigningSecret) == "" {
+		p.wsClient = seatalkoapisdk.NewClient(
+			p.cfg.SeaTalk.AppID,
+			p.cfg.SeaTalk.AppSecret,
+			seatalkoapisdk.WithEventDispatcher(seaTalkAdapter.NewWebSocketEventDispatcher()),
+		)
+		registerResult, connectErr := p.wsClient.Connect(ctx)
+		if connectErr != nil {
+			return fmt.Errorf("connect SeaTalk WebSocket: %w", connectErr)
+		}
+		log.Printf("SeaTalk WebSocket connected: app_id=%s session_id=%s", registerResult.AppID, registerResult.Sid)
+		defer func() {
+			if err != nil {
+				if shutdownErr := p.shutdownWebSocket(ctx); shutdownErr != nil {
+					log.Printf("SeaTalk WebSocket rollback failed: %v", shutdownErr)
+				}
+			}
+		}()
+
+		// The WebSocket lives for the process lifetime, rather than the bounded startup context.
+		wsCtx, wsCancel := context.WithCancel(context.WithoutCancel(ctx))
+		p.wsCancel = wsCancel
+		go p.receiveWebSocketEvents(wsCtx)
+		log.Printf("SeaTalk event delivery configured for WebSocket")
+	} else {
+		p.httpServerMux.Handle("/callback", seaTalkAdapter.NewCallbackHandler())
+		log.Printf("SeaTalk event delivery configured for HTTP callbacks")
+	}
+
+	p.httpServer = &http.Server{
+		Handler:           p.httpServerMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	defer func() {
 		if err != nil {
 			if shutdownErr := p.shutdownHTTP(ctx); shutdownErr != nil {
-				log.Printf("http service rollback failed: %v", shutdownErr)
+				log.Printf("HTTP service rollback failed: %v", shutdownErr)
 			}
 		}
 	}()
@@ -148,6 +187,14 @@ func (p *process) start(ctx context.Context) error {
 		return fmt.Errorf("create remote tunnel failed: %w", err)
 	}
 	if p.remoteTunnel != nil {
+		defer func() {
+			if err != nil {
+				if shutdownErr := p.remoteTunnel.Shutdown(ctx); shutdownErr != nil {
+					log.Printf("remote tunnel rollback failed: %v", shutdownErr)
+				}
+			}
+		}()
+
 		p.remoteTunnel.Start(ctx)
 	}
 
@@ -165,8 +212,12 @@ func (p *process) shutdown(ctx context.Context) error {
 
 	if p.httpServer != nil {
 		if err := p.shutdownHTTP(ctx); err != nil {
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("http service shutdown failed: %w", err))
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("HTTP service shutdown failed: %w", err))
 		}
+	}
+
+	if err := p.shutdownWebSocket(ctx); err != nil {
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("SeaTalk WebSocket shutdown failed: %w", err))
 	}
 
 	if p.dispatcher != nil {

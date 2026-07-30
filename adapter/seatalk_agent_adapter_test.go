@@ -21,6 +21,8 @@ import (
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/seatalk"
+
+	seatalkoapisdk "git.garena.com/seatalk/seatalk-oapi-sdk-go"
 )
 
 func TestSeaTalkAgentAdapterEnqueuesSupportedEvent(t *testing.T) {
@@ -67,6 +69,109 @@ func TestSeaTalkAgentAdapterEnqueuesSupportedEvent(t *testing.T) {
 	}
 	if reqCall.Message.Text != "hello" {
 		t.Fatalf("unexpected routed message text: %q", reqCall.Message.Text)
+	}
+}
+
+func TestSeaTalkAgentAdapterEnqueuesWebSocketSubscriberMessage(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{}
+	dispatcher := agent.NewDispatcher(agent.DispatcherOptions{
+		Store:              agent.NewConversationStore(cache.NewMemoryStorage()),
+		Runner:             runner,
+		WorkerCount:        1,
+		NonTextMergeWindow: 10 * time.Millisecond,
+	})
+	seaTalkAdapter := newSeaTalkAgentAdapterWithClient(dispatcher, nil)
+
+	if err := dispatcher.Start(); err != nil {
+		t.Fatalf("start dispatcher failed: %v", err)
+	}
+	defer func() {
+		if err := dispatcher.Shutdown(context.Background()); err != nil {
+			t.Fatalf("shutdown dispatcher failed: %v", err)
+		}
+	}()
+
+	event := &seatalkoapisdk.MessageFromBotSubscriberEvent{
+		EventID:   "evt-websocket-1",
+		EventType: seatalkoapisdk.EventTypeMessageFromBotSubscriber,
+		Timestamp: 1_700_000_000_000,
+		AppID:     "app-1",
+		Event: seatalkoapisdk.MessageFromBotSubscriberEventDetail{
+			SeaTalkID:    "u_1",
+			EmployeeCode: "e_1",
+			Message: seatalkoapisdk.BotSubscriberMessage{
+				MessageID: "msg-websocket-1",
+				Tag:       seatalkoapisdk.MessageTagText,
+				Text:      &seatalkoapisdk.TextMessage{Content: "hello from websocket"},
+			},
+		},
+	}
+
+	if err := seaTalkAdapter.processWebSocketEvent(context.Background(), event, &seatalk.MessageFromBotSubscriberEvent{}); err != nil {
+		t.Fatalf("process WebSocket event failed: %v", err)
+	}
+	if err := waitForRunnerCalls(runner); err != nil {
+		t.Fatal(err)
+	}
+
+	reqCall := runner.LastRequest()
+	if reqCall.Message.ID != "evt-websocket-1" {
+		t.Fatalf("unexpected message ID: %q", reqCall.Message.ID)
+	}
+	if reqCall.Message.Text != "hello from websocket" {
+		t.Fatalf("unexpected routed message text: %q", reqCall.Message.Text)
+	}
+}
+
+func TestSeaTalkAgentAdapterMovesWebSocketThreadMentionsIntoText(t *testing.T) {
+	t.Parallel()
+
+	runner := &testRunner{}
+	dispatcher := agent.NewDispatcher(agent.DispatcherOptions{
+		Store:              agent.NewConversationStore(cache.NewMemoryStorage()),
+		Runner:             runner,
+		WorkerCount:        1,
+		NonTextMergeWindow: 10 * time.Millisecond,
+	})
+	seaTalkAdapter := newSeaTalkAgentAdapterWithClient(dispatcher, nil)
+	if err := dispatcher.Start(); err != nil {
+		t.Fatalf("start dispatcher failed: %v", err)
+	}
+	defer func() {
+		if err := dispatcher.Shutdown(context.Background()); err != nil {
+			t.Fatalf("shutdown dispatcher failed: %v", err)
+		}
+	}()
+
+	event := &seatalkoapisdk.NewMessageReceivedFromThreadEvent{
+		EventID:   "evt-websocket-thread-1",
+		EventType: seatalkoapisdk.EventTypeNewMessageReceivedFromThread,
+		Event: seatalkoapisdk.NewMessageReceivedFromThreadEventData{
+			GroupID: "group-1",
+			Message: seatalkoapisdk.ThreadMessage{
+				MessageID: "msg-websocket-thread-1",
+				ThreadID:  "thread-1",
+				Tag:       seatalkoapisdk.MessageTagText,
+				Text: &seatalkoapisdk.ThreadTextMessage{
+					PlainText: "hello @alice",
+					MentionedList: []*seatalkoapisdk.ThreadMentionedActor{{
+						Username: "alice", SeaTalkID: "seatalk-alice", Email: "alice@example.com",
+					}},
+				},
+			},
+		},
+	}
+
+	if err := seaTalkAdapter.processWebSocketEvent(context.Background(), event, &seatalk.NewMessageReceivedFromThreadEvent{}); err != nil {
+		t.Fatalf("process WebSocket event failed: %v", err)
+	}
+	if err := waitForRunnerCalls(runner); err != nil {
+		t.Fatal(err)
+	}
+	if got := runner.LastRequest().Message.Text; got != "hello @alice [mentioned_user_email=alice@example.com]" {
+		t.Fatalf("unexpected routed message text: %q", got)
 	}
 }
 
@@ -3418,10 +3523,12 @@ func TestSeatalkSlashCommandRemovesBotMentionFromGroupText(t *testing.T) {
 	event := &seatalk.NewMentionedMessageReceivedFromGroupChatEvent{}
 	event.Message.Text.PlainText = "/stop @assistant"
 	event.Message.Text.MentionedList = []struct {
-		Username     string `json:"username"`
-		SeatalkID    string `json:"seatalk_id"`
-		EmployeeCode string `json:"employee_code"`
-		Email        string `json:"email"`
+		Username     string  `json:"username"`
+		SeatalkID    string  `json:"seatalk_id"`
+		EmployeeCode string  `json:"employee_code"`
+		Email        string  `json:"email"`
+		Location     *uint32 `json:"location,omitempty"`
+		Length       *uint32 `json:"length,omitempty"`
 	}{
 		{Username: "assistant", SeatalkID: "bot-1"},
 	}
@@ -3442,10 +3549,12 @@ func TestNormalizeMentionedGroupSlashCommandTextLeavesNonBotMentionsIntact(t *te
 	event := &seatalk.NewMentionedMessageReceivedFromGroupChatEvent{}
 	event.Message.Text.PlainText = "@alice /stop @assistant"
 	event.Message.Text.MentionedList = []struct {
-		Username     string `json:"username"`
-		SeatalkID    string `json:"seatalk_id"`
-		EmployeeCode string `json:"employee_code"`
-		Email        string `json:"email"`
+		Username     string  `json:"username"`
+		SeatalkID    string  `json:"seatalk_id"`
+		EmployeeCode string  `json:"employee_code"`
+		Email        string  `json:"email"`
+		Location     *uint32 `json:"location,omitempty"`
+		Length       *uint32 `json:"length,omitempty"`
 	}{
 		{Username: "alice", SeatalkID: "user-1", EmployeeCode: "e_1", Email: "alice@example.com"},
 		{Username: "assistant", SeatalkID: "bot-1"},

@@ -282,3 +282,68 @@ func TestMessageFromBotSubscriberEventString(t *testing.T) {
 		t.Fatalf("unexpected event string: %q", got)
 	}
 }
+
+func TestDecodeEventGroupChatConvertedToExternalGroup(t *testing.T) {
+	t.Parallel()
+
+	req := EventRequest{
+		EventType: EventTypeGroupChatConvertedToExternal,
+		Event: json.RawMessage(`{
+            "group_id": "group-1",
+            "operator": {
+                "seatalk_id": "seatalk-1",
+                "employee_code": "employee-1",
+                "email": "operator@example.com"
+            }
+        }`),
+	}
+
+	event, err := req.decodeEvent()
+	if err != nil {
+		t.Fatalf("decode event failed: %v", err)
+	}
+	converted, ok := event.(*GroupChatConvertedToExternalGroupEvent)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", event)
+	}
+	if converted.GroupID != "group-1" || converted.Operator.SeatalkID != "seatalk-1" {
+		t.Fatalf("unexpected event: %+v", converted)
+	}
+}
+
+func TestDecodeEventNewMessageReceivedFromGroupChat(t *testing.T) {
+	t.Parallel()
+
+	req := EventRequest{
+		EventType: EventTypeNewMessageReceivedFromGroupChat,
+		Event: json.RawMessage(`{
+            "group_id": "group-1",
+            "message": {
+                "message_id": "message-1",
+                "thread_id": "thread-1",
+                "sender": {"seatalk_id": "seatalk-1"},
+                "tag": "text",
+                "text": {
+                    "plain_text": "hello @alice",
+					"mentioned_list": [{"username": "alice", "seatalk_id": "seatalk-alice", "location": 6, "length": 6}]
+                }
+            }
+        }`),
+	}
+
+	event, err := req.decodeEvent()
+	if err != nil {
+		t.Fatalf("decode event failed: %v", err)
+	}
+	groupEvent, ok := event.(*NewMessageReceivedFromGroupChatEvent)
+	if !ok {
+		t.Fatalf("unexpected event type: %T", event)
+	}
+	if groupEvent.Message.Text.PlainText != "hello @alice" || len(groupEvent.Message.Text.MentionedList) != 1 {
+		t.Fatalf("unexpected event payload: %+v", groupEvent)
+	}
+	mentioned := groupEvent.Message.Text.MentionedList[0]
+	if mentioned.Location == nil || *mentioned.Location != 6 || mentioned.Length == nil || *mentioned.Length != 6 {
+		t.Fatalf("unexpected mention position: %+v", mentioned)
+	}
+}

@@ -258,6 +258,10 @@ type MentionedEntity struct {
 	EmployeeCode string `json:"employee_code"`
 	// Email is the email of the mentioned user when available.
 	Email string `json:"email"`
+	// Location is the byte offset of the mention in the plain text message.
+	Location *uint32 `json:"location,omitempty"`
+	// Length is the byte length of the mention in the plain text message.
+	Length *uint32 `json:"length,omitempty"`
 }
 
 // MessageSender contains the basic sender information returned with a message.
