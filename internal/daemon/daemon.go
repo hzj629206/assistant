@@ -143,11 +143,6 @@ func (p *process) start(ctx context.Context) error {
 			p.cfg.SeaTalk.AppSecret,
 			seatalkoapisdk.WithEventDispatcher(seaTalkAdapter.NewWebSocketEventDispatcher()),
 		)
-		registerResult, connectErr := p.wsClient.Connect(ctx)
-		if connectErr != nil {
-			return fmt.Errorf("connect SeaTalk WebSocket: %w", connectErr)
-		}
-		log.Printf("SeaTalk WebSocket connected: app_id=%s session_id=%s", registerResult.AppID, registerResult.Sid)
 		defer func() {
 			if err != nil {
 				if shutdownErr := p.shutdownWebSocket(ctx); shutdownErr != nil {
@@ -156,10 +151,7 @@ func (p *process) start(ctx context.Context) error {
 			}
 		}()
 
-		// The WebSocket lives for the process lifetime, rather than the bounded startup context.
-		wsCtx, wsCancel := context.WithCancel(context.WithoutCancel(ctx))
-		p.wsCancel = wsCancel
-		go p.receiveWebSocketEvents(wsCtx)
+		p.receiveWebSocketEvents(ctx)
 		log.Printf("SeaTalk event delivery configured for WebSocket")
 	} else {
 		p.httpServerMux.Handle("/callback", seaTalkAdapter.NewCallbackHandler())
@@ -178,7 +170,7 @@ func (p *process) start(ctx context.Context) error {
 		}
 	}()
 
-	if err = p.serveHTTP(ctx, p.cfg.ListenAddr); err != nil {
+	if err = p.serveHTTP(ctx); err != nil {
 		return fmt.Errorf("listen on %s failed: %w", p.cfg.ListenAddr, err)
 	}
 

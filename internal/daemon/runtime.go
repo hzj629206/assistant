@@ -44,8 +44,8 @@ func newRemoteTunnel(listenAddr string, cfg config.TunnelConfig) (tunnel.Tunnel,
 	})
 }
 
-func (p *process) serveHTTP(ctx context.Context, listenAddr string) error {
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+func (p *process) serveHTTP(ctx context.Context) error {
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", p.cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
@@ -73,11 +73,49 @@ func (p *process) receiveWebSocketEvents(ctx context.Context) {
 	if p == nil || p.wsClient == nil {
 		return
 	}
-	err := p.wsClient.Start(ctx)
-	if err != nil && ctx.Err() == nil {
-		log.Printf("SeaTalk WebSocket stopped unexpectedly: %v", err)
-		p.errCh <- err
-	}
+
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	p.wsCancel = cancel
+
+	go func() {
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			registerResult, connectErr := p.wsClient.Connect(ctx)
+			if connectErr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+
+				log.Printf("SeaTalk WebSocket connect failed: %v", connectErr)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+
+			//nolint:gosec // SeaTalk returns the app ID and session ID; both are safe diagnostic values.
+			log.Printf("SeaTalk WebSocket connected: app_id=%s session_id=%s", registerResult.AppID, registerResult.Sid)
+
+			err := p.wsClient.Start(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				log.Printf("SeaTalk WebSocket stopped unexpectedly: %v", err)
+			} else {
+				log.Printf("SeaTalk WebSocket stopped unexpectedly")
+			}
+
+			if closeErr := p.wsClient.Close(); closeErr != nil {
+				log.Printf("SeaTalk WebSocket close before reconnect failed: %v", closeErr)
+			}
+		}
+	}()
 }
 
 func (p *process) shutdownWebSocket(_ context.Context) error {
