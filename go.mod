@@ -1,12 +1,10 @@
 module github.com/hzj629206/assistant
 
-go 1.25.7
+go 1.25.12
 
 require golang.org/x/crypto v0.50.0
 
-require github.com/godeps/codex-sdk-go v0.1.1
-
-require github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d
+require github.com/pmenglund/codex-sdk-go v0.147.0
 
 require (
 	github.com/gorilla/websocket v1.5.3

@@ -17,6 +17,7 @@ type acpRunnerSession struct {
 	conversationKey string
 	sessionID       string
 
+	scheduleMu                  sync.Mutex
 	mu                          sync.Mutex
 	session                     acp.Session
 	token                       string
@@ -56,6 +57,9 @@ func (s *acpRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (T
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run acp turn failed: session is nil")
 	}
+	s.scheduleMu.Lock()
+	defer s.scheduleMu.Unlock()
+
 	s.mu.Lock()
 	closed := s.closed
 	s.mu.Unlock()

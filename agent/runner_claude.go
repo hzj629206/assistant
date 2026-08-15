@@ -436,10 +436,6 @@ func (r *ClaudeCodeRunner) clearArgFileCacheLocked() {
 	clear(r.argFiles)
 }
 
-func (r *ClaudeCodeRunner) buildTurnPrompt(req TurnRequest) (string, []string) {
-	return buildTurnPrompt(req.Message)
-}
-
 func (r *ClaudeCodeRunner) buildClaudeSessionRunOptions(sessionID string, control *claudeControlServer) (claudecode.RunOptions, error) {
 	systemPrompts, tools := r.globalContext()
 	runOptions := r.runOptions

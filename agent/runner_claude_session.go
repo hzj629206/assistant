@@ -17,6 +17,7 @@ type claudeRunnerSession struct {
 	conversationKey string
 	sessionID       string
 
+	scheduleMu  sync.Mutex
 	mu          sync.Mutex
 	session     claudecode.Session
 	control     *claudeControlServer
@@ -58,6 +59,9 @@ func (s *claudeRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest)
 	if s == nil || s.runner == nil {
 		return nil, errors.New("run claude code turn failed: session is nil")
 	}
+	s.scheduleMu.Lock()
+	defer s.scheduleMu.Unlock()
+
 	s.mu.Lock()
 	closed := s.closed
 	s.mu.Unlock()
@@ -257,8 +261,8 @@ func (s *claudeRunnerSession) scheduleClaudeTurn(ctx context.Context, req TurnRe
 	if s == nil || s.runner == nil {
 		return nil, 0, 0, errors.New("claude code session is nil")
 	}
-	prompt, imagePaths := s.runner.buildTurnPrompt(req)
-	blocks, err := claudecode.BuildUserContentBlocks(prompt, imagePaths)
+	prompt := buildTurnPromptResult(req.Message)
+	blocks, err := claudecode.BuildUserContentBlocks(prompt.Text, prompt.ImagePaths)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -270,7 +274,7 @@ func (s *claudeRunnerSession) scheduleClaudeTurn(ctx context.Context, req TurnRe
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	return turn, len(prompt), len(imagePaths), nil
+	return turn, len(prompt.Text), len(prompt.ImagePaths), nil
 }
 
 func (s *claudeRunnerSession) clearCurrentTurn(turn *claudeScheduledTurn) {

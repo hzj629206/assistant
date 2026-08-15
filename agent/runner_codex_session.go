@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/godeps/codex-sdk-go"
+	"github.com/hzj629206/assistant/agent/codex"
 )
 
 type codexRunnerSession struct {
@@ -17,17 +18,27 @@ type codexRunnerSession struct {
 	conversationKey       string
 	threadID              string
 	thread                codexThread
+	scheduleMu            sync.Mutex
 	mu                    sync.Mutex
 	pendingInitialContext bool
-	activeTurn            *codexRunnerActiveTurn
+	activeTurn            *codexScheduledTurn
 	closed                atomic.Bool
 }
 
 type codexScheduledTurn struct {
-	session *codexRunnerSession
-	req     TurnRequest
-	active  *codexRunnerActiveTurn
-	runCalled atomic.Bool
+	session          *codexRunnerSession
+	req              TurnRequest
+	requestInterrupt func()
+	done             chan struct{}
+	interrupted      atomic.Bool
+	runStarted       bool
+	finished         bool
+	runCalled        atomic.Bool
+}
+
+type codexThread interface {
+	ID() string
+	RunStreamed(input codex.Input, turnOptions codex.TurnOptions) (*codex.StreamedTurn, error)
 }
 
 func (s *codexRunnerSession) ID() string {
@@ -35,17 +46,6 @@ func (s *codexRunnerSession) ID() string {
 		return ""
 	}
 	return s.currentThreadID()
-}
-
-func (s *codexRunnerSession) interruptCurrentTurn(ctx context.Context) error {
-	if s == nil || s.runner == nil {
-		return nil
-	}
-	activeTurn, ok := s.activeSessionTurn()
-	if !ok {
-		return nil
-	}
-	return (&codexScheduledTurn{session: s, active: activeTurn}).Interrupt(ctx)
 }
 
 //nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
@@ -73,37 +73,45 @@ func (s *codexRunnerSession) ScheduleTurn(ctx context.Context, req TurnRequest) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var activeTurn *codexRunnerActiveTurn
-	for {
-		_, releaseTurnCtx := joinRunnerContext(context.Background(), s.runner.lifecycleCtx)
-		var currentTurn *codexRunnerActiveTurn
-		activeTurn, currentTurn, err = s.startTurn(thread.ID(), releaseTurnCtx)
-		if err != nil {
-			releaseTurnCtx()
-			return nil, fmt.Errorf("run codex turn failed: %w", err)
-		}
-		if currentTurn == nil {
-			break
-		}
+
+	s.scheduleMu.Lock()
+	defer s.scheduleMu.Unlock()
+
+	_, releaseTurnCtx := joinRunnerContext(context.Background(), s.runner.lifecycleCtx)
+	activeTurn, currentTurn, err := s.startTurn(thread.ID(), req, releaseTurnCtx)
+	if err != nil {
 		releaseTurnCtx()
-		if interruptErr := (&codexScheduledTurn{session: s, active: currentTurn}).Interrupt(ctx); interruptErr != nil {
-			return nil, fmt.Errorf("run codex turn failed: %w", interruptErr)
-		}
+		return nil, fmt.Errorf("run codex turn failed: %w", err)
 	}
-	return &codexScheduledTurn{session: s, req: req, active: activeTurn}, nil
+	if currentTurn == nil {
+		return activeTurn, nil
+	}
+
+	releaseTurnCtx()
+	if interruptErr := currentTurn.Interrupt(ctx); interruptErr != nil {
+		return nil, fmt.Errorf("run codex turn failed: %w", interruptErr)
+	}
+
+	_, releaseTurnCtx = joinRunnerContext(context.Background(), s.runner.lifecycleCtx)
+	activeTurn, _, err = s.startTurn(thread.ID(), req, releaseTurnCtx)
+	if err != nil {
+		releaseTurnCtx()
+		return nil, fmt.Errorf("run codex turn failed: %w", err)
+	}
+
+	return activeTurn, nil
 }
 
 func (t *codexScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 	s := t.session
 	req := t.req
-	activeTurn := t.active
 	if s == nil || s.runner == nil {
 		return TurnResult{}, errors.New("run codex turn failed: session is nil")
 	}
 	if !t.runCalled.CompareAndSwap(false, true) {
 		return TurnResult{}, errors.New("run codex turn failed: turn run already started")
 	}
-	if !s.startTurnRun(activeTurn) {
+	if !s.startTurnRun(t) {
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", context.Canceled)
 	}
 	prompts, tools := s.runner.globalContext()
@@ -130,7 +138,7 @@ func (t *codexScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 		inputReq.Conversation.RunnerThreadID = ""
 	}
 
-	input, err := s.runner.buildTurnInputWithContext(inputReq, turnContext)
+	input, err := buildCodexTurnInput(inputReq, turnContext)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
 	}
@@ -138,11 +146,11 @@ func (t *codexScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 	s.pendingInitialContext = false
 	s.mu.Unlock()
 
-	defer s.finishTurn(activeTurn, thread.ID())
+	defer s.finishTurn(t, thread.ID())
 	turnCtx, releaseTurnCtx := joinRunnerContext(ctx, s.runner.lifecycleCtx)
-	s.setActiveTurnInterrupt(activeTurn, releaseTurnCtx)
+	s.setActiveTurnInterrupt(t, releaseTurnCtx)
 	defer releaseTurnCtx()
-	if activeTurn.interrupted.Load() {
+	if t.interrupted.Load() {
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", context.Canceled)
 	}
 
@@ -164,7 +172,7 @@ func (t *codexScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 			return TurnResult{}, fmt.Errorf("run codex turn failed: %w", err)
 		}
 	}
-	if activeTurn.interrupted.Load() {
+	if t.interrupted.Load() {
 		return TurnResult{}, fmt.Errorf("run codex turn failed: %w", context.Canceled)
 	}
 
@@ -182,22 +190,21 @@ func (t *codexScheduledTurn) Interrupt(ctx context.Context) error {
 		return nil
 	}
 
-	activeTurn := t.active
 	threadID := s.ID()
 	log.Printf("codex session interrupt requested: conversation=%s thread_id=%s", s.conversationKey, threadID)
-	activeTurn.interrupted.Store(true)
-	if s.finishTurnInterruptBeforeRun(activeTurn) {
+	t.interrupted.Store(true)
+	if s.finishTurnInterruptBeforeRun(t) {
 		log.Printf("codex session interrupt completed: conversation=%s thread_id=%s", s.conversationKey, threadID)
 		return nil
 	}
-	if requestInterrupt := s.activeTurnInterrupt(activeTurn); requestInterrupt != nil {
+	if requestInterrupt := s.activeTurnInterrupt(t); requestInterrupt != nil {
 		requestInterrupt()
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	select {
-	case <-activeTurn.done:
+	case <-t.done:
 		log.Printf("codex session interrupt completed: conversation=%s thread_id=%s", s.conversationKey, threadID)
 		return nil
 	case <-ctx.Done():
@@ -205,7 +212,7 @@ func (t *codexScheduledTurn) Interrupt(ctx context.Context) error {
 	}
 }
 
-func (t *codexScheduledTurn) Done() <-chan struct{} { return t.active.done }
+func (t *codexScheduledTurn) Done() <-chan struct{} { return t.done }
 
 func (s *codexRunnerSession) Close() error {
 	if s == nil || s.runner == nil {
@@ -255,14 +262,6 @@ func (s *codexRunnerSession) Status(context.Context) (SessionStatus, error) {
 	}, nil
 }
 
-type codexRunnerActiveTurn struct {
-	requestInterrupt func()
-	done             chan struct{}
-	interrupted      atomic.Bool
-	runStarted       bool
-	finished         bool
-}
-
 func (s *codexRunnerSession) currentThreadID() string {
 	if s == nil {
 		return ""
@@ -288,7 +287,7 @@ func (s *codexRunnerSession) setThreadID(threadID string) {
 	s.mu.Unlock()
 }
 
-func (s *codexRunnerSession) activeSessionTurn() (*codexRunnerActiveTurn, bool) {
+func (s *codexRunnerSession) activeSessionTurn() (*codexScheduledTurn, bool) {
 	if s == nil {
 		return nil, false
 	}
@@ -301,7 +300,7 @@ func (s *codexRunnerSession) activeSessionTurn() (*codexRunnerActiveTurn, bool) 
 	return s.activeTurn, true
 }
 
-func (s *codexRunnerSession) startTurnRun(activeTurn *codexRunnerActiveTurn) bool {
+func (s *codexRunnerSession) startTurnRun(activeTurn *codexScheduledTurn) bool {
 	if s == nil || activeTurn == nil {
 		return false
 	}
@@ -315,7 +314,7 @@ func (s *codexRunnerSession) startTurnRun(activeTurn *codexRunnerActiveTurn) boo
 	return true
 }
 
-func (s *codexRunnerSession) setActiveTurnInterrupt(activeTurn *codexRunnerActiveTurn, requestInterrupt func()) {
+func (s *codexRunnerSession) setActiveTurnInterrupt(activeTurn *codexScheduledTurn, requestInterrupt func()) {
 	if s == nil || activeTurn == nil {
 		return
 	}
@@ -327,7 +326,7 @@ func (s *codexRunnerSession) setActiveTurnInterrupt(activeTurn *codexRunnerActiv
 	s.mu.Unlock()
 }
 
-func (s *codexRunnerSession) activeTurnInterrupt(activeTurn *codexRunnerActiveTurn) func() {
+func (s *codexRunnerSession) activeTurnInterrupt(activeTurn *codexScheduledTurn) func() {
 	if s == nil || activeTurn == nil {
 		return nil
 	}
@@ -340,12 +339,14 @@ func (s *codexRunnerSession) activeTurnInterrupt(activeTurn *codexRunnerActiveTu
 	return activeTurn.requestInterrupt
 }
 
-func (s *codexRunnerSession) startTurn(threadID string, cancel func()) (*codexRunnerActiveTurn, *codexRunnerActiveTurn, error) {
+func (s *codexRunnerSession) startTurn(threadID string, req TurnRequest, cancel func()) (*codexScheduledTurn, *codexScheduledTurn, error) {
 	if s == nil {
 		return nil, nil, errors.New("session is nil")
 	}
 
-	activeTurn := &codexRunnerActiveTurn{
+	activeTurn := &codexScheduledTurn{
+		session:          s,
+		req:              req,
 		requestInterrupt: cancel,
 		done:             make(chan struct{}),
 	}
@@ -365,7 +366,7 @@ func (s *codexRunnerSession) startTurn(threadID string, cancel func()) (*codexRu
 	return activeTurn, nil, nil
 }
 
-func (s *codexRunnerSession) finishTurnInterruptBeforeRun(activeTurn *codexRunnerActiveTurn) bool {
+func (s *codexRunnerSession) finishTurnInterruptBeforeRun(activeTurn *codexScheduledTurn) bool {
 	if s == nil || activeTurn == nil {
 		return false
 	}
@@ -387,7 +388,7 @@ func (s *codexRunnerSession) finishTurnInterruptBeforeRun(activeTurn *codexRunne
 	return true
 }
 
-func (s *codexRunnerSession) finishTurn(activeTurn *codexRunnerActiveTurn, threadID string) {
+func (s *codexRunnerSession) finishTurn(activeTurn *codexScheduledTurn, threadID string) {
 	if activeTurn == nil {
 		return
 	}
@@ -421,7 +422,6 @@ func (s *codexRunnerSession) runThreadTurn(req TurnRequest, thread codexThread, 
 	if err != nil {
 		return codex.Turn{}, err
 	}
-
 	return s.collectStreamedTurn(req, streamed)
 }
 
@@ -434,68 +434,144 @@ func (s *codexRunnerSession) collectStreamedTurn(req TurnRequest, streamed *code
 	var finalResponse string
 	var usage *codex.Usage
 	var turnFailure *codex.ThreadError
-
 	for event := range streamed.Events {
 		switch event.Type {
-		case "thread.started":
-			log.Printf(
-				"codex runner thread started: conversation=%s thread_id=%s",
-				req.Conversation.Key,
-				event.ThreadID,
-			)
 		case "item.completed":
 			if event.Item != nil {
-				logCodexCompletedItem(req, event.Item)
 				items = append(items, event.Item)
-				if msg, ok := event.Item.(*codex.AgentMessageItem); ok {
-					finalResponse = msg.Text
+				logCodexCompletedItem(req, event.Item)
+				if message, ok := event.Item.(*codex.AgentMessageItem); ok {
+					finalResponse = message.Text
 				}
 			}
 		case "turn.completed":
 			usage = event.Usage
-			if usage != nil {
-				log.Printf(
-					"codex runner turn usage: conversation=%s input_tokens=%d cached_input_tokens=%d output_tokens=%d",
-					req.Conversation.Key,
-					usage.InputTokens,
-					usage.CachedInputTokens,
-					usage.OutputTokens,
-				)
-			}
 		case "turn.failed":
 			turnFailure = event.Error
-			if turnFailure != nil {
-				log.Printf(
-					"codex runner turn failed event: conversation=%s err=%s",
-					req.Conversation.Key,
-					turnFailure.Message,
-				)
-			}
-		case "error":
-			log.Printf(
-				"codex runner stream error event: conversation=%s message=%s",
-				req.Conversation.Key,
-				strings.TrimSpace(event.Message),
-			)
 		}
 	}
-
-	if err := <-streamed.Done; err != nil {
-		return codex.Turn{}, err
+	if streamed.Done != nil {
+		if err, ok := <-streamed.Done; ok && err != nil {
+			return codex.Turn{}, err
+		}
 	}
 	if turnFailure != nil {
 		return codex.Turn{}, errors.New(turnFailure.Message)
 	}
-	log.Printf(
-		"codex runner completed streamed turn: conversation=%s items=%d final_response_len=%d",
-		req.Conversation.Key,
-		len(items),
-		len(finalResponse),
-	)
+	return codex.Turn{Items: items, FinalResponse: finalResponse, Usage: usage}, nil
+}
 
-	return codex.Turn{
-		Items:         items,
-		FinalResponse: finalResponse,
-		Usage:         usage,
-	}, nil
+func logCodexCompletedItem(req TurnRequest, item codex.ThreadItem) {
+	switch current := item.(type) {
+	case *codex.AgentMessageItem:
+		log.Printf(
+			"codex runner item completed: conversation=%s type=%s text_len=%d",
+			req.Conversation.Key,
+			current.Type,
+			len(current.Text),
+		)
+	case *codex.ReasoningItem:
+		log.Printf(
+			"codex runner reasoning completed: conversation=%s text=%q",
+			req.Conversation.Key,
+			abbreviateLogText(current.Text, 200),
+		)
+	case *codex.CommandExecutionItem:
+		exitCode := ""
+		if current.ExitCode != nil {
+			exitCode = strconv.Itoa(*current.ExitCode)
+		}
+		log.Printf(
+			"codex runner command completed: conversation=%s status=%s exit_code=%s command=%q output=%q",
+			req.Conversation.Key,
+			current.Status,
+			exitCode,
+			abbreviateLogText(current.Command, 160),
+			abbreviateLogText(current.AggregatedOutput, 200),
+		)
+	case *codex.FileChangeItem:
+		log.Printf(
+			"codex runner file change completed: conversation=%s status=%s changes=%s",
+			req.Conversation.Key,
+			current.Status,
+			summarizeCodexFileChanges(current.Changes),
+		)
+	case *codex.McpToolCallItem:
+		log.Printf(
+			"codex runner mcp tool completed: conversation=%s server=%s tool=%s status=%s error=%q",
+			req.Conversation.Key,
+			current.Server,
+			current.Tool,
+			current.Status,
+			summarizeCodexMCPError(current.Error),
+		)
+	case *codex.WebSearchItem:
+		log.Printf(
+			"codex runner web search completed: conversation=%s query=%q",
+			req.Conversation.Key,
+			abbreviateLogText(current.Query, 200),
+		)
+	case *codex.TodoListItem:
+		log.Printf(
+			"codex runner todo list completed: conversation=%s items=%d completed=%d",
+			req.Conversation.Key,
+			len(current.Items),
+			countCompletedCodexTodos(current.Items),
+		)
+	case *codex.ErrorItem:
+		log.Printf(
+			"codex runner item error: conversation=%s message=%q",
+			req.Conversation.Key,
+			abbreviateLogText(current.Message, 200),
+		)
+	case *codex.UnknownItem:
+		log.Printf(
+			"codex runner unknown item completed: conversation=%s type=%s raw_bytes=%d",
+			req.Conversation.Key,
+			current.Type,
+			len(current.Raw),
+		)
+	default:
+		log.Printf(
+			"codex runner item completed: conversation=%s type=%s",
+			req.Conversation.Key,
+			item.ItemType(),
+		)
+	}
+}
+
+func summarizeCodexFileChanges(changes []codex.FileUpdateChange) string {
+	if len(changes) == 0 {
+		return "none"
+	}
+
+	parts := make([]string, 0, len(changes))
+	for _, change := range changes {
+		part := string(change.Kind)
+		if strings.TrimSpace(change.Path) != "" {
+			part += ":" + change.Path
+		}
+		parts = append(parts, part)
+	}
+
+	return abbreviateLogText(strings.Join(parts, ", "), 240)
+}
+
+func summarizeCodexMCPError(err *codex.McpToolCallError) string {
+	if err == nil {
+		return ""
+	}
+
+	return abbreviateLogText(err.Message, 200)
+}
+
+func countCompletedCodexTodos(items []codex.TodoItem) int {
+	count := 0
+	for _, item := range items {
+		if item.Completed {
+			count++
+		}
+	}
+
+	return count
 }

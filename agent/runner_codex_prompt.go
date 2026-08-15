@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/godeps/codex-sdk-go"
+	"github.com/hzj629206/assistant/agent/codex"
 )
 
 type promptAttachmentKind string
@@ -29,7 +29,39 @@ type turnPrompt struct {
 	Attachments []promptAttachmentRef
 }
 
-func (r *CodexRunner) injectInitialPrompt(input codex.Input, prompts []string, tools []Tool) (codex.Input, error) {
+func buildCodexTurnInput(req TurnRequest, turnContext codexTurnContext) (codex.Input, error) {
+	prompt := buildTurnPromptResult(req.Message)
+	if len(prompt.ImagePaths) == 0 {
+		return injectCodexInitialTurnContext(req, codex.TextInput(prompt.Text), turnContext)
+	}
+
+	items := make([]codex.UserInput, 0, 1+len(prompt.ImagePaths))
+	if prompt.Text != "" {
+		items = append(items, codex.UserInput{
+			Type: codex.UserInputText,
+			Text: prompt.Text,
+		})
+	}
+
+	for _, imagePath := range prompt.ImagePaths {
+		items = append(items, codex.UserInput{
+			Type: codex.UserInputLocalImage,
+			Path: imagePath,
+		})
+	}
+
+	return injectCodexInitialTurnContext(req, codex.ItemsInput(items...), turnContext)
+}
+
+func injectCodexInitialTurnContext(req TurnRequest, input codex.Input, turnContext codexTurnContext) (codex.Input, error) {
+	if req.Conversation.RunnerThreadID != "" {
+		return input, nil
+	}
+
+	return injectCodexInitialPrompt(input, turnContext.prompts, turnContext.tools)
+}
+
+func injectCodexInitialPrompt(input codex.Input, prompts []string, tools []Tool) (codex.Input, error) {
 	instruction, err := buildInitialInstruction(prompts, tools)
 	if err != nil {
 		return codex.Input{}, err
@@ -106,51 +138,6 @@ Rules:
 `))
 
 	return joinPromptBlocks(parts...), nil
-}
-
-func (r *CodexRunner) buildTurnInput(req TurnRequest) (codex.Input, error) {
-	prompts, tools := r.globalContext()
-	return r.buildTurnInputWithContext(req, codexTurnContext{
-		prompts: prompts,
-		tools:   tools,
-	})
-}
-
-func (r *CodexRunner) buildTurnInputWithContext(req TurnRequest, turnContext codexTurnContext) (codex.Input, error) {
-	prompt := buildTurnPromptResult(req.Message)
-	if len(prompt.ImagePaths) == 0 {
-		return r.injectInitialTurnContext(req, codex.TextInput(prompt.Text), turnContext)
-	}
-
-	items := make([]codex.UserInput, 0, 1+len(prompt.ImagePaths))
-	if prompt.Text != "" {
-		items = append(items, codex.UserInput{
-			Type: codex.UserInputText,
-			Text: prompt.Text,
-		})
-	}
-
-	for _, imagePath := range prompt.ImagePaths {
-		items = append(items, codex.UserInput{
-			Type: codex.UserInputLocalImage,
-			Path: imagePath,
-		})
-	}
-
-	return r.injectInitialTurnContext(req, codex.ItemsInput(items...), turnContext)
-}
-
-func (r *CodexRunner) injectInitialTurnContext(req TurnRequest, input codex.Input, turnContext codexTurnContext) (codex.Input, error) {
-	if req.Conversation.RunnerThreadID != "" {
-		return input, nil
-	}
-
-	return r.injectInitialPrompt(input, turnContext.prompts, turnContext.tools)
-}
-
-func buildTurnPrompt(message InboundMessage) (string, []string) {
-	prompt := buildTurnPromptResult(message)
-	return prompt.Text, prompt.ImagePaths
 }
 
 func buildTurnPromptResult(message InboundMessage) turnPrompt {

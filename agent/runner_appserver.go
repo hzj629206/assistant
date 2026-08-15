@@ -20,7 +20,7 @@ import (
 type AppServerRunner struct {
 	closeFn             func() error
 	rpcClient           *apprpc.Client
-	rpcClientFactory    func(context.Context, apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error)
+	rpcClientFactory    func(context.Context, *appcodex.ServerRequestCallbacks) (*apprpc.Client, func() error, bool, error)
 	interruptTurnFn     func(context.Context, string, string) error
 	unsubscribeThreadFn func(context.Context, string) error
 	canRecoverRPCClient bool
@@ -89,15 +89,6 @@ func (p SandboxPolicy) String() string {
 	default:
 		return ""
 	}
-}
-
-var appServerOptOutNotificationMethods = []string{
-	"command/exec/outputDelta",
-	"item/agentMessage/delta",
-	"item/fileChange/outputDelta",
-	"item/plan/delta",
-	"item/reasoning/summaryTextDelta",
-	"item/reasoning/textDelta",
 }
 
 // NewAppServerRunner builds a runner backed by the Codex app-server.
@@ -169,11 +160,11 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 		canRecoverRPCClient: options.Client == nil && options.CodexOptions.Transport == nil,
 	}
 	runner.lifecycleCtx, runner.cancel = context.WithCancel(context.Background())
-	runner.rpcClientFactory = func(ctx context.Context, handler apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
-		return newAppServerRPCClient(ctx, options.CodexOptions, options.Client, handler)
+	runner.rpcClientFactory = func(ctx context.Context, callbacks *appcodex.ServerRequestCallbacks) (*apprpc.Client, func() error, bool, error) {
+		return newAppServerRPCClient(ctx, options.CodexOptions, options.Client, callbacks)
 	}
 
-	rpcClient, closeFn, _, err := runner.rpcClientFactory(ctx, runner)
+	rpcClient, closeFn, _, err := runner.rpcClientFactory(ctx, newAppServerRequestCallbacks(runner))
 	if err != nil {
 		return nil, fmt.Errorf("create codex app-server client failed: %w", err)
 	}
@@ -488,7 +479,7 @@ func (r *AppServerRunner) ensureRPCClient(ctx context.Context) error {
 		return nil
 	}
 
-	client, closeFn, _, err := factory(ctx, r)
+	client, closeFn, _, err := factory(ctx, newAppServerRequestCallbacks(r))
 	if err != nil {
 		return fmt.Errorf("recreate codex app-server client failed: %w", err)
 	}
@@ -550,6 +541,22 @@ func (r *AppServerRunner) createAppServerThread(ctx context.Context, threadID st
 		return r.startRPCThreadWithTools(runCtx, options, r.globalTools())
 	}
 	return r.startThread(runCtx, options)
+}
+
+func (r *AppServerRunner) recoverAppServerThread(ctx context.Context, threadID string) (appServerThread, error) {
+	if err := r.ensureRPCClient(ctx); err != nil {
+		return nil, err
+	}
+
+	thread, err := r.createAppServerThread(ctx, threadID)
+	if err != nil {
+		r.invalidateRPCClientIfRecoverable(err)
+		return nil, err
+	}
+	if thread == nil {
+		return nil, errors.New("restored app-server thread is nil")
+	}
+	return thread, nil
 }
 
 func (r *AppServerRunner) globalPrompts() []string {

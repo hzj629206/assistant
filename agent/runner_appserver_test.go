@@ -572,7 +572,7 @@ func TestEnsureRPCClientRecreatesMissingClient(t *testing.T) {
 	createCount := 0
 	runner := &AppServerRunner{
 		canRecoverRPCClient: true,
-		rpcClientFactory: func(context.Context, apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
+		rpcClientFactory: func(context.Context, *appcodex.ServerRequestCallbacks) (*apprpc.Client, func() error, bool, error) {
 			createCount++
 			return &apprpc.Client{}, func() error { return nil }, true, nil
 		},
@@ -599,6 +599,58 @@ func TestEnsureRPCClientRecreatesMissingClient(t *testing.T) {
 	}
 	if createCount != 2 {
 		t.Fatalf("unexpected create count after second ensure: %d", createCount)
+	}
+}
+
+func TestAppServerSessionRestoresThreadAfterTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	staleThread := &fakeAppServerThread{
+		id: "thread-1",
+		runStreamedFn: func(context.Context, []appcodex.Input, *appcodex.TurnOptions) (appServerTurnStream, error) {
+			return nil, errors.New("connection closed")
+		},
+	}
+	restoredThread := &fakeAppServerThread{id: "thread-1"}
+	var resumedThreadID string
+	runner := &AppServerRunner{
+		lifecycleCtx: context.Background(),
+		turnOptions:  appcodex.TurnOptions{},
+		resumeThread: func(_ context.Context, options appcodex.ThreadResumeOptions) (appServerThread, error) {
+			resumedThreadID = options.ThreadID
+			return restoredThread, nil
+		},
+	}
+	session := &appServerSession{
+		runner:          runner,
+		conversationKey: "conv-1",
+		threadID:        "thread-1",
+		thread:          staleThread,
+	}
+	req := TurnRequest{
+		Conversation: ConversationState{Key: "conv-1"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	}
+
+	turn, err := session.ScheduleTurn(context.Background(), req)
+	if err != nil {
+		t.Fatalf("schedule stale turn: %v", err)
+	}
+	if _, err := turn.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "connection closed") {
+		t.Fatalf("run stale turn error = %v, want transport failure", err)
+	}
+	if session.currentThread() != nil {
+		t.Fatal("expected failed transport to invalidate the session thread")
+	}
+
+	if _, err := session.ScheduleTurn(context.Background(), req); err != nil {
+		t.Fatalf("schedule restored turn: %v", err)
+	}
+	if resumedThreadID != "thread-1" {
+		t.Fatalf("resumed thread ID = %q, want thread-1", resumedThreadID)
+	}
+	if session.currentThread() != restoredThread {
+		t.Fatal("expected session to use restored thread")
 	}
 }
 
@@ -633,11 +685,11 @@ func TestAppServerRunTurnUsesFrozenPromptSnapshotForNewThread(t *testing.T) {
 	}
 }
 
-func TestMcpServerElicitationRequestDeclinesByDefault(t *testing.T) {
+func TestMCPServerElicitationRequestDeclinesByDefault(t *testing.T) {
 	t.Parallel()
 
 	runner := &AppServerRunner{}
-	response, err := runner.McpServerElicitationRequest(context.Background(), nil)
+	response, err := runner.MCPServerElicitationRequest(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -645,7 +697,7 @@ func TestMcpServerElicitationRequestDeclinesByDefault(t *testing.T) {
 		t.Fatal("expected response")
 	}
 
-	typed, ok := any(*response).(protocol.SanitizedMCPServerElicitationRequestResponseJSON)
+	typed, ok := any(*response).(protocol.MCPServerElicitationRequestResponse)
 	if !ok {
 		t.Fatalf("unexpected response type: %T", *response)
 	}
@@ -657,11 +709,11 @@ func TestMcpServerElicitationRequestDeclinesByDefault(t *testing.T) {
 	}
 }
 
-func TestMcpServerElicitationRequestAutoAcceptsEmptySchemaMCPToolApproval(t *testing.T) {
+func TestMCPServerElicitationRequestAutoAcceptsEmptySchemaMCPToolApproval(t *testing.T) {
 	t.Parallel()
 
 	runner := &AppServerRunner{}
-	response, err := runner.McpServerElicitationRequest(context.Background(), map[string]any{
+	response, err := runner.MCPServerElicitationRequest(context.Background(), mustMarshalJSON(t, map[string]any{
 		"_meta": map[string]any{
 			"codex_approval_kind": "mcp_tool_call",
 		},
@@ -671,7 +723,7 @@ func TestMcpServerElicitationRequestAutoAcceptsEmptySchemaMCPToolApproval(t *tes
 			"type":       "object",
 			"properties": map[string]any{},
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -679,7 +731,7 @@ func TestMcpServerElicitationRequestAutoAcceptsEmptySchemaMCPToolApproval(t *tes
 		t.Fatal("expected response")
 	}
 
-	typed, ok := any(*response).(protocol.SanitizedMCPServerElicitationRequestResponseJSON)
+	typed, ok := any(*response).(protocol.MCPServerElicitationRequestResponse)
 	if !ok {
 		t.Fatalf("unexpected response type: %T", *response)
 	}
@@ -695,11 +747,11 @@ func TestMcpServerElicitationRequestAutoAcceptsEmptySchemaMCPToolApproval(t *tes
 	}
 }
 
-func TestMcpServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
+func TestMCPServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
 	t.Parallel()
 
 	runner := &AppServerRunner{}
-	response, err := runner.McpServerElicitationRequest(context.Background(), map[string]any{
+	response, err := runner.MCPServerElicitationRequest(context.Background(), mustMarshalJSON(t, map[string]any{
 		"_meta": map[string]any{
 			"codex_approval_kind": "mcp_tool_call",
 		},
@@ -715,7 +767,7 @@ func TestMcpServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
 			},
 			"required": []string{"target"},
 		},
-	})
+	}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -723,7 +775,7 @@ func TestMcpServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
 		t.Fatal("expected response")
 	}
 
-	typed, ok := any(*response).(protocol.SanitizedMCPServerElicitationRequestResponseJSON)
+	typed, ok := any(*response).(protocol.MCPServerElicitationRequestResponse)
 	if !ok {
 		t.Fatalf("unexpected response type: %T", *response)
 	}
@@ -736,7 +788,7 @@ func TestApplyPatchApprovalApprovesByDefault(t *testing.T) {
 	t.Parallel()
 
 	runner := &AppServerRunner{}
-	response, err := runner.ApplyPatchApproval(context.Background(), protocol.SanitizedApplyPatchApprovalParamsJSON{
+	response, err := runner.ApplyPatchApproval(context.Background(), protocol.ApplyPatchApprovalParams{
 		ConversationID: "conv-1",
 		CallID:         "call-1",
 		FileChanges:    map[string]any{},
@@ -752,7 +804,7 @@ func TestApplyPatchApprovalApprovesByDefault(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected response type: %T", *response)
 	}
-	if typed.Decision != "approved" {
+	if typed.Decision.Kind() != protocol.ReviewDecisionKindApproved {
 		t.Fatalf("unexpected decision: %v", typed.Decision)
 	}
 }
@@ -766,7 +818,7 @@ func TestExecCommandApprovalApprovesByDefault(t *testing.T) {
 		CallID:         "call-1",
 		Command:        []string{"pwd"},
 		Cwd:            "/tmp",
-		ParsedCmd:      []protocol.SanitizedExecCommandApprovalParamsJSONParsedCmdElem{},
+		ParsedCmd:      nil,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -779,7 +831,7 @@ func TestExecCommandApprovalApprovesByDefault(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected response type: %T", *response)
 	}
-	if typed.Decision != "approved" {
+	if typed.Decision.Kind() != protocol.ReviewDecisionKindApproved {
 		t.Fatalf("unexpected decision: %v", typed.Decision)
 	}
 }
@@ -800,7 +852,7 @@ func TestItemCommandExecutionRequestApprovalAcceptsByDefault(t *testing.T) {
 	if response == nil {
 		t.Fatal("expected response")
 	}
-	if response.Decision != "accept" {
+	if response.Decision.Kind() != protocol.CommandExecutionApprovalDecisionKindAccept {
 		t.Fatalf("unexpected decision: %v", response.Decision)
 	}
 }
@@ -977,6 +1029,26 @@ func appcodexNotification(t *testing.T, payload map[string]any) apprpc.Notificat
 	return apprpc.Notification{Raw: raw}
 }
 
+func TestShouldIgnoreAppServerNotification(t *testing.T) {
+	t.Parallel()
+
+	for method, want := range map[string]bool{
+		"command/exec/outputDelta":        true,
+		"item/agentMessage/delta":         true,
+		"item/fileChange/outputDelta":     true,
+		"item/plan/delta":                 true,
+		"item/reasoning/summaryTextDelta": true,
+		"item/reasoning/textDelta":        true,
+		"item/completed":                  false,
+		"turn/completed":                  false,
+		"item/tool/call":                  false,
+	} {
+		if got := shouldIgnoreAppServerNotification(method); got != want {
+			t.Errorf("shouldIgnoreAppServerNotification(%q) = %t, want %t", method, got, want)
+		}
+	}
+}
+
 func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 	t.Parallel()
 
@@ -994,17 +1066,6 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 					"name":    "assistant-test",
 					"title":   "Assistant Test",
 					"version": "test",
-				},
-				"capabilities": map[string]any{
-					"experimentalApi": true,
-					"optOutNotificationMethods": []string{
-						"command/exec/outputDelta",
-						"item/agentMessage/delta",
-						"item/fileChange/outputDelta",
-						"item/plan/delta",
-						"item/reasoning/summaryTextDelta",
-						"item/reasoning/textDelta",
-					},
 				},
 			}),
 		}),
@@ -1250,9 +1311,9 @@ func TestItemToolCallPrefersExactTurnMatch(t *testing.T) {
 	if len(content) != 1 {
 		t.Fatalf("unexpected content items: %#v", content)
 	}
-	item, ok := content[0].(map[string]any)
-	if !ok {
-		t.Fatalf("unexpected content item type: %#v", content[0])
+	var item map[string]any
+	if err := json.Unmarshal(content[0].RawJSON(), &item); err != nil {
+		t.Fatalf("decode content item: %v", err)
 	}
 	if item["text"] != `{"text":"HELLO"}` {
 		t.Fatalf("unexpected content text: %#v", item["text"])
@@ -1621,7 +1682,7 @@ func TestAppServerScheduledTurnInterruptBeforeRunCompletesImmediately(t *testing
 
 	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{Key: "conv-pre-run"},
-		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("ScheduleTurn failed: %v", err)
@@ -1671,7 +1732,7 @@ func TestAppServerScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing
 
 	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{Key: "conv-concurrent-run"},
-		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("ScheduleTurn failed: %v", err)

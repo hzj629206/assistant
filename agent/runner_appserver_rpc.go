@@ -16,6 +16,17 @@ import (
 	apprpc "github.com/pmenglund/codex-sdk-go/rpc"
 )
 
+// This file contains the small raw-RPC layer that remains necessary on top of
+// codex-sdk-go. Prefer the SDK's public types and client machinery whenever they
+// cover an operation. The raw calls below exist because the high-level thread API
+// does not yet declare dynamic tools, while this runner must both register custom
+// tools and handle their callbacks; it also needs turn IDs for interruption.
+//
+// When upgrading the SDK, compare these wire structs and method names with the
+// generated protocol first. Delete a raw path once the equivalent high-level API
+// supports dynamic-tool registration and preserves the lifecycle requirements in
+// runner_appserver_transport.go.
+
 type appServerTurnNotification struct {
 	WillRetry *bool               `json:"willRetry,omitempty"`
 	ThreadID  string              `json:"threadId,omitempty"`
@@ -157,6 +168,9 @@ func marshalAppServerJSONValue(field string, value any) (json.RawMessage, error)
 	return data, nil
 }
 
+// appServerThreadStartParams extends the generated thread/start shape with
+// dynamicTools. The latter is intentionally manual until ThreadStartOptions
+// exposes it in the SDK.
 type appServerThreadStartParams struct {
 	Model                 *string                `json:"model,omitempty"`
 	Cwd                   *string                `json:"cwd,omitempty"`
@@ -224,20 +238,11 @@ func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools 
 			})
 		}
 	}
-	if options.ExperimentalRawEvents {
-		return params, errors.New("experimental raw events are no longer supported by the current app-server protocol")
-	}
 	return params, nil
 }
 
 func buildAppServerThreadResumeParams(options appcodex.ThreadResumeOptions) (appServerThreadResumeParams, error) {
 	params := appServerThreadResumeParams{ThreadID: options.ThreadID}
-	if len(options.History) > 0 {
-		return params, errors.New("thread resume history is no longer supported by the current app-server protocol")
-	}
-	if options.Path != "" {
-		return params, errors.New("thread resume path is no longer supported by the current app-server protocol")
-	}
 	if options.Model != "" {
 		params.Model = stringPtr(options.Model)
 	}
@@ -313,19 +318,20 @@ func buildAppServerTurnStartParams(threadID string, inputs []appcodex.Input, opt
 	} else if len(raw) != 0 {
 		params.OutputSchema = raw
 	}
-	if opts.CollaborationMode != nil {
-		return params, errors.New("collaboration mode is no longer supported by the current app-server protocol")
-	}
-
 	return params, nil
 }
 
-func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existing *appcodex.Codex, handler apprpc.ServerRequestHandler) (*apprpc.Client, func() error, bool, error) {
+// newAppServerRPCClient uses the SDK RPC client but manages spawning itself so
+// the daemon can use appServerStdioTransport. Capabilities are intentionally not
+// sent during initialize: they are optional protocol opt-ins, and notification
+// filtering is performed locally by rpcAppServerTurnStream.
+func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existing *appcodex.Codex, callbacks *appcodex.ServerRequestCallbacks) (*apprpc.Client, func() error, bool, error) {
 	if existing != nil {
 		rpcClient := existing.Client()
-		if rpcClient != nil {
-			rpcClient.SetRequestHandler(handler)
+		if rpcClient == nil {
+			return nil, nil, false, errors.New("app-server client is not initialized")
 		}
+		rpcClient.SetRequestHandler(callbacks)
 		return rpcClient, existing.Close, false, nil
 	}
 
@@ -354,20 +360,20 @@ func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existi
 		}
 	}
 
-	rpcClient := apprpc.NewClient(transport, apprpc.ClientOptions{
+	rpcClient, err := apprpc.NewClientChecked(transport, apprpc.ClientOptions{
 		Logger:         logger,
-		RequestHandler: handler,
+		RequestHandler: callbacks,
 	})
+	if err != nil {
+		_ = transport.Close()
+		return nil, nil, false, err
+	}
 
 	initializeParams := appproto.InitializeParams{
 		ClientInfo: appproto.ClientInfo{
 			Name:    "assistant-appserver-runner",
 			Title:   stringPtr("Assistant AppServer Runner"),
 			Version: appServerRunnerVersion(),
-		},
-		Capabilities: appproto.InitializeCapabilities{
-			ExperimentalApi:           true,
-			OptOutNotificationMethods: append([]string(nil), appServerOptOutNotificationMethods...),
 		},
 	}
 	if options.ClientInfo.Name != "" {
@@ -510,6 +516,8 @@ func (r *AppServerRunner) resumeRPCThread(ctx context.Context, options appcodex.
 	return &rpcAppServerThread{client: r.rpcClient, id: threadID}, nil
 }
 
+// rpcAppServerThread retains the low-level client because turn/start and
+// turn/interrupt are coordinated by the runner rather than the SDK TurnHandle.
 type rpcAppServerThread struct {
 	client *apprpc.Client
 	id     string
@@ -567,9 +575,30 @@ func (s *rpcAppServerTurnStream) Next(ctx context.Context) (apprpc.Notification,
 		if err != nil {
 			return note, err
 		}
+		// Deltas are intentionally discarded before matching or collecting them.
+		// The runner only publishes completed items and terminal turn state.
+		if shouldIgnoreAppServerNotification(note.Method) {
+			continue
+		}
 		if matchesAppServerTurn(note, s.threadID, s.turnID) {
 			return note, nil
 		}
+	}
+}
+
+// shouldIgnoreAppServerNotification reports whether a notification is a streaming delta
+// that the runner does not currently consume.
+func shouldIgnoreAppServerNotification(method string) bool {
+	switch method {
+	case "command/exec/outputDelta",
+		"item/agentMessage/delta",
+		"item/fileChange/outputDelta",
+		"item/plan/delta",
+		"item/reasoning/summaryTextDelta",
+		"item/reasoning/textDelta":
+		return true
+	default:
+		return false
 	}
 }
 

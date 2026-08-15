@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/godeps/codex-sdk-go"
+	"github.com/hzj629206/assistant/agent/codex"
 )
 
 type testRunnerResponder struct {
@@ -30,6 +30,11 @@ type uppercaseTool struct{}
 
 type snapshotTool struct {
 	name string
+}
+
+func buildTestCodexTurnInput(runner *CodexRunner, req TurnRequest) (codex.Input, error) {
+	prompts, tools := runner.globalContext()
+	return buildCodexTurnInput(req, codexTurnContext{prompts: prompts, tools: tools})
 }
 
 func (unmarshalableTool) Name() string {
@@ -177,6 +182,11 @@ func testLocalRFC3339() string {
 
 func testLocalRFC3339At(timestamp int64) string {
 	return time.Unix(timestamp, 0).In(time.Local).Format(time.RFC3339) //nolint:gosmopolitan // Tests intentionally follow the local machine timezone behavior.
+}
+
+func buildTurnPrompt(message InboundMessage) (string, []string) {
+	prompt := buildTurnPromptResult(message)
+	return prompt.Text, prompt.ImagePaths
 }
 
 func TestBuildTurnPromptIncludesQuotedTextContext(t *testing.T) {
@@ -753,7 +763,7 @@ func TestBuildTurnInputUsesLocalImagePath(t *testing.T) {
 
 	runner := &CodexRunner{}
 
-	input, err := runner.buildTurnInput(TurnRequest{
+	input, err := buildTestCodexTurnInput(runner, TurnRequest{
 		Message: InboundMessage{
 			Kind:      MessageKindImage,
 			ImagePath: file.Name(),
@@ -835,7 +845,7 @@ func TestBuildTurnInputUsesMixedMessageImagePaths(t *testing.T) {
 
 	runner := &CodexRunner{}
 
-	input, err := runner.buildTurnInput(TurnRequest{
+	input, err := buildTestCodexTurnInput(runner, TurnRequest{
 		Message: InboundMessage{
 			Kind:       MessageKindMixed,
 			Text:       "mixed content",
@@ -864,7 +874,7 @@ func TestBuildTurnInputInjectsInitialSystemPromptAndToolsForNewConversation(t *t
 	runner.RegisterSystemPrompt("Global system prompt.")
 	runner.RegisterTools(uppercaseTool{})
 
-	input, err := runner.buildTurnInput(TurnRequest{
+	input, err := buildTestCodexTurnInput(runner, TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "hello",
@@ -892,7 +902,7 @@ func TestBuildTurnInputSkipsInitialContextForExistingConversation(t *testing.T) 
 	runner.RegisterSystemPrompt("Global system prompt.")
 	runner.RegisterTools(uppercaseTool{})
 
-	input, err := runner.buildTurnInput(TurnRequest{
+	input, err := buildTestCodexTurnInput(runner, TurnRequest{
 		Conversation: ConversationState{
 			RunnerThreadID: "thread-1",
 		},
@@ -1155,13 +1165,15 @@ func TestRunToolLoopExecutesToolAndReturnsFinalResponse(t *testing.T) {
 			Text: "Please uppercase hello",
 		},
 	}
-	input, err := runner.buildTurnInput(req)
+	input, err := buildTestCodexTurnInput(runner, req)
 	if err != nil {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
 	session := &codexRunnerSession{runner: runner}
-	reply, err := session.runToolLoop(context.Background(), req, thread, input)
+	prompts, tools := runner.globalContext()
+	turnContext := codexTurnContext{prompts: prompts, tools: tools}
+	reply, err := session.runToolLoopWithContext(context.Background(), req, thread, input, turnContext)
 	if err != nil {
 		t.Fatalf("run tool loop failed: %v", err)
 	}
@@ -1209,13 +1221,15 @@ func TestRunToolLoopRecoversFromUnknownTool(t *testing.T) {
 			Text: "test",
 		},
 	}
-	input, err := runner.buildTurnInput(req)
+	input, err := buildTestCodexTurnInput(runner, req)
 	if err != nil {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
 	session := &codexRunnerSession{runner: runner}
-	reply, err := session.runToolLoop(context.Background(), req, thread, input)
+	prompts, tools := runner.globalContext()
+	turnContext := codexTurnContext{prompts: prompts, tools: tools}
+	reply, err := session.runToolLoopWithContext(context.Background(), req, thread, input, turnContext)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1252,13 +1266,15 @@ func TestRunToolLoopSupportsSilentCompletion(t *testing.T) {
 			Text: "No reply needed",
 		},
 	}
-	input, err := runner.buildTurnInput(req)
+	input, err := buildTestCodexTurnInput(runner, req)
 	if err != nil {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
 	session := &codexRunnerSession{runner: runner}
-	reply, err := session.runToolLoop(context.Background(), req, thread, input)
+	prompts, tools := runner.globalContext()
+	turnContext := codexTurnContext{prompts: prompts, tools: tools}
+	reply, err := session.runToolLoopWithContext(context.Background(), req, thread, input, turnContext)
 	if err != nil {
 		t.Fatalf("run tool loop failed: %v", err)
 	}
@@ -1291,13 +1307,15 @@ func TestRunToolLoopRecoversFromInvalidJSON(t *testing.T) {
 			Text: "test",
 		},
 	}
-	input, err := runner.buildTurnInput(req)
+	input, err := buildTestCodexTurnInput(runner, req)
 	if err != nil {
 		t.Fatalf("build turn input failed: %v", err)
 	}
 
 	session := &codexRunnerSession{runner: runner}
-	reply, err := session.runToolLoop(context.Background(), req, thread, input)
+	prompts, tools := runner.globalContext()
+	turnContext := codexTurnContext{prompts: prompts, tools: tools}
+	reply, err := session.runToolLoopWithContext(context.Background(), req, thread, input, turnContext)
 	if err != nil {
 		t.Fatalf("run tool loop failed: %v", err)
 	}
@@ -1312,13 +1330,13 @@ func TestRunToolLoopRecoversFromInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestBuildTurnInputWithContextUsesFrozenToolSnapshot(t *testing.T) {
+func TestBuildCodexTurnInputUsesFrozenToolSnapshot(t *testing.T) {
 	t.Parallel()
 
 	runner := &CodexRunner{}
 	frozenTools := []Tool{snapshotTool{name: "frozen"}}
 
-	input, err := runner.buildTurnInputWithContext(TurnRequest{
+	input, err := buildCodexTurnInput(TurnRequest{
 		Message: InboundMessage{
 			Kind: MessageKindText,
 			Text: "test",
@@ -1504,23 +1522,27 @@ func TestInterruptWaitsForActiveCodexSessionTurn(t *testing.T) {
 		thread:          thread,
 	}
 
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-interrupt"},
+		Message: InboundMessage{
+			Kind: MessageKindText,
+			Text: "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := runSessionTurn(context.Background(), session, TurnRequest{
-			Conversation: ConversationState{Key: "conv-interrupt"},
-			Message: InboundMessage{
-				Kind: MessageKindText,
-				Text: "hello",
-			},
-		})
-		runErrCh <- err
+		_, runErr := turn.Run(context.Background())
+		runErrCh <- runErr
 	}()
 
 	<-started
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- interruptSession(context.Background(), session)
+		interruptDone <- turn.Interrupt(context.Background())
 	}()
 
 	select {
@@ -1624,7 +1646,7 @@ func TestCodexScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T) 
 
 	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
 		Conversation: ConversationState{Key: "conv-concurrent-run"},
-		Message: InboundMessage{Kind: MessageKindText, Text: "hello"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
 	})
 	if err != nil {
 		t.Fatalf("ScheduleTurn failed: %v", err)
@@ -1701,20 +1723,24 @@ func TestInterruptedCodexSessionTurnDoesNotReturnSuccessfulResult(t *testing.T) 
 		thread:          thread,
 	}
 
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-interrupt-success"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
 	runErrCh := make(chan error, 1)
 	go func() {
-		_, err := runSessionTurn(context.Background(), session, TurnRequest{
-			Conversation: ConversationState{Key: "conv-interrupt-success"},
-			Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
-		})
-		runErrCh <- err
+		_, runErr := turn.Run(context.Background())
+		runErrCh <- runErr
 	}()
 
 	<-started
 
 	interruptDone := make(chan error, 1)
 	go func() {
-		interruptDone <- interruptSession(context.Background(), session)
+		interruptDone <- turn.Interrupt(context.Background())
 	}()
 
 	close(release)
@@ -1738,7 +1764,7 @@ func TestInterruptedCodexSessionTurnDoesNotReturnSuccessfulResult(t *testing.T) 
 	}
 }
 
-func TestInterruptReturnsNilWithoutActiveCodexSessionTurn(t *testing.T) {
+func TestScheduledCodexTurnInterruptsBeforeRun(t *testing.T) {
 	t.Parallel()
 
 	runner := &CodexRunner{
@@ -1747,9 +1773,23 @@ func TestInterruptReturnsNilWithoutActiveCodexSessionTurn(t *testing.T) {
 		},
 	}
 
-	err := interruptWithRunner(t, runner, ConversationState{Key: "conv-idle"})
+	session, err := runner.StartSession(context.Background(), SessionOptions{ConversationKey: "conv-idle"})
 	if err != nil {
-		t.Fatalf("expected nil interrupt on idle session, got %v", err)
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	turn, err := session.ScheduleTurn(context.Background(), TurnRequest{
+		Conversation: ConversationState{Key: "conv-idle"},
+		Message:      InboundMessage{Kind: MessageKindText, Text: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("ScheduleTurn failed: %v", err)
+	}
+	if err := turn.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt failed: %v", err)
+	}
+	_, err = turn.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled run after interrupt, got %v", err)
 	}
 }
 

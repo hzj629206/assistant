@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	codexcli "github.com/godeps/codex-sdk-go"
+	codexcli "github.com/hzj629206/assistant/agent/codex"
 	codexapp "github.com/pmenglund/codex-sdk-go"
 
 	"github.com/hzj629206/assistant/agent"

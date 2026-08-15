@@ -6,29 +6,54 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 
+	appcodex "github.com/pmenglund/codex-sdk-go"
 	appproto "github.com/pmenglund/codex-sdk-go/protocol"
 )
+
+func newAppServerRequestCallbacks(runner *AppServerRunner) *appcodex.ServerRequestCallbacks {
+	if runner == nil {
+		return &appcodex.ServerRequestCallbacks{}
+	}
+
+	return &appcodex.ServerRequestCallbacks{
+		RefreshAuthTokens:           runner.AccountChatgptAuthTokensRefresh,
+		ApprovePatch:                runner.ApplyPatchApproval,
+		GenerateAttestation:         runner.AttestationGenerate,
+		ApproveCommand:              runner.ExecCommandApproval,
+		ApproveCommandExecution:     runner.ItemCommandExecutionRequestApproval,
+		ApproveFileChange:           runner.ItemFileChangeRequestApproval,
+		ApprovePermissions:          runner.ItemPermissionsRequestApproval,
+		CallTool:                    runner.ItemToolCall,
+		RequestUserInput:            runner.ItemToolRequestUserInput,
+		RequestMCPServerElicitation: runner.MCPServerElicitationRequest,
+	}
+}
 
 func (*AppServerRunner) AccountChatgptAuthTokensRefresh(context.Context, appproto.ChatgptAuthTokensRefreshParams) (*appproto.ChatgptAuthTokensRefreshResponse, error) {
 	return nil, errors.New("chatgpt auth token refresh is not configured")
 }
 
+func (*AppServerRunner) AttestationGenerate(context.Context, appproto.AttestationGenerateParams) (*appproto.AttestationGenerateResponse, error) {
+	return nil, errors.New("attestation generation is not configured")
+}
+
 func (*AppServerRunner) ApplyPatchApproval(_ context.Context, params appproto.ApplyPatchApprovalParams) (*appproto.ApplyPatchApprovalResponse, error) {
 	logAppServerRequest("auto-approved apply patch request", params)
-	response := appproto.SanitizedApplyPatchApprovalResponseJSON{Decision: "approved"}
+	response := appproto.SanitizedApplyPatchApprovalResponseJSON{Decision: appproto.MustReviewDecision("approved")}
 	return &response, nil
 }
 
 func (*AppServerRunner) ExecCommandApproval(_ context.Context, params appproto.ExecCommandApprovalParams) (*appproto.ExecCommandApprovalResponse, error) {
 	logAppServerRequest("auto-approved exec command request", params)
-	response := appproto.SanitizedExecCommandApprovalResponseJSON{Decision: "approved"}
+	response := appproto.SanitizedExecCommandApprovalResponseJSON{Decision: appproto.MustReviewDecision("approved")}
 	return &response, nil
 }
 
 func (*AppServerRunner) ItemCommandExecutionRequestApproval(_ context.Context, params appproto.CommandExecutionRequestApprovalParams) (*appproto.CommandExecutionRequestApprovalResponse, error) {
 	logAppServerRequest("auto-approved command execution request", params)
-	response := appproto.CommandExecutionRequestApprovalResponse{Decision: "accept"}
+	response := appproto.CommandExecutionRequestApprovalResponse{Decision: appproto.MustCommandExecutionApprovalDecision("accept")}
 	return &response, nil
 }
 
@@ -48,24 +73,20 @@ func (*AppServerRunner) ItemToolRequestUserInput(context.Context, appproto.ToolR
 	return nil, errors.New("tool user input is not configured")
 }
 
-func (*AppServerRunner) McpServerElicitationRequest(_ context.Context, params appproto.McpServerElicitationRequestParams) (*appproto.McpServerElicitationRequestResponse, error) {
+func (*AppServerRunner) MCPServerElicitationRequest(_ context.Context, params appproto.MCPServerElicitationRequestParams) (*appproto.MCPServerElicitationRequestResponse, error) {
 	if shouldAutoAcceptMCPToolApproval(params) {
 		logAppServerRequest("auto-accepted MCP tool approval elicitation request", params)
-		response := appproto.McpServerElicitationRequestResponse(
-			appproto.SanitizedMCPServerElicitationRequestResponseJSON{
-				Action:  appproto.MCPServerElicitationActionAccept,
-				Content: map[string]any{},
-			},
-		)
+		response := appproto.MCPServerElicitationRequestResponse{
+			Action:  appproto.MCPServerElicitationActionAccept,
+			Content: map[string]any{},
+		}
 		return &response, nil
 	}
 
 	logAppServerRequest("declined MCP elicitation request because no interactive elicitation handler is configured", params)
-	response := appproto.McpServerElicitationRequestResponse(
-		appproto.SanitizedMCPServerElicitationRequestResponseJSON{
-			Action: appproto.MCPServerElicitationActionDecline,
-		},
-	)
+	response := appproto.MCPServerElicitationRequestResponse{
+		Action: appproto.MCPServerElicitationActionDecline,
+	}
 	return &response, nil
 }
 
@@ -78,9 +99,9 @@ func logAppServerRequest(message string, params any) {
 	log.Printf("app-server runner %s: params=%s", message, string(payload))
 }
 
-func shouldAutoAcceptMCPToolApproval(params any) bool {
-	root, ok := params.(map[string]any)
-	if !ok {
+func shouldAutoAcceptMCPToolApproval(params appproto.MCPServerElicitationRequestParams) bool {
+	var root map[string]any
+	if err := json.Unmarshal(params, &root); err != nil {
 		return false
 	}
 
@@ -152,47 +173,38 @@ func decodeDynamicToolCallParams(value appproto.DynamicToolCallParams) (appServe
 	return params, nil
 }
 
-func buildDynamicToolContentItems(result any, callErr error) ([]appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem, error) {
+func buildDynamicToolContentItems(result any, callErr error) ([]appproto.DynamicToolCallOutputContentItem, error) {
 	if callErr != nil {
 		return dynamicToolErrorContentItems(callErr), nil
 	}
 
 	switch value := result.(type) {
 	case nil:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": "OK",
-		}}, nil
+		return dynamicToolTextContentItems("OK")
 	case string:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": value,
-		}}, nil
+		return dynamicToolTextContentItems(value)
 	case []byte:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": string(value),
-		}}, nil
+		return dynamicToolTextContentItems(string(value))
 	case json.RawMessage:
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": string(value),
-		}}, nil
+		return dynamicToolTextContentItems(string(value))
 	default:
 		payload, err := json.Marshal(value)
 		if err != nil {
 			return nil, fmt.Errorf("encode tool result failed: %w", err)
 		}
-		return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-			"type": "inputText",
-			"text": string(payload),
-		}}, nil
+		return dynamicToolTextContentItems(string(payload))
 	}
 }
 
-func dynamicToolErrorContentItems(err error) []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem {
-	return []appproto.SanitizedDynamicToolCallResponseJSONContentItemsElem{map[string]any{
-		"type": "inputText",
-		"text": err.Error(),
-	}}
+func dynamicToolErrorContentItems(err error) []appproto.DynamicToolCallOutputContentItem {
+	items, _ := dynamicToolTextContentItems(err.Error())
+	return items
+}
+
+func dynamicToolTextContentItems(text string) ([]appproto.DynamicToolCallOutputContentItem, error) {
+	var item appproto.DynamicToolCallOutputContentItem
+	if err := json.Unmarshal([]byte(`{"type":"inputText","text":`+strconv.Quote(text)+`}`), &item); err != nil {
+		return nil, fmt.Errorf("encode dynamic tool text result: %w", err)
+	}
+	return []appproto.DynamicToolCallOutputContentItem{item}, nil
 }

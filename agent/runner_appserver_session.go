@@ -21,12 +21,14 @@ type appServerSession struct {
 	conversationKey string
 	threadID        string
 	thread          appServerThread
+	scheduleMu      sync.Mutex
 	mu              sync.Mutex
-	activeTurn      *appServerActiveTurn
+	activeTurn      *appServerScheduledTurn
 	closed          atomic.Bool
 }
 
-type appServerActiveTurn struct {
+type appServerScheduledTurn struct {
+	session            *appServerSession
 	req                TurnRequest
 	tools              []Tool
 	threadID           string
@@ -41,14 +43,10 @@ type appServerActiveTurn struct {
 	interruptFinished  bool
 	requestInterrupt   func()
 	interrupted        atomic.Bool
+	runCalled          atomic.Bool
 }
 
-type appServerScheduledTurn struct {
-	session *appServerSession
-	req     TurnRequest
-	active  *appServerActiveTurn
-	runCalled atomic.Bool
-}
+type appServerActiveTurn = appServerScheduledTurn
 
 func (s *appServerSession) ID() string {
 	if s == nil {
@@ -63,11 +61,14 @@ func (s *appServerSession) interruptCurrentTurn(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	active := s.activeTurn
+	if active != nil && active.session == nil {
+		active.session = s
+	}
 	s.mu.Unlock()
 	if active == nil {
 		return nil
 	}
-	return (&appServerScheduledTurn{session: s, active: active}).Interrupt(ctx)
+	return active.Interrupt(ctx)
 }
 
 //nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
@@ -83,35 +84,44 @@ func (s *appServerSession) ScheduleTurn(ctx context.Context, req TurnRequest) (T
 	if err != nil {
 		return nil, fmt.Errorf("run app-server turn failed: %w", err)
 	}
-	thread := s.currentThread()
-	if thread == nil {
-		return nil, errors.New("run app-server turn failed: thread is nil")
-	}
-	threadID := firstNonEmptyString(thread.ID(), s.ID(), req.Conversation.RunnerThreadID, s.conversationKey)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var active *appServerActiveTurn
-	for {
-		var current *appServerActiveTurn
-		active, current, err = s.beginTurn(threadID, "", req, s.runner.globalTools())
+	s.scheduleMu.Lock()
+	defer s.scheduleMu.Unlock()
+
+	thread := s.currentThread()
+	if thread == nil {
+		thread, err = s.runner.recoverAppServerThread(ctx, s.currentThreadID())
 		if err != nil {
-			return nil, fmt.Errorf("run app-server turn failed: %w", err)
+			return nil, fmt.Errorf("run app-server turn failed: restore thread: %w", err)
 		}
-		if current == nil {
-			break
-		}
-		if interruptErr := (&appServerScheduledTurn{session: s, active: current}).Interrupt(ctx); interruptErr != nil {
-			return nil, fmt.Errorf("run app-server turn failed: %w", interruptErr)
-		}
+		s.setThread(thread)
 	}
-	return &appServerScheduledTurn{session: s, req: req, active: active}, nil
+	threadID := firstNonEmptyString(thread.ID(), s.ID(), req.Conversation.RunnerThreadID)
+
+	active, current, err := s.beginTurn(threadID, "", req, s.runner.globalTools())
+	if err != nil {
+		return nil, fmt.Errorf("run app-server turn failed: %w", err)
+	}
+	if current == nil {
+		return active, nil
+	}
+	if interruptErr := current.Interrupt(ctx); interruptErr != nil {
+		return nil, fmt.Errorf("run app-server turn failed: %w", interruptErr)
+	}
+
+	active, _, err = s.beginTurn(threadID, "", req, s.runner.globalTools())
+	if err != nil {
+		return nil, fmt.Errorf("run app-server turn failed: %w", err)
+	}
+	return active, nil
 }
 
 func (t *appServerScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 	s := t.session
 	req := t.req
-	active := t.active
+	active := t
 	if s == nil || s.runner == nil {
 		return TurnResult{}, errors.New("run app-server turn failed: session is nil")
 	}
@@ -141,6 +151,10 @@ func (t *appServerScheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 	}
 	turn, runErr := s.runThreadTurn(runCtx, req, thread, inputs, &s.runner.turnOptions)
 	if runErr != nil {
+		if shouldRecoverAppServerRPCClient(runErr) {
+			s.runner.invalidateRPCClientIfRecoverable(runErr)
+			s.clearThread(thread)
+		}
 		return TurnResult{}, fmt.Errorf("run app-server turn failed: %w", runErr)
 	}
 	if active != nil && active.interrupted.Load() {
@@ -161,7 +175,7 @@ func (t *appServerScheduledTurn) Interrupt(ctx context.Context) error {
 	if s == nil || s.runner == nil {
 		return nil
 	}
-	active := t.active
+	active := t
 	if active == nil {
 		return nil
 	}
@@ -203,7 +217,7 @@ func (t *appServerScheduledTurn) Interrupt(ctx context.Context) error {
 	}
 }
 
-func (t *appServerScheduledTurn) Done() <-chan struct{} { return t.active.done }
+func (t *appServerScheduledTurn) Done() <-chan struct{} { return t.done }
 
 func (s *appServerSession) Close() error {
 	if s == nil || s.runner == nil {
@@ -335,7 +349,8 @@ func (s *appServerSession) beginTurn(threadID string, turnID string, req TurnReq
 	}
 
 	interruptRequested := make(chan struct{})
-	active := &appServerActiveTurn{
+	active := &appServerScheduledTurn{
+		session:            s,
 		done:               make(chan struct{}),
 		interruptRequested: interruptRequested,
 		interruptDone:      make(chan struct{}),
@@ -432,6 +447,29 @@ func (s *appServerSession) setThreadID(threadID string) {
 	}
 	s.mu.Lock()
 	s.threadID = threadID
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) setThread(thread appServerThread) {
+	if s == nil || thread == nil {
+		return
+	}
+	s.mu.Lock()
+	s.thread = thread
+	if threadID := strings.TrimSpace(thread.ID()); threadID != "" {
+		s.threadID = threadID
+	}
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) clearThread(thread appServerThread) {
+	if s == nil || thread == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.thread == thread {
+		s.thread = nil
+	}
 	s.mu.Unlock()
 }
 
@@ -831,12 +869,12 @@ func (r *AppServerRunner) unregisterSession(sessionKey string, target *appServer
 }
 
 func buildAppServerTurnInputs(req TurnRequest) []appcodex.Input {
-	prompt, imagePaths := buildTurnPrompt(req.Message)
-	inputs := make([]appcodex.Input, 0, 1+len(imagePaths))
-	if prompt != "" {
-		inputs = append(inputs, appcodex.TextInput(prompt))
+	prompt := buildTurnPromptResult(req.Message)
+	inputs := make([]appcodex.Input, 0, 1+len(prompt.ImagePaths))
+	if prompt.Text != "" {
+		inputs = append(inputs, appcodex.TextInput(prompt.Text))
 	}
-	for _, imagePath := range imagePaths {
+	for _, imagePath := range prompt.ImagePaths {
 		inputs = append(inputs, appcodex.LocalImageInput(imagePath))
 	}
 	if len(inputs) == 0 {

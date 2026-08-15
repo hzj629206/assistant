@@ -8,8 +8,10 @@ import (
 	"log"
 	"strings"
 
-	"github.com/godeps/codex-sdk-go"
+	"github.com/hzj629206/assistant/agent/codex"
 )
+
+const defaultMaxToolIterations = 50
 
 type toolLoopResponse struct {
 	Action        string          `json:"action"`
@@ -24,16 +26,11 @@ type codexTurnContext struct {
 	tools   []Tool
 }
 
-func (s *codexRunnerSession) runToolLoop(ctx context.Context, req TurnRequest, thread codexThread, input codex.Input) (string, error) {
-	if s == nil || s.runner == nil {
-		return "", errors.New("codex session is nil")
+func (r *CodexRunner) effectiveMaxToolIterations() int {
+	if r == nil || r.maxToolIterations <= 0 {
+		return defaultMaxToolIterations
 	}
-
-	prompts, tools := s.runner.globalContext()
-	return s.runToolLoopWithContext(ctx, req, thread, input, codexTurnContext{
-		prompts: prompts,
-		tools:   tools,
-	})
+	return r.maxToolIterations
 }
 
 func (s *codexRunnerSession) runToolLoopWithContext(ctx context.Context, req TurnRequest, thread codexThread, input codex.Input, turnContext codexTurnContext) (string, error) {

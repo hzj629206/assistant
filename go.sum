@@ -1,5 +1,3 @@
-github.com/godeps/codex-sdk-go v0.1.1 h1:AfAIzUleTDS1PZA4QnwFPqxMeaC0dk9L8xaQBzbeEE4=
-github.com/godeps/codex-sdk-go v0.1.1/go.mod h1:MHgtgq/RdWL8mFnCh03Mhn+2Ze59a4w3tOZ+ji+e1+4=
 github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
 github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
@@ -10,8 +8,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/modelcontextprotocol/go-sdk v1.5.0 h1:CHU0FIX9kpueNkxuYtfYQn1Z0slhFzBZuq+x6IiblIU=
 github.com/modelcontextprotocol/go-sdk v1.5.0/go.mod h1:gggDIhoemhWs3BGkGwd1umzEXCEMMvAnhTrnbXJKKKA=
-github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d h1:S4w0cD/wA2T+6JgU0WyOVmZ6WWuIaza/XUqX8W6iGBM=
-github.com/pmenglund/codex-sdk-go v0.0.0-20260411043038-678f3b005f5d/go.mod h1:CCeCbibaIzsdmyONL6tcIvVYieia0TGRnKThsLvazt0=
+github.com/pmenglund/codex-sdk-go v0.147.0 h1:RAb2KfXweM6FupIixnzW+SAa1Ci1mGBs9qEOEi86q+c=
+github.com/pmenglund/codex-sdk-go v0.147.0/go.mod h1:j5lkVZEMTDhv2NHEBFUePjenoGqE3cOQoUrRkYao5Ic=
 github.com/segmentio/asm v1.1.3 h1:WM03sfUOENvvKexOLp+pCqgb/WDjsi7EK8gIsICtzhc=
 github.com/segmentio/asm v1.1.3/go.mod h1:Ld3L4ZXGNcSLRg4JBsZ3//1+f/TjYl0Mzen/DQy1EJg=
 github.com/segmentio/encoding v0.5.4 h1:OW1VRern8Nw6ITAtwSZ7Idrl3MXCFwXHPgqESYfvNt0=

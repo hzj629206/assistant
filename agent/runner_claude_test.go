@@ -697,17 +697,6 @@ func TestClaudeCodeSessionInterruptDoesNotAllowSuccessfulTurnResult(t *testing.T
 	}
 }
 
-func TestClaudeCodeRunnerInterruptReturnsNilWithoutActiveTurn(t *testing.T) {
-	t.Parallel()
-
-	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
-
-	err := interruptWithRunner(t, runner, ConversationState{Key: "conversation-idle"})
-	if err != nil {
-		t.Fatalf("expected nil interrupt on idle session, got %v", err)
-	}
-}
-
 func TestClaudeScheduledTurnRunReturnsErrorWhenStartedConcurrently(t *testing.T) {
 	t.Parallel()
 

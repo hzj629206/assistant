@@ -13,15 +13,27 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	apprpc "github.com/pmenglund/codex-sdk-go/rpc"
 )
 
+// appServerStdioTransport is deliberately separate from rpc.StdioTransport.
+//
+// The SDK transport handles ordinary CLI cleanup, but this daemon owns a long-lived
+// app-server which may create child processes. We start it in its own process group
+// and close that group in stages so shutdown cannot leave descendants behind. When
+// upgrading the SDK, retain that lifecycle guarantee while adopting compatible
+// Transport additions (for example bounded reads and context-aware writes).
 type appServerStdioTransport struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	mu     sync.Mutex
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    *bufio.Reader
+	writeOnce sync.Once
+	writeSem  chan struct{}
 }
 
+// spawnAppServerStdio starts app-server in a dedicated process group. Its context
+// only governs startup; Close owns the process lifetime after Start succeeds.
 func spawnAppServerStdio(ctx context.Context, binary string, args []string, stderr io.Writer) (*appServerStdioTransport, error) {
 	if binary == "" {
 		return nil, errors.New("codex binary path is empty")
@@ -47,26 +59,40 @@ func spawnAppServerStdio(ctx context.Context, binary string, args []string, stde
 	}
 
 	return &appServerStdioTransport{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdout),
+		cmd:      cmd,
+		stdin:    stdin,
+		stdout:   bufio.NewReader(stdout),
+		writeSem: make(chan struct{}, 1),
 	}, nil
 }
 
 func (t *appServerStdioTransport) ReadLine() (string, error) {
-	line, err := t.stdout.ReadString('\n')
-	if err != nil {
-		if errors.Is(err, io.EOF) && line != "" {
-			return strings.TrimRight(line, "\n"), nil
-		}
-		return "", err
-	}
-	return strings.TrimRight(line, "\n"), nil
+	// Keep the custom transport subject to the same inbound size limit as the
+	// SDK's built-in transports.
+	return apprpc.ReadLineLimited(t.stdout, apprpc.DefaultMaxMessageBytes)
 }
 
 func (t *appServerStdioTransport) WriteLine(line string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	return t.WriteLineContext(context.Background(), line)
+}
+
+func (t *appServerStdioTransport) WriteLineContext(ctx context.Context, line string) error {
+	if t == nil || t.stdin == nil {
+		return errors.New("app-server stdin is not initialized")
+	}
+	t.writeOnce.Do(func() {
+		if t.writeSem == nil {
+			t.writeSem = make(chan struct{}, 1)
+		}
+	})
+	// The RPC client serializes writes as well, but this semaphore also makes
+	// direct uses safe and lets a request be canceled while waiting to write.
+	select {
+	case t.writeSem <- struct{}{}:
+		defer func() { <-t.writeSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
@@ -77,6 +103,8 @@ func (t *appServerStdioTransport) WriteLine(line string) error {
 }
 
 func (t *appServerStdioTransport) Close() error {
+	// Closing stdin is the cooperative shutdown path. If app-server or one of
+	// its children remains alive, escalate against the whole process group.
 	var shutdownErr error
 
 	if t.stdin != nil {
