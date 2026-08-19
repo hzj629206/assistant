@@ -15,12 +15,27 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/dreampuf/mermaid.go"
+
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/seatalk"
 )
 
 type seaTalkSendFileTool struct{}
+
+type seaTalkSendMermaidTool struct {
+	newRenderer func(context.Context) (mermaidRenderer, error)
+}
+
+type mermaidRenderer interface {
+	RenderAsScaledPNG(content string, scale float64) ([]byte, error)
+	Close()
+}
+
+type mermaidGoRenderer struct {
+	engine *mermaid_go.RenderEngine
+}
 
 type seaTalkGetMessageTool struct{}
 
@@ -206,6 +221,102 @@ func (seaTalkSendFileTool) Call(ctx context.Context, input json.RawMessage) (any
 		"filename":   filename,
 	}, nil
 }
+
+func (seaTalkSendMermaidTool) Name() string { return "seatalk_send_mermaid" }
+
+func (seaTalkSendMermaidTool) Description() string {
+	return strings.TrimSpace(`
+Render Mermaid plain-text diagram definitions as a PNG image and send it to the current SeaTalk conversation.
+Use standard Mermaid syntax, such as flowchart, sequence, class, state, ER, gantt, and pie diagrams.
+`)
+}
+
+func (seaTalkSendMermaidTool) InputSchema() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"content": map[string]any{"type": "string"},
+		},
+		"required":             []any{"content"},
+		"additionalProperties": false,
+	}
+}
+
+func (seaTalkSendMermaidTool) OutputSchema() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"message_id": map[string]any{"type": "string"},
+		},
+		"required":             []any{"message_id"},
+		"additionalProperties": false,
+	}
+}
+
+func (t seaTalkSendMermaidTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
+	responder, turnReq, err := seaTalkResponderFromToolContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(input, &payload); err != nil {
+		return nil, fmt.Errorf("seatalk send mermaid tool failed: decode input: %w", err)
+	}
+	payload.Content = strings.TrimSpace(payload.Content)
+	if payload.Content == "" {
+		return nil, errors.New("seatalk send mermaid tool failed: content is empty")
+	}
+
+	newRenderer := t.newRenderer
+	if newRenderer == nil {
+		newRenderer = newMermaidRenderer
+	}
+	renderer, err := newRenderer(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("seatalk send mermaid tool failed: create renderer: %w", err)
+	}
+	defer renderer.Close()
+
+	image, err := renderer.RenderAsScaledPNG(payload.Content, 1)
+	if err != nil {
+		return nil, fmt.Errorf("seatalk send mermaid tool failed: render PNG: %w", err)
+	}
+	if base64.StdEncoding.EncodedLen(len(image)) > seaTalkFileBase64MaxBytes {
+		return nil, fmt.Errorf("seatalk send mermaid tool failed: base64-encoded PNG exceeds 5M limit: got %d bytes, max %d bytes", base64.StdEncoding.EncodedLen(len(image)), seaTalkFileBase64MaxBytes)
+	}
+
+	log.Printf("seatalk tool send_mermaid: conversation=%s target=%s content_bytes=%d image_bytes=%d", turnReq.Conversation.Key, responder.target.logValue(), len(payload.Content), len(image))
+
+	var result seatalk.SendMessageResult
+	if responder.target.isGroup {
+		result, err = responder.client.SendGroupImage(ctx, responder.target.groupID, seatalk.ImageMessage{Content: image}, seatalk.SendOptions{ThreadID: responder.target.threadID})
+	} else {
+		result, err = responder.client.SendPrivateImage(ctx, responder.target.employeeCode, seatalk.ImageMessage{Content: image}, seatalk.PrivateSendOptions{ThreadID: responder.target.threadID, UsablePlatform: seatalk.UsablePlatformAll})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("seatalk send mermaid tool failed: %w", err)
+	}
+
+	return map[string]any{"message_id": result.MessageID}, nil
+}
+
+func newMermaidRenderer(ctx context.Context) (mermaidRenderer, error) {
+	engine, err := mermaid_go.NewRenderEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return mermaidGoRenderer{engine: engine}, nil
+}
+
+func (r mermaidGoRenderer) RenderAsScaledPNG(content string, scale float64) ([]byte, error) {
+	image, _, err := r.engine.RenderAsScaledPng(content, scale)
+	return image, err
+}
+
+func (r mermaidGoRenderer) Close() { r.engine.Cancel() }
 
 func (seaTalkGetMessageTool) Name() string {
 	return "seatalk_get_message"

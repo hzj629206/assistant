@@ -844,7 +844,7 @@ func TestItemCommandExecutionRequestApprovalAcceptsByDefault(t *testing.T) {
 		ThreadID: "thread-1",
 		TurnID:   "turn-1",
 		ItemID:   "item-1",
-		Command:  stringPtr("pwd"),
+		Command:  new("pwd"),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1062,6 +1062,9 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			ID:     apprpc.NewIntRequestID(1),
 			Method: "initialize",
 			Params: appServerMustRaw(t, map[string]any{
+				"capabilities": map[string]any{
+					"experimentalApi": true,
+				},
 				"clientInfo": map[string]any{
 					"name":    "assistant-test",
 					"title":   "Assistant Test",
@@ -1193,7 +1196,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			Transport: apprpc.NewReplayTransport(transcript),
 			ClientInfo: protocol.ClientInfo{
 				Name:    "assistant-test",
-				Title:   stringPtr("Assistant Test"),
+				Title:   new("Assistant Test"),
 				Version: "test",
 			},
 		},

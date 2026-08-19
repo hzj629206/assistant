@@ -67,7 +67,7 @@ and only keeps already-running turns or commands alive for a short grace period.
 
 ## Requirements
 
-This project requires `Go 1.25+`.
+This project requires `Go 1.26+`.
 
 This project depends on a locally installed agent CLI for the daemon you choose to run.
 

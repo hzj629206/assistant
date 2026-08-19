@@ -2858,14 +2858,17 @@ func TestSeaTalkAgentAdapterTools(t *testing.T) {
 
 	adapter := newSeaTalkAgentAdapterWithClient(nil, seatalk.NewClient(seatalk.Config{AppID: "app-id", AppSecret: "app-secret"}))
 	tools := adapter.Tools()
-	if len(tools) != 2 {
+	if len(tools) != 3 {
 		t.Fatalf("unexpected tool count: %d", len(tools))
 	}
 	if tools[0].Name() != "seatalk_send_file" {
 		t.Fatalf("unexpected first tool name: %s", tools[0].Name())
 	}
-	if tools[1].Name() != "seatalk_push_interactive_message" {
+	if tools[1].Name() != "seatalk_send_mermaid" {
 		t.Fatalf("unexpected second tool name: %s", tools[1].Name())
+	}
+	if tools[2].Name() != "seatalk_push_interactive_message" {
+		t.Fatalf("unexpected third tool name: %s", tools[2].Name())
 	}
 }
 

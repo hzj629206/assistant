@@ -9,7 +9,10 @@ This is a backend-only Golang project for integrating SeaTalk with Codex CLI, Cl
 - Keep the application lightweight. Do not introduce unnecessarily complex architecture or abstractions.
 - Prefer the Go standard library. Avoid unnecessary third-party dependencies.
 - Add logs for important actions and events to support tracing and troubleshooting.
-- When importing third-party Go packages, group imports by domain name, and place this project's own packages in the last import group.
+- Group Go imports by domain; put aliased imports in a separate group for each domain.
+- Do not use import aliases unless there is a name conflict or another clear necessity.
+- Respect the boundaries of the repository structure.
+- Follow `.editorconfig`: tabs for Go files, spaces for others, UTF-8, LF line endings, and max line length.
 - Use `go run`, `go build`, and `go install` for build and execution workflows.
 - When using `go build`, always set the output path with `-o` so the generated binary is placed under the project `bin` directory, regardless of the current working directory.
 - Use `golangci-lint` **v2.11.4+** for linting and code checks.

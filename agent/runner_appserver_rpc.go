@@ -141,10 +141,6 @@ func extractAppServerTextFromItem(raw json.RawMessage) (string, bool) {
 	return "", false
 }
 
-func stringPtr(value string) *string {
-	return &value
-}
-
 func marshalAppServerJSONValue(field string, value any) (json.RawMessage, error) {
 	if value == nil {
 		return nil, nil
@@ -203,10 +199,10 @@ type appServerDynamicTool struct {
 func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools []Tool) (appServerThreadStartParams, error) {
 	params := appServerThreadStartParams{}
 	if options.Model != "" {
-		params.Model = stringPtr(options.Model)
+		params.Model = new(options.Model)
 	}
 	if options.Cwd != "" {
-		params.Cwd = stringPtr(options.Cwd)
+		params.Cwd = new(options.Cwd)
 	}
 	if raw, err := marshalAppServerJSONValue("approvalPolicy", options.ApprovalPolicy); err != nil {
 		return params, err
@@ -223,10 +219,10 @@ func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools 
 		params.Config = &config
 	}
 	if options.BaseInstructions != "" {
-		params.BaseInstructions = stringPtr(options.BaseInstructions)
+		params.BaseInstructions = new(options.BaseInstructions)
 	}
 	if options.DeveloperInstructions != "" {
-		params.DeveloperInstructions = stringPtr(options.DeveloperInstructions)
+		params.DeveloperInstructions = new(options.DeveloperInstructions)
 	}
 	if len(tools) != 0 {
 		params.DynamicTools = make([]appServerDynamicTool, 0, len(tools))
@@ -244,13 +240,13 @@ func buildAppServerThreadStartParams(options appcodex.ThreadStartOptions, tools 
 func buildAppServerThreadResumeParams(options appcodex.ThreadResumeOptions) (appServerThreadResumeParams, error) {
 	params := appServerThreadResumeParams{ThreadID: options.ThreadID}
 	if options.Model != "" {
-		params.Model = stringPtr(options.Model)
+		params.Model = new(options.Model)
 	}
 	if options.ModelProvider != "" {
-		params.ModelProvider = stringPtr(options.ModelProvider)
+		params.ModelProvider = new(options.ModelProvider)
 	}
 	if options.Cwd != "" {
-		params.Cwd = stringPtr(options.Cwd)
+		params.Cwd = new(options.Cwd)
 	}
 	if raw, err := marshalAppServerJSONValue("approvalPolicy", options.ApprovalPolicy); err != nil {
 		return params, err
@@ -267,10 +263,10 @@ func buildAppServerThreadResumeParams(options appcodex.ThreadResumeOptions) (app
 		params.Config = &config
 	}
 	if options.BaseInstructions != "" {
-		params.BaseInstructions = stringPtr(options.BaseInstructions)
+		params.BaseInstructions = new(options.BaseInstructions)
 	}
 	if options.DeveloperInstructions != "" {
-		params.DeveloperInstructions = stringPtr(options.DeveloperInstructions)
+		params.DeveloperInstructions = new(options.DeveloperInstructions)
 	}
 	return params, nil
 }
@@ -288,7 +284,7 @@ func buildAppServerTurnStartParams(threadID string, inputs []appcodex.Input, opt
 	}
 
 	if opts.Cwd != "" {
-		params.Cwd = stringPtr(opts.Cwd)
+		params.Cwd = new(opts.Cwd)
 	}
 	if raw, err := marshalAppServerJSONValue("approvalPolicy", opts.ApprovalPolicy); err != nil {
 		return params, err
@@ -301,7 +297,7 @@ func buildAppServerTurnStartParams(threadID string, inputs []appcodex.Input, opt
 		params.SandboxPolicy = raw
 	}
 	if opts.Model != "" {
-		params.Model = stringPtr(opts.Model)
+		params.Model = new(opts.Model)
 	}
 	if raw, err := marshalAppServerJSONValue("effort", opts.Effort); err != nil {
 		return params, err
@@ -372,8 +368,11 @@ func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existi
 	initializeParams := appproto.InitializeParams{
 		ClientInfo: appproto.ClientInfo{
 			Name:    "assistant-appserver-runner",
-			Title:   stringPtr("Assistant AppServer Runner"),
+			Title:   new("Assistant AppServer Runner"),
 			Version: appServerRunnerVersion(),
+		},
+		Capabilities: &appproto.InitializeCapabilities{
+			ExperimentalApi: true,
 		},
 	}
 	if options.ClientInfo.Name != "" {

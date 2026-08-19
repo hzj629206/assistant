@@ -777,6 +777,94 @@ func TestSeaTalkSendFileToolInputSchemaOmitsParameterDescriptions(t *testing.T) 
 	}
 }
 
+func TestSeaTalkSendMermaidToolRendersAndSendsGroupImage(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPost {
+				t.Fatalf("unexpected method: %s", req.Method)
+			}
+			if req.URL.Path != "/messaging/v2/group_chat" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+
+			var body struct {
+				GroupID string `json:"group_id"`
+				Message struct {
+					Tag      string `json:"tag"`
+					ThreadID string `json:"thread_id"`
+					Image    struct {
+						Content string `json:"content"`
+					} `json:"image"`
+				} `json:"message"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request failed: %v", err)
+			}
+			if body.GroupID != "group-1" || body.Message.ThreadID != "thread-1" || body.Message.Tag != "image" {
+				t.Fatalf("unexpected request: %+v", body)
+			}
+			image, err := base64.StdEncoding.DecodeString(body.Message.Image.Content)
+			if err != nil {
+				t.Fatalf("decode image failed: %v", err)
+			}
+			if !bytes.HasPrefix(image, []byte("\x89PNG\r\n\x1a\n")) {
+				t.Fatalf("expected PNG image, got %q", image[:min(len(image), 8)])
+			}
+
+			return jsonResponse(t, map[string]any{"code": 0, "message_id": "mermaid-msg-1"}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+
+	tool := seaTalkSendMermaidTool{
+		newRenderer: func(context.Context) (mermaidRenderer, error) {
+			return fakeMermaidRenderer{image: []byte("\x89PNG\r\n\x1a\nexample")}, nil
+		},
+	}
+	ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
+		Conversation: agent.ConversationState{Key: "seatalk:group:group-1:thread-1"},
+		Message: agent.InboundMessage{Responder: &SeaTalkResponder{
+			client: client,
+			target: seaTalkReplyTarget{isGroup: true, groupID: "group-1", threadID: "thread-1"},
+		}},
+	})
+
+	result, err := tool.Call(ctx, json.RawMessage(`{
+		"content":"flowchart LR\n  Build --> Deploy"
+	}`))
+	if err != nil {
+		t.Fatalf("tool call failed: %v", err)
+	}
+	body, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected tool result type: %T", result)
+	}
+	if body["message_id"] != "mermaid-msg-1" {
+		t.Fatalf("unexpected tool result: %#v", result)
+	}
+}
+
+type fakeMermaidRenderer struct {
+	image []byte
+}
+
+func (r fakeMermaidRenderer) RenderAsScaledPNG(content string, scale float64) ([]byte, error) {
+	if content != "flowchart LR\n  Build --> Deploy" {
+		return nil, fmt.Errorf("unexpected Mermaid code: %q", content)
+	}
+	if scale != 1 {
+		return nil, fmt.Errorf("unexpected render scale: %v", scale)
+	}
+	return r.image, nil
+}
+
+func (fakeMermaidRenderer) Close() {}
+
 func TestSeaTalkPushInteractiveMessageToolRequiresMode(t *testing.T) {
 	t.Parallel()
 

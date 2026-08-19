@@ -111,6 +111,7 @@ func (a *SeaTalkAgentAdapter) Tools() []agent.Tool {
 
 	tools := []agent.Tool{
 		seaTalkSendFileTool{},
+		seaTalkSendMermaidTool{},
 		// seaTalkGetMessageTool{},
 		// seaTalkGetThreadTool{},
 		seaTalkPushInteractiveMessageTool{},
