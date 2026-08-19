@@ -253,7 +253,7 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	if !(securityIndex != -1 && securityIndex < priorityIndex && priorityIndex < workingContextIndex) {
 		t.Fatalf("system prompt should place instruction priority guidance under security restrictions: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown doesn't support links, headings, or quotes. It supports tables, bold, italic, ordered lists, unordered lists, inline code, and code blocks.") {
 		t.Fatalf("system prompt missing SeaTalk markdown guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "SeaTalk Markdown italic, bold and inline code must not be nested.") {
@@ -2021,6 +2021,21 @@ func TestSplitSeaTalkTextSplitsByTopLevelMarkdownBlocks(t *testing.T) {
 	}
 	if !slices.Equal(parts, expected) {
 		t.Fatalf("unexpected chunks: %#v", parts)
+	}
+}
+
+func TestSplitSeaTalkTextKeepsMarkdownTableIntact(t *testing.T) {
+	t.Parallel()
+
+	text := "Intro.\n\n| Name | Status |\n| --- | --- |\n| Codex | Ready |\n\nOutro.\n"
+	parts := splitSeaTalkMarkdownTopLevelBlocks(text)
+	want := []string{
+		"Intro.\n\n",
+		"| Name | Status |\n| --- | --- |\n| Codex | Ready |\n\n",
+		"Outro.\n",
+	}
+	if !slices.Equal(parts, want) {
+		t.Fatalf("unexpected table blocks: %#v", parts)
 	}
 }
 

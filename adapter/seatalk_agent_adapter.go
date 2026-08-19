@@ -19,9 +19,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/yuin/goldmark"
-	goldmarktext "github.com/yuin/goldmark/text"
-
 	"github.com/hzj629206/assistant/agent"
 	"github.com/hzj629206/assistant/cache"
 	"github.com/hzj629206/assistant/seatalk"
@@ -79,7 +76,7 @@ Working context:
 - Tasks may not be related to the current working directory. Do not assume file paths are based on it.
 
 SeaTalk Markdown restrictions:
-- SeaTalk Markdown doesn't support links, headings, tables, and quotes. Only bold, italic, ordered lists, unordered lists, inline code, and code blocks are supported.
+- SeaTalk Markdown doesn't support links, headings, or quotes. It supports tables, bold, italic, ordered lists, unordered lists, inline code, and code blocks.
 - SeaTalk Markdown italic, bold and inline code must not be nested.
 - SeaTalk Markdown lists support at most three nesting levels, and indented sublists must be strictly compact without line breaks or blank lines.
 
@@ -1566,7 +1563,7 @@ func splitSeaTalkCodeBlock(block string) (string, string, string, string, bool) 
 
 func splitSeaTalkMarkdownTopLevelBlocks(text string) []string {
 	source := []byte(text)
-	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
+	document := parseSeaTalkMarkdown(source)
 
 	blocks := make([]string, 0)
 	start := 0

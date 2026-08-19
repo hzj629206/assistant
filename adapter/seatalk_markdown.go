@@ -10,6 +10,7 @@ import (
 
 	"github.com/yuin/goldmark"
 	goldmarkast "github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
 	goldmarktext "github.com/yuin/goldmark/text"
 )
 
@@ -19,7 +20,7 @@ func normalizeSeaTalkMarkdown(value string) string {
 	}
 
 	source := []byte(value)
-	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
+	document := parseSeaTalkMarkdown(source)
 	edits := collectSeaTalkMarkdownEdits(document, source)
 	normalized := value
 	if len(edits) != 0 {
@@ -35,13 +36,20 @@ func escapeSeaTalkMarkdownOrderedSectionNumbers(value string) string {
 	}
 
 	source := []byte(value)
-	document := goldmark.DefaultParser().Parse(goldmarktext.NewReader(source))
+	document := parseSeaTalkMarkdown(source)
 	edits := seaTalkMarkdownOrderedSectionNumberEdits(document, source)
 	if len(edits) == 0 {
 		return value
 	}
 
 	return applySeaTalkMarkdownEdits(source, edits)
+}
+
+// parseSeaTalkMarkdown recognizes the Markdown features SeaTalk supports.
+// Tables must be parsed as top-level blocks so they are preserved intact when
+// a response is normalized or split to meet SeaTalk's message size limit.
+func parseSeaTalkMarkdown(source []byte) goldmarkast.Node {
+	return goldmark.New(goldmark.WithExtensions(extension.Table)).Parser().Parse(goldmarktext.NewReader(source))
 }
 
 type seaTalkMarkdownEdit struct {

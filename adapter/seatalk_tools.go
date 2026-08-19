@@ -634,7 +634,7 @@ Set "mode" to control whether this call sends a new card or updates an existing 
 - mode="update": update "message_id" if provided, otherwise update the current interactive card in context. Fail if neither target is available.
 Elements are rendered top-to-bottom in array order. Mix title, description, button, button_group, and image elements freely to build the card.
 Limits per card: title <= 3, description <= 5, standalone button <= 5, button_group <= 3, image <= 3. Limits per button group: button <= 3.
-Description elements must use SeaTalk Markdown and satisfy the restrictions. Each supports up to 1000 characters.
+Description elements must use SeaTalk Markdown and satisfy the restrictions. Markdown tables are not supported in interactive cards. Each supports up to 1000 characters.
 For callback buttons, set "value" to a JSON-encoded callback action payload serialized into a string.
 Supported callback action payloads:
 - Tool call: {"action":"tool_call","tool_name":"...","tool_input_json":"{...}"}

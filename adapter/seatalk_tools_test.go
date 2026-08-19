@@ -482,7 +482,7 @@ func TestSeaTalkPushInteractiveMessageToolDescriptionMentionsMarkdown(t *testing
 	if !strings.Contains(description, "Limits per card: title <= 3, description <= 5, standalone button <= 5, button_group <= 3, image <= 3. Limits per button group: button <= 3.") {
 		t.Fatalf("expected card element limit guidance in tool description, got %q", description)
 	}
-	if !strings.Contains(description, "Description elements must use SeaTalk Markdown and satisfy the restrictions. Each supports up to 1000 characters.") {
+	if !strings.Contains(description, "Description elements must use SeaTalk Markdown and satisfy the restrictions. Markdown tables are not supported in interactive cards. Each supports up to 1000 characters.") {
 		t.Fatalf("expected description markdown and length guidance in tool description, got %q", description)
 	}
 	if !strings.Contains(description, `{"action":"tool_call","tool_name":"...","tool_input_json":"{...}"}`) {

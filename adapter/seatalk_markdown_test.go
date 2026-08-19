@@ -2,6 +2,17 @@ package adapter
 
 import "testing"
 
+func TestNormalizeSeaTalkMarkdownPreservesTables(t *testing.T) {
+	t.Parallel()
+
+	text := "| Name | Status |\n| :--- | ---: |\n| Codex | Ready |"
+	got := normalizeSeaTalkMarkdown(text)
+
+	if got != text {
+		t.Fatalf("unexpected normalized table: %q", got)
+	}
+}
+
 func TestNormalizeSeaTalkMarkdownPreservesParagraphAndCodeFenceBlankLines(t *testing.T) {
 	t.Parallel()
 
