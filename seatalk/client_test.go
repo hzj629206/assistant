@@ -985,6 +985,36 @@ func TestClientGetMessageRejectsEmptyMessageID(t *testing.T) {
 	}
 }
 
+func TestClientGetMessageMarksExpiredOrDeletedMessageUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(getMessageResponse{
+			Code:    4009,
+			Message: "The message has expired or been deleted",
+		}); err != nil {
+			t.Fatalf("encode response failed: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	originalEndpoint := getMessageEndpoint
+	getMessageEndpoint = server.URL
+	t.Cleanup(func() {
+		getMessageEndpoint = originalEndpoint
+	})
+
+	client := NewClient(Config{AppID: "app-id", AppSecret: "app-secret"})
+	client.httpClient = server.Client()
+	client.tokenProvider = func(context.Context, *http.Client, string, string) (string, error) {
+		return "token-123", nil
+	}
+
+	_, err := client.GetMessage(context.Background(), "message-1")
+	if !errors.Is(err, ErrMessageUnavailable) {
+		t.Fatalf("expected unavailable message error, got %v", err)
+	}
+}
+
 func TestClientGetGroupThread(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

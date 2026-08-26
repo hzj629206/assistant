@@ -552,6 +552,14 @@ func (a *SeaTalkAgentAdapter) prepareMessageAssets(ctx context.Context, route *s
 	)
 	quoted, err := a.resolveReferencedMessage(ctx, responder, route.quotedMessageID)
 	if err != nil {
+		if errors.Is(err, seatalk.ErrMessageUnavailable) {
+			log.Printf(
+				"seatalk adapter skipped unavailable quoted message: conversation=%s quoted_message_id=%s",
+				route.message.ConversationKey,
+				route.quotedMessageID,
+			)
+			return nil
+		}
 		return fmt.Errorf("hydrate quoted message failed: %w", err)
 	}
 	if quoted == nil {
@@ -1118,6 +1126,14 @@ func (a *SeaTalkAgentAdapter) normalizeThreadHistoryMessage(
 	if strings.TrimSpace(message.QuotedMessageID) != "" {
 		quoted, err := a.resolveReferencedMessage(ctx, responder, message.QuotedMessageID)
 		if err != nil {
+			if errors.Is(err, seatalk.ErrMessageUnavailable) {
+				log.Printf(
+					"seatalk adapter skipped unavailable quoted thread history message: message_id=%s quoted_message_id=%s",
+					message.MessageID,
+					message.QuotedMessageID,
+				)
+				return history, true, nil
+			}
 			return agent.InboundMessage{}, false, err
 		}
 		history.QuotedMessage = quoted

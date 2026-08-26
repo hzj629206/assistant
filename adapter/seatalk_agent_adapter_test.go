@@ -2655,6 +2655,150 @@ func TestSeaTalkResponderSetTypingSkipsWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestNormalizeThreadHistoryMessageIgnoresUnavailableQuotedMessage(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Query().Get("message_id") != "quoted-expired" {
+				t.Fatalf("unexpected quoted message id: %s", req.URL.Query().Get("message_id"))
+			}
+			return jsonResponse(t, map[string]any{
+				"code":    4009,
+				"message": "The message has expired or been deleted",
+			}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+	adapter := newSeaTalkAgentAdapterWithClient(nil, client)
+
+	normalized, ok, err := adapter.normalizeThreadHistoryMessage(
+		context.Background(),
+		nil,
+		"private:e_1:thread-1",
+		seatalk.PrivateThreadMessage{
+			MessageID:       "message-1",
+			QuotedMessageID: "quoted-expired",
+			Tag:             "text",
+			Text:            &seatalk.ThreadTextMessage{PlainText: "hello"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("normalize thread history message failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected history message to be retained")
+	}
+	if normalized.Text != "hello" {
+		t.Fatalf("unexpected normalized text: %q", normalized.Text)
+	}
+	if normalized.QuotedMessage != nil {
+		t.Fatalf("expected unavailable quoted message to be omitted, got %+v", normalized.QuotedMessage)
+	}
+}
+
+func TestPrepareMessageAssetsIgnoresUnavailableQuotedMessage(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Query().Get("message_id") != "quoted-expired" {
+				t.Fatalf("unexpected quoted message id: %s", req.URL.Query().Get("message_id"))
+			}
+			return jsonResponse(t, map[string]any{
+				"code":    4009,
+				"message": "The message has expired or been deleted",
+			}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+	adapter := newSeaTalkAgentAdapterWithClient(nil, client)
+	responder := &SeaTalkResponder{client: client}
+	route := &seaTalkRoute{
+		message: agent.InboundMessage{
+			ID:              "message-1",
+			ConversationKey: "private:e_1:thread-1",
+			Kind:            agent.MessageKindText,
+			Text:            "hello",
+		},
+		quotedMessageID: "quoted-expired",
+	}
+
+	if err := adapter.prepareMessageAssets(context.Background(), route, responder); err != nil {
+		t.Fatalf("prepare message assets failed: %v", err)
+	}
+	if route.message.QuotedMessage != nil {
+		t.Fatalf("expected unavailable quoted message to be omitted, got %+v", route.message.QuotedMessage)
+	}
+}
+
+func TestPrepareMessageAssetsReturnsOtherQuotedMessageErrors(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(t, map[string]any{"code": 4010, "message": "unexpected error"}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+	adapter := newSeaTalkAgentAdapterWithClient(nil, client)
+	responder := &SeaTalkResponder{client: client}
+	route := &seaTalkRoute{
+		message:         agent.InboundMessage{ConversationKey: "private:e_1:thread-1"},
+		quotedMessageID: "quoted-error",
+	}
+
+	err := adapter.prepareMessageAssets(context.Background(), route, responder)
+	if err == nil {
+		t.Fatal("expected quoted message lookup error")
+	}
+	if !strings.Contains(err.Error(), "code 4010") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNormalizeThreadHistoryMessageReturnsOtherQuotedMessageErrors(t *testing.T) {
+	t.Parallel()
+
+	client := seatalk.NewClient(
+		seatalk.Config{AppID: "app-id", AppSecret: "app-secret"},
+		seatalk.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(t, map[string]any{"code": 4010, "message": "unexpected error"}), nil
+		})}),
+		seatalk.WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+			return "token-123", nil
+		}),
+	)
+	adapter := newSeaTalkAgentAdapterWithClient(nil, client)
+
+	_, _, err := adapter.normalizeThreadHistoryMessage(
+		context.Background(),
+		nil,
+		"private:e_1:thread-1",
+		seatalk.PrivateThreadMessage{
+			MessageID:       "message-1",
+			QuotedMessageID: "quoted-error",
+			Tag:             "text",
+			Text:            &seatalk.ThreadTextMessage{PlainText: "hello"},
+		},
+	)
+	if err == nil {
+		t.Fatal("expected quoted message lookup error")
+	}
+	if !strings.Contains(err.Error(), "code 4010") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSeaTalkGetMessageAndGetThreadUseSameMessageOutputSchema(t *testing.T) {
 	t.Parallel()
 

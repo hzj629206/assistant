@@ -38,6 +38,9 @@ var (
 // ErrEmployeeInfoDisabled indicates that employee profile lookups are disabled by configuration.
 var ErrEmployeeInfoDisabled = errors.New("employee info is disabled")
 
+// ErrMessageUnavailable indicates that a message has expired or been deleted.
+var ErrMessageUnavailable = errors.New("message is unavailable")
+
 // TokenProvider returns an app access token for the client.
 type TokenProvider func(ctx context.Context, client *http.Client, appID, appSecret string) (string, error)
 
@@ -1054,6 +1057,12 @@ func (c *Client) GetMessage(ctx context.Context, messageID string) (GetMessageRe
 		return GetMessageResult{}, fmt.Errorf("get message failed: decode response body: %w", err)
 	}
 	if apiResp.Code != 0 {
+		if apiResp.Code == 4009 {
+			if apiResp.Message != "" {
+				return GetMessageResult{}, fmt.Errorf("get message failed: api returned code %d: %s: %w", apiResp.Code, apiResp.Message, ErrMessageUnavailable)
+			}
+			return GetMessageResult{}, fmt.Errorf("get message failed: api returned code %d: %w", apiResp.Code, ErrMessageUnavailable)
+		}
 		if apiResp.Message != "" {
 			return GetMessageResult{}, fmt.Errorf("get message failed: api returned code %d: %s", apiResp.Code, apiResp.Message)
 		}
