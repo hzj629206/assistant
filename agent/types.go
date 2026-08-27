@@ -18,6 +18,9 @@ const (
 	MessageKindInteractiveCard MessageKind = "interactive_card"
 )
 
+// MessageTagGroupMentioned marks a group message that explicitly mentions the assistant.
+const MessageTagGroupMentioned = "group_mentioned_message"
+
 // ReferencedMessage stores the normalized content of a quoted message.
 type ReferencedMessage struct {
 	// Kind identifies the normalized content type of the referenced message.
@@ -123,6 +126,7 @@ type ConversationState struct {
 	RunnerThreadID string    `json:"runner_thread_id,omitempty"`
 	LastEventID    string    `json:"last_event_id,omitempty"`
 	LastActivityAt time.Time `json:"last_activity_at"`
+	Muted          bool      `json:"muted,omitempty"`
 }
 
 // SessionMode describes one runner-backed mode exposed for the current conversation.

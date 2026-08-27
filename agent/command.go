@@ -6,6 +6,7 @@ import (
 )
 
 const slashCommandStop = "stop"
+const slashCommandStopMute = "mute"
 const slashCommandReset = "reset"
 const slashCommandHelp = "help"
 const slashCommandStatus = "status"
@@ -21,8 +22,8 @@ type CommandSpec struct {
 var supportedSlashCommands = []CommandSpec{
 	{
 		Name:        slashCommandStop,
-		Usage:       "/stop",
-		Description: "Stop the current turn and discard unprocessed messages in this conversation.",
+		Usage:       "/stop [mute]",
+		Description: "Stop the current turn and discard unprocessed messages; use mute to ignore future messages in this conversation.",
 		Interrupts:  true,
 	},
 	{
@@ -132,7 +133,11 @@ func DispatcherCommandSpec(name string) (CommandSpec, bool) {
 
 // Validate reports whether the command has valid slash-command syntax.
 func (c SlashCommand) Validate() bool {
-	return strings.TrimSpace(c.Name) != "" && strings.TrimSpace(c.Args) == ""
+	if strings.TrimSpace(c.Name) == "" {
+		return false
+	}
+	args := strings.TrimSpace(c.Args)
+	return args == "" || c.IsStop() && strings.EqualFold(args, slashCommandStopMute)
 }
 
 // CommandResponder delivers the final slash-command reply.

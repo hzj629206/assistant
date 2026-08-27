@@ -215,7 +215,7 @@ func (a *SeaTalkAgentAdapter) processEvent(ctx context.Context, req seatalk.Even
 		responder := &SeaTalkResponder{
 			client:             a.client,
 			target:             route.replyTarget,
-			typingEnabled:      !route.replyTarget.isGroup || slices.Contains(route.message.MessageTags, "group_mentioned_message"),
+			typingEnabled:      !route.replyTarget.isGroup || slices.Contains(route.message.MessageTags, agent.MessageTagGroupMentioned),
 			typingAllowedUntil: typingAllowedUntil(route.message.SentAtUnix),
 		}
 		if err = a.populateReplyMention(ctx, responder); err != nil {

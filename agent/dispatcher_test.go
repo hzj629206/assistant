@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -945,6 +946,184 @@ func TestDispatcherResetCommandInterruptsAndResetsConversationState(t *testing.T
 	}
 }
 
+func TestDispatcherStopMutePersistsStateAndIgnoresFutureMessages(t *testing.T) {
+	t.Parallel()
+
+	const conversationKey = "private:e_1:stop-mute"
+	store := NewConversationStore(cache.NewMemoryStorage())
+	if err := store.PutConversation(context.Background(), ConversationState{
+		Key:            conversationKey,
+		RunnerThreadID: "thread-muted",
+	}); err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
+
+	runner := &testRunner{}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       store,
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	reply, err := dispatcher.executeBlockingCommand(context.Background(), CommandRequest{
+		ConversationKey: conversationKey,
+		EventID:         "evt-stop-mute",
+		Command: SlashCommand{
+			Name: slashCommandStop,
+			Args: slashCommandStopMute,
+			Raw:  "/stop mute",
+		},
+	})
+	if err != nil {
+		t.Fatalf("execute stop mute failed: %v", err)
+	}
+	if !strings.Contains(reply, "_Conversation muted._") {
+		t.Fatalf("unexpected stop mute reply: %q", reply)
+	}
+
+	state, err := store.GetConversation(context.Background(), conversationKey)
+	if err != nil {
+		t.Fatalf("get muted conversation failed: %v", err)
+	}
+	if !state.Muted {
+		t.Fatal("expected conversation to be muted")
+	}
+	if state.RunnerThreadID != "thread-muted" {
+		t.Fatalf("unexpected runner thread id: %q", state.RunnerThreadID)
+	}
+	if state.LastEventID != "evt-stop-mute" {
+		t.Fatalf("unexpected command event id: %q", state.LastEventID)
+	}
+
+	_ = dispatcher.Start()
+	responder := &testResponder{}
+	initialContextCalled := make(chan struct{}, 1)
+	initialMessagesCalled := make(chan struct{}, 1)
+	if err = dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-muted-message",
+		ConversationKey: conversationKey,
+		Text:            "this message must be ignored",
+		Responder:       responder,
+		LoadInitialContext: func(context.Context) (string, error) {
+			initialContextCalled <- struct{}{}
+			return "unexpected", nil
+		},
+		LoadInitialMessages: func(context.Context) ([]InboundMessage, error) {
+			initialMessagesCalled <- struct{}{}
+			return []InboundMessage{{Text: "unexpected"}}, nil
+		},
+	}); err != nil {
+		t.Fatalf("enqueue muted message failed: %v", err)
+	}
+
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for responder.CleanupCalls() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for muted message cleanup")
+		case <-ticker.C:
+		}
+	}
+
+	if runner.StartSessionCalls() != 0 {
+		t.Fatalf("expected muted message not to start a runner session, got %d", runner.StartSessionCalls())
+	}
+	if runner.Calls() != 0 {
+		t.Fatalf("expected muted message not to run a turn, got %d", runner.Calls())
+	}
+	if responder.SendCalls() != 0 {
+		t.Fatalf("expected muted message not to receive a reply, got %d", responder.SendCalls())
+	}
+	select {
+	case <-initialContextCalled:
+		t.Fatal("expected muted message not to load initial context")
+	default:
+	}
+	select {
+	case <-initialMessagesCalled:
+		t.Fatal("expected muted message not to load initial messages")
+	default:
+	}
+
+	state, err = store.GetConversation(context.Background(), conversationKey)
+	if err != nil {
+		t.Fatalf("get muted conversation after message failed: %v", err)
+	}
+	if !state.Muted {
+		t.Fatal("expected conversation to remain muted")
+	}
+	if state.LastEventID != "evt-muted-message" {
+		t.Fatalf("unexpected ignored event id: %q", state.LastEventID)
+	}
+}
+
+func TestDispatcherMentionedMessageUnmutesMergedConversation(t *testing.T) {
+	t.Parallel()
+
+	const conversationKey = "group:g_1:mentioned-unmute"
+	store := NewConversationStore(cache.NewMemoryStorage())
+	if err := store.PutConversation(context.Background(), ConversationState{
+		Key:            conversationKey,
+		RunnerThreadID: "thread-muted",
+		Muted:          true,
+	}); err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
+
+	runner := &testRunner{}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:  store,
+		Runner: runner,
+	})
+	responder := &testResponder{}
+	message := combineInboundMessages([]InboundMessage{
+		{
+			ID:              "evt-mentioned",
+			ConversationKey: conversationKey,
+			Text:            "@assistant please check",
+			MessageTags:     []string{MessageTagGroupMentioned},
+		},
+		{
+			ID:              "evt-follow-up",
+			ConversationKey: conversationKey,
+			Text:            "additional context",
+			Responder:       responder,
+		},
+	})
+	if err := dispatcher.handleMessage(context.Background(), message); err != nil {
+		t.Fatalf("handle mentioned message failed: %v", err)
+	}
+
+	if runner.Calls() != 1 {
+		t.Fatalf("expected mentioned batch to run one turn, got %d", runner.Calls())
+	}
+	request := runner.LastRequest()
+	if len(request.Message.mergedMessages) != 2 {
+		t.Fatalf("expected two merged messages, got %d", len(request.Message.mergedMessages))
+	}
+	if !slices.Contains(request.Message.mergedMessages[0].MessageTags, MessageTagGroupMentioned) {
+		t.Fatalf("expected first merged message to retain mention tag: %+v", request.Message.mergedMessages[0].MessageTags)
+	}
+	if responder.SendCalls() != 1 {
+		t.Fatalf("expected mentioned batch to receive a reply, got %d", responder.SendCalls())
+	}
+
+	state, err := store.GetConversation(context.Background(), conversationKey)
+	if err != nil {
+		t.Fatalf("get unmuted conversation failed: %v", err)
+	}
+	if state.Muted {
+		t.Fatal("expected mentioned conversation to be unmuted")
+	}
+	if state.RunnerThreadID != "thread-muted" {
+		t.Fatalf("unexpected runner thread id: %q", state.RunnerThreadID)
+	}
+	if state.LastEventID != "evt-follow-up" {
+		t.Fatalf("unexpected last event id: %q", state.LastEventID)
+	}
+}
+
 func TestDispatcherResetCausesNextTurnToReloadInitialMessages(t *testing.T) {
 	t.Parallel()
 
@@ -1823,6 +2002,76 @@ func TestDispatcherHandleStopCancelsTurnAndRepliesWithDiscardedMessages(t *testi
 	}
 	if runner.LastInterrupt().Key != "private:e_1:0" {
 		t.Fatalf("unexpected interrupted conversation: %+v", runner.LastInterrupt())
+	}
+}
+
+func TestDispatcherHandleStopMuteInterruptsActiveTurnAndPersistsState(t *testing.T) {
+	t.Parallel()
+
+	const conversationKey = "private:e_1:active-stop-mute"
+	store := NewConversationStore(cache.NewMemoryStorage())
+	runner := &testRunner{
+		startSessionID: "thread-stop-mute",
+		started:        make(chan struct{}, 1),
+		canceled:       make(chan struct{}, 1),
+		waitForCancel:  true,
+	}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:       store,
+		Runner:      runner,
+		WorkerCount: 1,
+	})
+	_ = dispatcher.Start()
+
+	if err := dispatcher.Enqueue(context.Background(), InboundMessage{
+		ID:              "evt-active-stop-mute",
+		ConversationKey: conversationKey,
+		Text:            "running turn",
+		Responder:       &testResponder{},
+	}); err != nil {
+		t.Fatalf("enqueue active message failed: %v", err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active turn")
+	}
+
+	commandResponder := &testResponder{}
+	if err := dispatcher.EnqueueCommand(context.Background(), CommandRequest{
+		ConversationKey: conversationKey,
+		EventID:         "evt-command-stop-mute",
+		Responder:       commandResponder,
+		Command: SlashCommand{
+			Name: slashCommandStop,
+			Args: slashCommandStopMute,
+			Raw:  "/stop mute",
+		},
+	}); err != nil {
+		t.Fatalf("enqueue stop mute failed: %v", err)
+	}
+
+	select {
+	case <-runner.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for runner cancellation")
+	}
+	if err := waitForResponderSend(commandResponder); err != nil {
+		t.Fatalf("timed out waiting for stop mute reply: %v", err)
+	}
+	if reply := commandResponder.Reply().text; !strings.Contains(reply, "_Conversation interrupted and muted._") {
+		t.Fatalf("unexpected stop mute reply: %q", reply)
+	}
+
+	state, err := store.GetConversation(context.Background(), conversationKey)
+	if err != nil {
+		t.Fatalf("get muted conversation failed: %v", err)
+	}
+	if !state.Muted {
+		t.Fatal("expected conversation to be muted")
+	}
+	if state.RunnerThreadID != "thread-stop-mute" {
+		t.Fatalf("unexpected runner thread id: %q", state.RunnerThreadID)
 	}
 }
 

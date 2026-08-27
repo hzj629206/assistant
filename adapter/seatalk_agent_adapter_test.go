@@ -3663,6 +3663,22 @@ func TestSeatalkSlashCommandParsesPrivateStop(t *testing.T) {
 	}
 }
 
+func TestSeatalkSlashCommandParsesPrivateStopMute(t *testing.T) {
+	t.Parallel()
+
+	event := &seatalk.MessageFromBotSubscriberEvent{}
+	event.Message.Tag = string(agent.MessageKindText)
+	event.Message.Text.Content = " /stop mute \n"
+
+	command, ok := seatalkSlashCommand(event)
+	if !ok {
+		t.Fatal("expected slash command to be parsed")
+	}
+	if !command.IsStop() || command.Args != "mute" {
+		t.Fatalf("unexpected command: %+v", command)
+	}
+}
+
 func TestSeatalkSlashCommandParsesPrivateHelp(t *testing.T) {
 	t.Parallel()
 

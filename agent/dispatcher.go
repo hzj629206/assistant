@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -540,6 +541,25 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		state = newConversationState(message)
 		log.Printf("dispatcher created conversation state: conversation=%s event_id=%s", message.ConversationKey, message.ID)
 	}
+	if state.Muted {
+		if !messagesHaveTag(freshMessages, MessageTagGroupMentioned) {
+			state.LastEventID = message.ID
+			state.LastActivityAt = time.Now()
+			if err = d.store.PutConversation(ctx, state); err != nil {
+				return err
+			}
+			log.Printf("dispatcher ignored message for muted conversation: conversation=%s event_id=%s", message.ConversationKey, message.ID)
+			return nil
+		}
+
+		state.Muted = false
+		state.LastEventID = message.ID
+		state.LastActivityAt = time.Now()
+		if err = d.store.PutConversation(ctx, state); err != nil {
+			return err
+		}
+		log.Printf("dispatcher unmuted mentioned conversation: conversation=%s event_id=%s", message.ConversationKey, message.ID)
+	}
 	var activeWork *activeConversationWork
 	activeWork, releaseWork = d.startActiveConversationWork(state)
 
@@ -863,6 +883,15 @@ func flattenInboundMessages(message InboundMessage) []InboundMessage {
 		flattened = append(flattened, flattenInboundMessages(current)...)
 	}
 	return flattened
+}
+
+func messagesHaveTag(messages []InboundMessage, tag string) bool {
+	for _, message := range messages {
+		if slices.Contains(message.MessageTags, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func combineInboundMessages(messages []InboundMessage) InboundMessage {
@@ -1543,7 +1572,12 @@ func (d *Dispatcher) executeBlockingCommand(ctx context.Context, req CommandRequ
 	}
 
 	if req.Command.IsStop() {
-		return d.buildStopCommandReply(ctx, req, interrupted)
+		muted := strings.EqualFold(strings.TrimSpace(req.Command.Args), slashCommandStopMute)
+		if muted {
+			unlock := d.locks.Lock(req.ConversationKey)
+			defer unlock()
+		}
+		return d.buildStopCommandReply(ctx, req, interrupted, muted)
 	}
 
 	unlock := d.locks.Lock(req.ConversationKey)
@@ -1552,7 +1586,7 @@ func (d *Dispatcher) executeBlockingCommand(ctx context.Context, req CommandRequ
 	return d.buildBlockingCommandReplyLocked(ctx, req, interrupted)
 }
 
-func (d *Dispatcher) buildStopCommandReply(ctx context.Context, req CommandRequest, interrupted bool) (string, error) {
+func (d *Dispatcher) buildStopCommandReply(ctx context.Context, req CommandRequest, interrupted bool, muted bool) (string, error) {
 	clearedMessages, cleanupErr := d.dropConversationQueuedWork(ctx, req.ConversationKey)
 	if cleanupErr != nil {
 		return "", cleanupErr
@@ -1562,7 +1596,21 @@ func (d *Dispatcher) buildStopCommandReply(ctx context.Context, req CommandReque
 		d.recordCommandMessage(req.ConversationKey, message)
 	}
 
-	return buildStopReply(interrupted, d.takeCommandBriefs(req.ConversationKey)), nil
+	if muted {
+		state, _, err := d.loadCommandConversationState(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		state.Muted = true
+		state.LastEventID = req.EventID
+		state.LastActivityAt = time.Now()
+		if err = d.store.PutConversation(context.WithoutCancel(ctx), state); err != nil {
+			return "", fmt.Errorf("persist muted conversation state failed: %w", err)
+		}
+		log.Printf("dispatcher muted conversation: conversation=%s event_id=%s", req.ConversationKey, req.EventID)
+	}
+
+	return buildStopReply(interrupted, muted, d.takeCommandBriefs(req.ConversationKey)), nil
 }
 
 func (d *Dispatcher) buildCommandReply(ctx context.Context, req CommandRequest) (string, error) {
@@ -1880,14 +1928,23 @@ func (d *Dispatcher) dropConversationQueuedWork(ctx context.Context, conversatio
 	return dropped, cleanupInboundMessages(ctx, dropped)
 }
 
-func buildStopReply(interrupted bool, briefs []string) string {
+func buildStopReply(interrupted bool, muted bool, briefs []string) string {
 	lines := make([]string, 0, len(briefs)+4)
-	if interrupted {
+	switch {
+	case interrupted && muted:
+		lines = append(lines, "_Conversation interrupted and muted._")
+	case muted:
+		lines = append(lines, "_Conversation muted._")
+	case interrupted:
 		lines = append(lines, "_Conversation interrupted._")
-	} else {
+	default:
 		lines = append(lines, "_Conversation is not running._")
 	}
-	lines = append(lines, "_Quote the messages above if you want to continue from them._")
+	if muted {
+		lines = append(lines, "_Future messages in this conversation will be ignored._")
+	} else {
+		lines = append(lines, "_Quote the messages above if you want to continue from them._")
+	}
 	if len(briefs) == 0 {
 		return strings.Join(lines, "\n")
 	}

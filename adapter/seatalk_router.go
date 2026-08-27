@@ -168,7 +168,7 @@ func routeMentionedGroupMessage(req seatalk.EventRequest, event *seatalk.NewMent
 
 	threadRef := groupConversationThreadKey(event.Message.ThreadID, event.Message.MessageID)
 	messageTags := updatedMessageTags(
-		[]string{"group_mentioned_message"},
+		[]string{agent.MessageTagGroupMentioned},
 		messageWasUpdated(event.Message.Tag, event.Message.Text.LastEditedTime, event.Message.InteractiveMessage),
 	)
 

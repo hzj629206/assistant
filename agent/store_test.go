@@ -16,6 +16,7 @@ func TestConversationStoreRoundTrip(t *testing.T) {
 	state := ConversationState{
 		Key:            "private:e_1:msg-1",
 		RunnerThreadID: "codex-1",
+		Muted:          true,
 	}
 
 	if err := store.PutConversation(ctx, state); err != nil {
@@ -28,6 +29,9 @@ func TestConversationStoreRoundTrip(t *testing.T) {
 	}
 	if got.RunnerThreadID != "codex-1" {
 		t.Fatalf("unexpected agent thread id: %s", got.RunnerThreadID)
+	}
+	if !got.Muted {
+		t.Fatal("expected muted state to survive round trip")
 	}
 }
 
