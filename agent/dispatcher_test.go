@@ -1058,6 +1058,163 @@ func TestDispatcherStopMutePersistsStateAndIgnoresFutureMessages(t *testing.T) {
 	}
 }
 
+func TestDispatcherIgnoresUnmentionedMessageWithoutConversationState(t *testing.T) {
+	t.Parallel()
+
+	const conversationKey = "seatalk:group:g_1:unmentioned-new"
+	store := NewConversationStore(cache.NewMemoryStorage())
+	runner := &testRunner{}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:  store,
+		Runner: runner,
+	})
+	responder := &testResponder{}
+	initialContextCalled := false
+	initialMessagesCalled := false
+
+	err := dispatcher.handleMessage(context.Background(), InboundMessage{
+		ID:              "evt-unmentioned-new",
+		ConversationKey: conversationKey,
+		Text:            "this message must be ignored",
+		Responder:       responder,
+		LoadInitialContext: func(context.Context) (string, error) {
+			initialContextCalled = true
+			return "unexpected", nil
+		},
+		LoadInitialMessages: func(context.Context) ([]InboundMessage, error) {
+			initialMessagesCalled = true
+			return []InboundMessage{{Text: "unexpected"}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("handle unmentioned message failed: %v", err)
+	}
+
+	if runner.StartSessionCalls() != 0 {
+		t.Fatalf("expected unmentioned message not to start a runner session, got %d", runner.StartSessionCalls())
+	}
+	if runner.Calls() != 0 {
+		t.Fatalf("expected unmentioned message not to run a turn, got %d", runner.Calls())
+	}
+	if responder.SendCalls() != 0 {
+		t.Fatalf("expected unmentioned message not to receive a reply, got %d", responder.SendCalls())
+	}
+	if responder.CleanupCalls() != 1 {
+		t.Fatalf("expected unmentioned message cleanup once, got %d", responder.CleanupCalls())
+	}
+	if initialContextCalled {
+		t.Fatal("expected unmentioned message not to load initial context")
+	}
+	if initialMessagesCalled {
+		t.Fatal("expected unmentioned message not to load initial messages")
+	}
+	if _, err = store.GetConversation(context.Background(), conversationKey); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("expected conversation state to remain absent, got %v", err)
+	}
+}
+
+func TestDispatcherIgnoresUnmentionedMessageForInactiveConversation(t *testing.T) {
+	t.Parallel()
+
+	const conversationKey = "seatalk:group:g_1:inactive"
+	lastActivityAt := time.Now().Add(-2 * groupConversationMentionTimeout)
+	store := NewConversationStore(cache.NewMemoryStorage())
+	if err := store.PutConversation(context.Background(), ConversationState{
+		Key:            conversationKey,
+		RunnerThreadID: "thread-inactive",
+		LastEventID:    "evt-previous",
+		LastActivityAt: lastActivityAt,
+	}); err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
+
+	runner := &testRunner{}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:  store,
+		Runner: runner,
+	})
+	responder := &testResponder{}
+	err := dispatcher.handleMessage(context.Background(), InboundMessage{
+		ID:              "evt-inactive-unmentioned",
+		ConversationKey: conversationKey,
+		Text:            "this message must be ignored",
+		Responder:       responder,
+	})
+	if err != nil {
+		t.Fatalf("handle inactive conversation message failed: %v", err)
+	}
+
+	if runner.StartSessionCalls() != 0 {
+		t.Fatalf("expected inactive conversation not to start a runner session, got %d", runner.StartSessionCalls())
+	}
+	if runner.Calls() != 0 {
+		t.Fatalf("expected inactive conversation not to run a turn, got %d", runner.Calls())
+	}
+	if responder.SendCalls() != 0 {
+		t.Fatalf("expected inactive conversation not to receive a reply, got %d", responder.SendCalls())
+	}
+	if responder.CleanupCalls() != 1 {
+		t.Fatalf("expected inactive conversation cleanup once, got %d", responder.CleanupCalls())
+	}
+
+	state, err := store.GetConversation(context.Background(), conversationKey)
+	if err != nil {
+		t.Fatalf("get inactive conversation failed: %v", err)
+	}
+	if state.LastEventID != "evt-previous" {
+		t.Fatalf("expected ignored event not to update last event ID, got %q", state.LastEventID)
+	}
+	if !state.LastActivityAt.Equal(lastActivityAt) {
+		t.Fatalf("expected ignored event not to update last activity, got %s", state.LastActivityAt)
+	}
+}
+
+func TestDispatcherProcessesMentionedMessageForInactiveConversation(t *testing.T) {
+	t.Parallel()
+
+	const conversationKey = "seatalk:group:g_1:inactive-mentioned"
+	lastActivityAt := time.Now().Add(-2 * groupConversationMentionTimeout)
+	store := NewConversationStore(cache.NewMemoryStorage())
+	if err := store.PutConversation(context.Background(), ConversationState{
+		Key:            conversationKey,
+		RunnerThreadID: "thread-inactive",
+		LastEventID:    "evt-previous",
+		LastActivityAt: lastActivityAt,
+	}); err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
+
+	runner := &testRunner{}
+	dispatcher := NewDispatcher(DispatcherOptions{
+		Store:  store,
+		Runner: runner,
+	})
+	err := dispatcher.handleMessage(context.Background(), InboundMessage{
+		ID:              "evt-inactive-mentioned",
+		ConversationKey: conversationKey,
+		Text:            "@assistant please check",
+		MessageTags:     []string{MessageTagGroupMentioned},
+		Responder:       &testResponder{},
+	})
+	if err != nil {
+		t.Fatalf("handle mentioned inactive conversation message failed: %v", err)
+	}
+
+	if runner.Calls() != 1 {
+		t.Fatalf("expected mentioned inactive conversation to run one turn, got %d", runner.Calls())
+	}
+	state, err := store.GetConversation(context.Background(), conversationKey)
+	if err != nil {
+		t.Fatalf("get inactive conversation failed: %v", err)
+	}
+	if state.LastEventID != "evt-inactive-mentioned" {
+		t.Fatalf("unexpected last event ID: %q", state.LastEventID)
+	}
+	if !state.LastActivityAt.After(lastActivityAt) {
+		t.Fatalf("expected mentioned event to refresh last activity, got %s", state.LastActivityAt)
+	}
+}
+
 func TestDispatcherMentionedMessageUnmutesMergedConversation(t *testing.T) {
 	t.Parallel()
 
@@ -1326,6 +1483,7 @@ func TestDispatcherLoadsInitialContextOnlyForNewConversation(t *testing.T) {
 		ID:              "evt-context-1",
 		ConversationKey: "group:g_1:thread-1",
 		Text:            "hello",
+		MessageTags:     []string{MessageTagGroupMentioned},
 		LoadInitialContext: func(context.Context) (string, error) {
 			loadCalls++
 			return "[1] alice@example.com: earlier message", nil
@@ -1403,6 +1561,7 @@ func TestDispatcherPrependsInitialMessagesOnlyForNewConversation(t *testing.T) {
 		Kind:            MessageKindText,
 		Sender:          "bob@example.com",
 		Text:            "current",
+		MessageTags:     []string{MessageTagGroupMentioned},
 		LoadInitialMessages: func(context.Context) ([]InboundMessage, error) {
 			loadCalls++
 			return []InboundMessage{{
@@ -1500,6 +1659,7 @@ func TestDispatcherMergesPendingMessagesForSameConversation(t *testing.T) {
 		Sender:          "alice@example.com",
 		Text:            "first",
 		Responder:       responder1,
+		MessageTags:     []string{MessageTagGroupMentioned},
 	}); err != nil {
 		t.Fatalf("enqueue first message failed: %v", err)
 	}

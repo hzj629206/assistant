@@ -20,6 +20,7 @@ const defaultNonTextMergeWindow = 10 * time.Second
 const defaultSessionIdleTimeout = 10 * time.Minute
 const defaultShutdownTurnTimeout = 15 * time.Second
 const defaultShutdownInterruptTimeout = 1000 * time.Millisecond
+const groupConversationMentionTimeout = time.Hour
 
 // ErrDispatcherClosed indicates the dispatcher is no longer accepting new work.
 var ErrDispatcherClosed = errors.New("dispatcher is closed")
@@ -537,6 +538,10 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 		if !errors.Is(err, cache.ErrNotFound) {
 			return err
 		}
+		if isGroupConversationKey(message.ConversationKey) && !messagesHaveTag(freshMessages, MessageTagGroupMentioned) {
+			log.Printf("dispatcher ignored unmentioned message without conversation state: conversation=%s event_id=%s", message.ConversationKey, message.ID)
+			return nil
+		}
 		isNewConversation = true
 		state = newConversationState(message)
 		log.Printf("dispatcher created conversation state: conversation=%s event_id=%s", message.ConversationKey, message.ID)
@@ -559,6 +564,17 @@ func (d *Dispatcher) handleMessage(ctx context.Context, message InboundMessage) 
 			return err
 		}
 		log.Printf("dispatcher unmuted mentioned conversation: conversation=%s event_id=%s", message.ConversationKey, message.ID)
+	}
+	if isGroupConversationKey(message.ConversationKey) &&
+		conversationStateInactive(state, time.Now()) &&
+		!messagesHaveTag(freshMessages, MessageTagGroupMentioned) {
+		log.Printf(
+			"dispatcher ignored unmentioned message for inactive conversation: conversation=%s event_id=%s last_activity_at=%s",
+			message.ConversationKey,
+			message.ID,
+			state.LastActivityAt.Format(time.RFC3339),
+		)
+		return nil
 	}
 	var activeWork *activeConversationWork
 	activeWork, releaseWork = d.startActiveConversationWork(state)
@@ -892,6 +908,14 @@ func messagesHaveTag(messages []InboundMessage, tag string) bool {
 		}
 	}
 	return false
+}
+
+func isGroupConversationKey(conversationKey string) bool {
+	return strings.HasPrefix(conversationKey, "group:") || strings.HasPrefix(conversationKey, "seatalk:group:")
+}
+
+func conversationStateInactive(state ConversationState, now time.Time) bool {
+	return !state.LastActivityAt.IsZero() && now.Sub(state.LastActivityAt) >= groupConversationMentionTimeout
 }
 
 func combineInboundMessages(messages []InboundMessage) InboundMessage {

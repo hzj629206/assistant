@@ -129,8 +129,12 @@ func TestSeaTalkAgentAdapterMovesWebSocketThreadMentionsIntoText(t *testing.T) {
 	t.Parallel()
 
 	runner := &testRunner{}
+	store := agent.NewConversationStore(cache.NewMemoryStorage())
+	if err := store.PutConversation(context.Background(), agent.ConversationState{Key: "seatalk:group:group-1:thread-1"}); err != nil {
+		t.Fatalf("put conversation failed: %v", err)
+	}
 	dispatcher := agent.NewDispatcher(agent.DispatcherOptions{
-		Store:              agent.NewConversationStore(cache.NewMemoryStorage()),
+		Store:              store,
 		Runner:             runner,
 		WorkerCount:        1,
 		NonTextMergeWindow: 10 * time.Millisecond,
@@ -754,12 +758,14 @@ func TestSeaTalkAgentAdapterLoadsInitialContextForFirstPrivateInteractiveClickEv
 	}
 }
 
-func TestSeaTalkAgentAdapterLoadsInitialContextForFirstGroupInteractiveClickEvent(t *testing.T) {
+func TestSeaTalkAgentAdapterIgnoresFirstGroupInteractiveClickWithoutMention(t *testing.T) {
 	t.Parallel()
 
 	runner := &testRunner{}
+	storage := cache.NewMemoryStorage()
+	store := agent.NewConversationStore(storage)
 	dispatcher := agent.NewDispatcher(agent.DispatcherOptions{
-		Store:       agent.NewConversationStore(cache.NewMemoryStorage()),
+		Store:       store,
 		Runner:      runner,
 		WorkerCount: 1,
 	})
@@ -849,21 +855,12 @@ func TestSeaTalkAgentAdapterLoadsInitialContextForFirstGroupInteractiveClickEven
 		t.Fatalf("process event failed: %v", err)
 	}
 
-	if err := waitForRunnerCalls(runner); err != nil {
-		t.Fatal(err)
+	waitForProcessedEvent(t, storage, req.EventID)
+	if runner.Calls() != 0 {
+		t.Fatalf("expected group interactive click without mention not to run a turn, got %d", runner.Calls())
 	}
-
-	reqCall := runner.LastRequest()
-	expected := "Group profile:\n- name: Demo Group\n" +
-		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
-	if reqCall.Message.InitialContext() != expected {
-		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
-	}
-	if len(reqCall.Message.HistoricalMessages()) != 1 {
-		t.Fatalf("unexpected historical message count: %d", len(reqCall.Message.HistoricalMessages()))
-	}
-	if reqCall.Message.HistoricalMessages()[0].Text != "earlier group message" {
-		t.Fatalf("unexpected history text: %q", reqCall.Message.HistoricalMessages()[0].Text)
+	if _, err := store.GetConversation(context.Background(), "seatalk:group:group-1:thread-1"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("expected conversation state to remain absent, got %v", err)
 	}
 }
 
@@ -1512,12 +1509,14 @@ func TestSeaTalkAgentAdapterLoadsPrivateContextWithoutHistoryForTopLevelPrivateM
 	}
 }
 
-func TestSeaTalkAgentAdapterAddsReplyDecisionGuidanceForFirstGroupThreadEvent(t *testing.T) {
+func TestSeaTalkAgentAdapterIgnoresFirstGroupThreadEventWithoutMention(t *testing.T) {
 	t.Parallel()
 
 	runner := &testRunner{}
+	storage := cache.NewMemoryStorage()
+	store := agent.NewConversationStore(storage)
 	dispatcher := agent.NewDispatcher(agent.DispatcherOptions{
-		Store:       agent.NewConversationStore(cache.NewMemoryStorage()),
+		Store:       store,
 		Runner:      runner,
 		WorkerCount: 1,
 	})
@@ -1607,24 +1606,12 @@ func TestSeaTalkAgentAdapterAddsReplyDecisionGuidanceForFirstGroupThreadEvent(t 
 		t.Fatalf("process event failed: %v", err)
 	}
 
-	if err := waitForRunnerCalls(runner); err != nil {
-		t.Fatal(err)
+	waitForProcessedEvent(t, storage, req.EventID)
+	if runner.Calls() != 0 {
+		t.Fatalf("expected unmentioned first group thread event not to run a turn, got %d", runner.Calls())
 	}
-
-	reqCall := runner.LastRequest()
-	expected := "Group profile:\n- name: Demo Group\n" +
-		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
-	if reqCall.Message.InitialContext() != expected {
-		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
-	}
-	if len(reqCall.Message.MessageTags) != 0 {
-		t.Fatalf("unexpected message tags: %+v", reqCall.Message.MessageTags)
-	}
-	if len(reqCall.Message.HistoricalMessages()) != 1 {
-		t.Fatalf("unexpected historical message count: %d", len(reqCall.Message.HistoricalMessages()))
-	}
-	if reqCall.Message.HistoricalMessages()[0].Text != "earlier message" {
-		t.Fatalf("unexpected history text: %q", reqCall.Message.HistoricalMessages()[0].Text)
+	if _, err := store.GetConversation(context.Background(), "seatalk:group:group-1:thread-1"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("expected conversation state to remain absent, got %v", err)
 	}
 }
 
@@ -3573,6 +3560,27 @@ func waitForRunnerCalls(runner *testRunner) error {
 		select {
 		case <-deadline:
 			return context.DeadlineExceeded
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForProcessedEvent(t *testing.T, storage cache.Storage, eventID string) {
+	t.Helper()
+
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := storage.Get(context.Background(), "agent:event:"+eventID); err == nil {
+			return
+		} else if !errors.Is(err, cache.ErrNotFound) {
+			t.Fatalf("get processed event failed: %v", err)
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for event %q to be processed", eventID)
 		case <-ticker.C:
 		}
 	}
