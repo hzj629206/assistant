@@ -74,13 +74,9 @@ func (*AppServerRunner) ItemToolRequestUserInput(context.Context, appproto.ToolR
 }
 
 func (*AppServerRunner) MCPServerElicitationRequest(_ context.Context, params appproto.MCPServerElicitationRequestParams) (*appproto.MCPServerElicitationRequestResponse, error) {
-	if shouldAutoAcceptMCPToolApproval(params) {
+	if response := buildMCPToolApprovalResponse(params); response != nil {
 		logAppServerRequest("auto-accepted MCP tool approval elicitation request", params)
-		response := appproto.MCPServerElicitationRequestResponse{
-			Action:  appproto.MCPServerElicitationActionAccept,
-			Content: map[string]any{},
-		}
-		return &response, nil
+		return response, nil
 	}
 
 	logAppServerRequest("declined MCP elicitation request because no interactive elicitation handler is configured", params)
@@ -99,31 +95,42 @@ func logAppServerRequest(message string, params any) {
 	log.Printf("app-server runner %s: params=%s", message, string(payload))
 }
 
-func shouldAutoAcceptMCPToolApproval(params appproto.MCPServerElicitationRequestParams) bool {
+func buildMCPToolApprovalResponse(params appproto.MCPServerElicitationRequestParams) *appproto.MCPServerElicitationRequestResponse {
 	var root map[string]any
 	if err := json.Unmarshal(params, &root); err != nil {
-		return false
+		return nil
 	}
 
 	meta, ok := root["_meta"].(map[string]any)
 	if !ok {
-		return false
+		return nil
 	}
 	approvalKind, ok := meta["codex_approval_kind"].(string)
 	if !ok || approvalKind != "mcp_tool_call" {
-		return false
+		return nil
 	}
 
 	requestedSchema, ok := root["requestedSchema"].(map[string]any)
 	if !ok {
-		return false
+		return nil
 	}
 	properties, ok := requestedSchema["properties"].(map[string]any)
-	if !ok {
-		return false
+	if !ok || len(properties) != 0 {
+		return nil
 	}
 
-	return len(properties) == 0
+	response := &appproto.MCPServerElicitationRequestResponse{
+		Action:  appproto.MCPServerElicitationActionAccept,
+		Content: map[string]any{},
+	}
+	persistOptions, _ := meta["persist"].([]any)
+	for _, option := range persistOptions {
+		if persist, ok := option.(string); ok && persist == "always" {
+			response.Meta = map[string]any{"persist": "always"}
+			break
+		}
+	}
+	return response
 }
 
 type appServerDynamicToolCallParams struct {

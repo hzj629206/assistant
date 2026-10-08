@@ -747,6 +747,59 @@ func TestMCPServerElicitationRequestAutoAcceptsEmptySchemaMCPToolApproval(t *tes
 	}
 }
 
+func TestMCPServerElicitationRequestSelectsAlwaysPersistence(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		persist any
+		want    string
+	}{
+		{name: "always after session", persist: []string{"session", "always"}, want: "always"},
+		{name: "always only", persist: []string{"always"}, want: "always"},
+		{name: "session only", persist: []string{"session"}},
+		{name: "absent"},
+		{name: "malformed", persist: "always"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			meta := map[string]any{"codex_approval_kind": "mcp_tool_call"}
+			if test.persist != nil {
+				meta["persist"] = test.persist
+			}
+			runner := &AppServerRunner{}
+			response, err := runner.MCPServerElicitationRequest(context.Background(), mustMarshalJSON(t, map[string]any{
+				"_meta": meta,
+				"requestedSchema": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			}))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var payload struct {
+				Action  string            `json:"action"`
+				Content map[string]any    `json:"content"`
+				Meta    map[string]string `json:"_meta"`
+			}
+			if err := json.Unmarshal(mustMarshalJSON(t, response), &payload); err != nil {
+				t.Fatalf("decode response failed: %v", err)
+			}
+			if payload.Action != "accept" || payload.Content == nil || len(payload.Content) != 0 {
+				t.Fatalf("unexpected approval response: %#v", payload)
+			}
+			if payload.Meta["persist"] != test.want {
+				t.Fatalf("unexpected persistence: got %q, want %q", payload.Meta["persist"], test.want)
+			}
+			if test.want == "" && payload.Meta != nil {
+				t.Fatalf("expected omitted metadata, got %#v", payload.Meta)
+			}
+		})
+	}
+}
+
 func TestMCPServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
 	t.Parallel()
 
@@ -754,6 +807,7 @@ func TestMCPServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
 	response, err := runner.MCPServerElicitationRequest(context.Background(), mustMarshalJSON(t, map[string]any{
 		"_meta": map[string]any{
 			"codex_approval_kind": "mcp_tool_call",
+			"persist":             []string{"session", "always"},
 		},
 		"serverName": "demo",
 		"message":    "Need more input",
@@ -781,6 +835,9 @@ func TestMCPServerElicitationRequestDeclinesStructuredPayload(t *testing.T) {
 	}
 	if typed.Action != protocol.MCPServerElicitationActionDecline {
 		t.Fatalf("unexpected action: %s", typed.Action)
+	}
+	if typed.Meta != nil {
+		t.Fatalf("expected no persistence for declined request, got %#v", typed.Meta)
 	}
 }
 
