@@ -113,13 +113,13 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	}
 
 	if startOptions.ApprovalPolicy == nil {
-		startOptions.ApprovalPolicy = appcodex.ApprovalPolicyNever
+		startOptions.ApprovalPolicy = appcodex.ApprovalPolicyOnRequest
 	}
 	if resumeOptions.ApprovalPolicy == nil {
-		resumeOptions.ApprovalPolicy = appcodex.ApprovalPolicyNever
+		resumeOptions.ApprovalPolicy = appcodex.ApprovalPolicyOnRequest
 	}
 	if turnOptions.ApprovalPolicy == nil {
-		turnOptions.ApprovalPolicy = appcodex.ApprovalPolicyNever
+		turnOptions.ApprovalPolicy = appcodex.ApprovalPolicyOnRequest
 	}
 
 	if turnOptions.Effort == nil {

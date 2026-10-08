@@ -146,7 +146,9 @@ go install github.com/hzj629206/assistant/cmd/codexd@master
 
 After installation, run the service with `codexd`.
 
-Security note for `codexd`: the service runs with `read-only` sandbox mode and `never` approval by default, while `WebSearch` and `NetworkAccess` are enabled by default for the local `codex` CLI backend.
+Security note for `codexd`: both backends use `read-only` sandbox mode by default.
+The default `appserver` backend uses `on-request` approval, while the `exec` backend uses `never` approval.
+`WebSearch` and `NetworkAccess` are enabled by default for the local `codex` CLI backend.
 Do not store sensitive data in the working directory because the bot is able to read files from that directory, search the web, and access network resources.
 
 ### Install `clauded`
@@ -159,7 +161,8 @@ go install github.com/hzj629206/assistant/cmd/clauded@master
 
 After installation, run the service with `clauded`.
 
-Security note for `clauded`: the service inherits the permissions and tool-access behavior of the local `Claude Code` CLI environment. The default permission mode is `dontAsk`, and any permission request that still requires user confirmation is currently accepted by default.
+Security note for `clauded`: the service inherits the permissions and tool-access behavior of the local `Claude Code` CLI
+environment. The default permission mode is `dontAsk`.
 Do not store sensitive data in the working directory because the bot may be able to read local files, invoke configured tools, and access external resources depending on that local CLI configuration.
 
 ### Install `acpd`

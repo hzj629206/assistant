@@ -1083,7 +1083,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			Params: appServerMustRaw(t, map[string]any{
 				"model":                 testDefaultModel,
 				"cwd":                   cwd,
-				"approvalPolicy":        "never",
+				"approvalPolicy":        "on-request",
 				"developerInstructions": "Global system prompt.",
 				"config": map[string]any{
 					"web_search": "live",
@@ -1121,7 +1121,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 					},
 				},
 				"cwd":            cwd,
-				"approvalPolicy": "never",
+				"approvalPolicy": "on-request",
 				"sandboxPolicy": map[string]any{
 					"type": "readOnly",
 				},
