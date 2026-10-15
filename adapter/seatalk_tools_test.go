@@ -821,11 +821,6 @@ func TestSeaTalkSendMermaidToolRendersAndSendsGroupImage(t *testing.T) {
 		}),
 	)
 
-	tool := seaTalkSendMermaidTool{
-		newRenderer: func(context.Context) (mermaidRenderer, error) {
-			return fakeMermaidRenderer{image: []byte("\x89PNG\r\n\x1a\nexample")}, nil
-		},
-	}
 	ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
 		Conversation: agent.ConversationState{Key: "seatalk:group:group-1:thread-1"},
 		Message: agent.InboundMessage{Responder: &SeaTalkResponder{
@@ -834,30 +829,70 @@ func TestSeaTalkSendMermaidToolRendersAndSendsGroupImage(t *testing.T) {
 		}},
 	})
 
-	result, err := tool.Call(ctx, json.RawMessage(`{
-		"content":"flowchart LR\n  Build --> Deploy"
-	}`))
-	if err != nil {
-		t.Fatalf("tool call failed: %v", err)
+	for _, tc := range []struct {
+		name  string
+		input string
+		scale float64
+	}{
+		{"default", `{"content":"flowchart LR\n  Build --> Deploy"}`, 2},
+		{"custom", `{"content":"flowchart LR\n  Build --> Deploy","scale":3}`, 3},
+		{"fractional", `{"content":"flowchart LR\n  Build --> Deploy","scale":1.5}`, 1.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tool := seaTalkSendMermaidTool{
+				newRenderer: func(context.Context) (mermaidRenderer, error) {
+					return fakeMermaidRenderer{image: []byte("\x89PNG\r\n\x1a\nexample"), scale: tc.scale}, nil
+				},
+			}
+			result, err := tool.Call(ctx, json.RawMessage(tc.input))
+			if err != nil {
+				t.Fatalf("tool call failed: %v", err)
+			}
+			body, ok := result.(map[string]any)
+			if !ok {
+				t.Fatalf("unexpected tool result type: %T", result)
+			}
+			if body["message_id"] != "mermaid-msg-1" {
+				t.Fatalf("unexpected tool result: %#v", result)
+			}
+		})
 	}
-	body, ok := result.(map[string]any)
-	if !ok {
-		t.Fatalf("unexpected tool result type: %T", result)
-	}
-	if body["message_id"] != "mermaid-msg-1" {
-		t.Fatalf("unexpected tool result: %#v", result)
+}
+
+func TestSeaTalkSendMermaidToolRejectsInvalidScale(t *testing.T) {
+	t.Parallel()
+
+	for _, scale := range []string{"0", "-1", `"large"`, "1e999"} {
+		t.Run(scale, func(t *testing.T) {
+			t.Parallel()
+			ctx := agent.ContextWithTurnRequest(context.Background(), agent.TurnRequest{
+				Message: agent.InboundMessage{Responder: &SeaTalkResponder{}},
+			})
+			tool := seaTalkSendMermaidTool{
+				newRenderer: func(context.Context) (mermaidRenderer, error) {
+					t.Fatal("renderer should not be created for invalid scale")
+					return nil, nil
+				},
+			}
+			_, err := tool.Call(ctx, json.RawMessage(`{"content":"flowchart LR; A --> B","scale":`+scale+`}`))
+			if err == nil || !strings.Contains(err.Error(), "scale") {
+				t.Fatalf("expected scale error, got %v", err)
+			}
+		})
 	}
 }
 
 type fakeMermaidRenderer struct {
 	image []byte
+	scale float64
 }
 
 func (r fakeMermaidRenderer) RenderAsScaledPNG(content string, scale float64) ([]byte, error) {
 	if content != "flowchart LR\n  Build --> Deploy" {
 		return nil, fmt.Errorf("unexpected Mermaid code: %q", content)
 	}
-	if scale != 1 {
+	if scale != r.scale {
 		return nil, fmt.Errorf("unexpected render scale: %v", scale)
 	}
 	return r.image, nil

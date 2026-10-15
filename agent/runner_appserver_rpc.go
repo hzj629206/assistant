@@ -318,9 +318,9 @@ func buildAppServerTurnStartParams(threadID string, inputs []appcodex.Input, opt
 }
 
 // newAppServerRPCClient uses the SDK RPC client but manages spawning itself so
-// the daemon can use appServerStdioTransport. Capabilities are intentionally not
-// sent during initialize: they are optional protocol opt-ins, and notification
-// filtering is performed locally by rpcAppServerTurnStream.
+// the daemon can use appServerStdioTransport. Initialization explicitly enables
+// experimentalApi for dynamic tools. Other capability opt-ins are left unset;
+// notification filtering is performed locally by rpcAppServerTurnStream.
 func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existing *appcodex.Codex, callbacks *appcodex.ServerRequestCallbacks) (*apprpc.Client, func() error, bool, error) {
 	if existing != nil {
 		rpcClient := existing.Client()
@@ -350,7 +350,7 @@ func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existi
 			spawn.Stderr = apprpc.DefaultStderr()
 		}
 		var err error
-		transport, err = spawnAppServerStdio(context.WithoutCancel(ctx), spawn.CodexPath, args, spawn.Stderr)
+		transport, err = spawnAppServerStdio(context.WithoutCancel(ctx), spawn.CodexPath, args, spawn.Stderr, spawn.Env...)
 		if err != nil {
 			return nil, nil, false, err
 		}

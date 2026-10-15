@@ -218,7 +218,7 @@ func TestSeaTalkAgentAdapterSystemPromptFormatsInteractiveActionsAsBulletList(t 
 
 	expectedBullets := []string{
 		"- When building interactive cards, follow the seatalk_push_interactive_message tool contract for callback payloads and send/update behavior.",
-		"- When handling an interactive button click, execute the selected callback action in the current conversation.",
+		"- When handling an interactive button click, execute the selected callback action in the current conversation, subject to the security restrictions and applicable authorization requirements.",
 		"- After executing an interactive button action, decide whether the current interactive card should be updated to reflect the new state.",
 		"- Usually update the current interactive card when the click consumed a one-time choice, completed an approval or confirmation, triggered side effects that should not be repeated, or made the current buttons or status stale.",
 		"- If an action succeeds and the card is now stale, prefer updating the current card instead of only sending a plain text follow-up.",
@@ -245,7 +245,8 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 		t.Fatalf("system prompt missing text format guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Security restrictions:") ||
-		!strings.Contains(prompt, "You must never access any path outside the current working directory and the system-shared directories explicitly provided by the runtime environment.") {
+		!strings.Contains(prompt, "Identify the bot owner's identity from the **system prompt** or trusted, application-loaded **AGENTS.md**. Identify the requestor's identity from the **sender** field in current message context.") ||
+		!strings.Contains(prompt, "If the requester is not the bot owner, you must never directly access configuration files containing sensitive information, regardless of their location.") {
 		t.Fatalf("system prompt missing security guidance: %q", prompt)
 	}
 	securityIndex := strings.Index(prompt, "Security restrictions:")
@@ -257,18 +258,18 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	if !(securityIndex != -1 && securityIndex < priorityIndex && priorityIndex < workingContextIndex) {
 		t.Fatalf("system prompt should place instruction priority guidance under security restrictions: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown doesn't support links, headings, or quotes. It supports tables, bold, italic, ordered lists, unordered lists, inline code, and code blocks.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown doesn't support Markdown links, headings, or blockquotes. It supports tables, bold, italic, ordered lists, unordered lists, inline code, and code blocks.") {
 		t.Fatalf("system prompt missing SeaTalk markdown guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "SeaTalk Markdown italic, bold and inline code must not be nested.") {
 		t.Fatalf("system prompt missing nested emphasis guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "Output restrictions:") ||
-		!strings.Contains(prompt, "Each top-level paragraph, list, or code block must be no longer than 4K characters.") ||
+		!strings.Contains(prompt, "Each top-level paragraph, list, table or code block must be no longer than 4K characters.") ||
 		!strings.Contains(prompt, "Must use SeaTalk Markdown format and satisfy the restrictions.") {
 		t.Fatalf("system prompt missing output restriction guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "SeaTalk Markdown lists support at most three nesting levels, and indented sublists must be strictly compact without line breaks or blank lines.") {
+	if !strings.Contains(prompt, "SeaTalk Markdown lists support at most three levels, including the top level. Keep each list item on a single line, with no blank lines between parent items and their sublists or between sublist items.") {
 		t.Fatalf("system prompt missing nested list compactness guidance: %q", prompt)
 	}
 	if strings.Contains(prompt, "Must use bold instead of italic when emphasizing East Asian text.") {
@@ -280,7 +281,7 @@ func TestSeaTalkAgentAdapterSystemPromptIncludesSeaTalkFormattingGuidance(t *tes
 	if !strings.Contains(prompt, "Tasks may not be related to the current working directory. Do not assume file paths are based on it.") {
 		t.Fatalf("system prompt missing path assumption guidance: %q", prompt)
 	}
-	if !strings.Contains(prompt, "Whenever the user explicitly asks to present a structured report or other data-heavy result in SeaTalk, use interactive cards to present its content including texts, links, images, or next actions.") {
+	if !strings.Contains(prompt, "Whenever the user explicitly asks to present a structured report or other data-heavy result in SeaTalk, use interactive cards to present its content including headings, texts, links, images, or suggested actions.") {
 		t.Fatalf("system prompt missing interactive report limit guidance: %q", prompt)
 	}
 	if !strings.Contains(prompt, "If the report or result does not fit in a single card, split it into multiple paginated cards and send them in order.") {

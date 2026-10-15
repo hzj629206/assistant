@@ -34,7 +34,7 @@ type appServerStdioTransport struct {
 
 // spawnAppServerStdio starts app-server in a dedicated process group. Its context
 // only governs startup; Close owns the process lifetime after Start succeeds.
-func spawnAppServerStdio(ctx context.Context, binary string, args []string, stderr io.Writer) (*appServerStdioTransport, error) {
+func spawnAppServerStdio(ctx context.Context, binary string, args []string, stderr io.Writer, env ...string) (*appServerStdioTransport, error) {
 	if binary == "" {
 		return nil, errors.New("codex binary path is empty")
 	}
@@ -43,6 +43,9 @@ func spawnAppServerStdio(ctx context.Context, binary string, args []string, stde
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

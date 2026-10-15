@@ -1,10 +1,10 @@
 module github.com/hzj629206/assistant
 
-go 1.26
+go 1.26.9
 
 require golang.org/x/crypto v0.50.0
 
-require github.com/pmenglund/codex-sdk-go v0.147.0
+require github.com/pmenglund/codex-sdk-go v0.162.1
 
 require (
 	github.com/dreampuf/mermaid.go v0.2.3

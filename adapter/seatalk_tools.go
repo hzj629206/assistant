@@ -24,6 +24,8 @@ import (
 
 type seaTalkSendFileTool struct{}
 
+const seaTalkMermaidDefaultScale = 2.0
+
 type seaTalkSendMermaidTool struct {
 	newRenderer func(context.Context) (mermaidRenderer, error)
 }
@@ -236,6 +238,12 @@ func (seaTalkSendMermaidTool) InputSchema() any {
 		"type": "object",
 		"properties": map[string]any{
 			"content": map[string]any{"type": "string"},
+			"scale": map[string]any{
+				"type":             "number",
+				"description":      "PNG render scale controls PNG resolution; defaults to 2.",
+				"default":          seaTalkMermaidDefaultScale,
+				"exclusiveMinimum": 0,
+			},
 		},
 		"required":             []any{"content"},
 		"additionalProperties": false,
@@ -260,7 +268,8 @@ func (t seaTalkSendMermaidTool) Call(ctx context.Context, input json.RawMessage)
 	}
 
 	var payload struct {
-		Content string `json:"content"`
+		Content string   `json:"content"`
+		Scale   *float64 `json:"scale"`
 	}
 	if err := json.Unmarshal(input, &payload); err != nil {
 		return nil, fmt.Errorf("seatalk send mermaid tool failed: decode input: %w", err)
@@ -268,6 +277,13 @@ func (t seaTalkSendMermaidTool) Call(ctx context.Context, input json.RawMessage)
 	payload.Content = strings.TrimSpace(payload.Content)
 	if payload.Content == "" {
 		return nil, errors.New("seatalk send mermaid tool failed: content is empty")
+	}
+	scale := seaTalkMermaidDefaultScale
+	if payload.Scale != nil {
+		scale = *payload.Scale
+	}
+	if scale <= 0 {
+		return nil, errors.New("seatalk send mermaid tool failed: scale must be greater than zero")
 	}
 
 	newRenderer := t.newRenderer
@@ -280,7 +296,7 @@ func (t seaTalkSendMermaidTool) Call(ctx context.Context, input json.RawMessage)
 	}
 	defer renderer.Close()
 
-	image, err := renderer.RenderAsScaledPNG(payload.Content, 1)
+	image, err := renderer.RenderAsScaledPNG(payload.Content, scale)
 	if err != nil {
 		return nil, fmt.Errorf("seatalk send mermaid tool failed: render PNG: %w", err)
 	}
@@ -288,7 +304,8 @@ func (t seaTalkSendMermaidTool) Call(ctx context.Context, input json.RawMessage)
 		return nil, fmt.Errorf("seatalk send mermaid tool failed: base64-encoded PNG exceeds 5M limit: got %d bytes, max %d bytes", base64.StdEncoding.EncodedLen(len(image)), seaTalkFileBase64MaxBytes)
 	}
 
-	log.Printf("seatalk tool send_mermaid: conversation=%s target=%s content_bytes=%d image_bytes=%d", turnReq.Conversation.Key, responder.target.logValue(), len(payload.Content), len(image))
+	log.Printf("seatalk tool send_mermaid: conversation=%s target=%s scale=%g content_bytes=%d image_bytes=%d",
+		turnReq.Conversation.Key, responder.target.logValue(), scale, len(payload.Content), len(image))
 
 	var result seatalk.SendMessageResult
 	if responder.target.isGroup {
