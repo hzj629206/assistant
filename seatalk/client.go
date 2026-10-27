@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,6 +23,7 @@ const (
 )
 
 var (
+	joinedGroupsEndpoint     = "https://openapi.seatalk.io/messaging/v2/group_chat/joined"
 	sendGroupChatEndpoint    = "https://openapi.seatalk.io/messaging/v2/group_chat"
 	sendSingleChatEndpoint   = "https://openapi.seatalk.io/messaging/v2/single_chat"
 	getEmployeeInfoEndpoint  = "https://openapi.seatalk.io/contacts/v2/profile"
@@ -173,6 +175,22 @@ type EmployeeCustomField struct {
 type GetEmployeeInfoResult struct {
 	// Employees is the employee profile list that matches the requested employee codes.
 	Employees []EmployeeInfo
+}
+
+// JoinedGroupsOptions controls pagination for JoinedGroups.
+type JoinedGroupsOptions struct {
+	// PageSize is between 1 and 100. Zero omits the parameter and uses the server default.
+	PageSize int
+	// Cursor continues traversal from a previous response. Empty requests the first page.
+	Cursor string
+}
+
+// JoinedGroupsResult contains one page of group IDs for groups the bot has joined.
+type JoinedGroupsResult struct {
+	// GroupIDs are opaque SeaTalk group IDs, not local database identifiers.
+	GroupIDs []string
+	// NextCursor is empty when there are no more pages.
+	NextCursor string
 }
 
 // GetGroupInfoOptions controls the optional pagination arguments for GetGroupInfo.
@@ -780,6 +798,80 @@ func (c *Client) GetEmployeeInfo(ctx context.Context, employeeCodes ...string) (
 	return GetEmployeeInfoResult{
 		Employees: apiResp.Employees,
 	}, nil
+}
+
+// JoinedGroups retrieves one page of IDs for group chats the bot has joined.
+func (c *Client) JoinedGroups(ctx context.Context, opts JoinedGroupsOptions) (JoinedGroupsResult, error) {
+	if c == nil {
+		return JoinedGroupsResult{}, errors.New("joined groups failed: client is nil")
+	}
+	if opts.PageSize < 0 || opts.PageSize > 100 {
+		return JoinedGroupsResult{}, errors.New("joined groups failed: page size must be between 1 and 100")
+	}
+
+	client := c.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	tokenProvider := c.tokenProvider
+	if tokenProvider == nil {
+		tokenProvider = GetAccessToken
+	}
+	token, err := tokenProvider(ctx, client, c.appID, c.appSecret)
+	if err != nil {
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: get access token: %w", err)
+	}
+
+	values := url.Values{}
+	if opts.PageSize > 0 {
+		values.Set("page_size", strconv.Itoa(opts.PageSize))
+	}
+	if opts.Cursor != "" {
+		values.Set("cursor", opts.Cursor)
+	}
+	endpoint := joinedGroupsEndpoint
+	if len(values) > 0 {
+		endpoint += "?" + values.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: read response body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: unexpected status %d: %s", resp.StatusCode, respBody)
+	}
+
+	var apiResp struct {
+		Code             int    `json:"code"`
+		Message          string `json:"message"`
+		NextCursor       string `json:"next_cursor"`
+		JoinedGroupChats struct {
+			GroupIDs []string `json:"group_id"`
+		} `json:"joined_group_chats"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: decode response body: %w", err)
+	}
+	if apiResp.Code != 0 {
+		if apiResp.Message != "" {
+			return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: api returned code %d: %s", apiResp.Code, apiResp.Message)
+		}
+		return JoinedGroupsResult{}, fmt.Errorf("joined groups failed: api returned code %d", apiResp.Code)
+	}
+	slog.DebugContext(ctx, "Retrieved joined SeaTalk groups", "group_count", len(apiResp.JoinedGroupChats.GroupIDs))
+	return JoinedGroupsResult{GroupIDs: apiResp.JoinedGroupChats.GroupIDs, NextCursor: apiResp.NextCursor}, nil
 }
 
 // GetGroupInfo retrieves the current info of a group chat that the bot has joined.

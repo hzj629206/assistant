@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1333,5 +1335,129 @@ func TestClientSendTextRejectsInvalidFormat(t *testing.T) {
 	}, SendOptions{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func joinedGroupsTestClient(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	originalEndpoint := joinedGroupsEndpoint
+	joinedGroupsEndpoint = server.URL
+	t.Cleanup(func() {
+		joinedGroupsEndpoint = originalEndpoint
+		server.Close()
+	})
+	return NewClient(Config{AppID: "app-id", AppSecret: "app-secret"},
+		WithHTTPClient(server.Client()),
+		WithTokenProvider(func(_ context.Context, _ *http.Client, appID, appSecret string) (string, error) {
+			if appID != "app-id" || appSecret != "app-secret" {
+				t.Error("unexpected app credentials")
+			}
+			return "token-123", nil
+		}))
+}
+
+func TestClientJoinedGroupsPagination(t *testing.T) {
+	cursor := "next+/=& cursor"
+	requests := 0
+	client := joinedGroupsTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer token-123" || r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("unexpected headers: %v", r.Header)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) != 0 {
+			t.Errorf("expected no request body, got %q, error %v", body, err)
+		}
+		switch requests {
+		case 1:
+			if r.URL.RawQuery != "" {
+				t.Errorf("expected omitted pagination, got %s", r.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"code":0,"next_cursor":"next+/=& cursor","joined_group_chats":{"group_id":["opaque-001"]}}`)
+		case 2:
+			if r.URL.Query().Get("page_size") != "1" || r.URL.Query().Get("cursor") != cursor {
+				t.Errorf("unexpected query: %s", r.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"code":0,"next_cursor":"","joined_group_chats":{"group_id":["opaque-002"]}}`)
+		default:
+			t.Errorf("unexpected request %d", requests)
+		}
+	})
+	first, err := client.JoinedGroups(t.Context(), JoinedGroupsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.NextCursor != cursor || !reflect.DeepEqual(first.GroupIDs, []string{"opaque-001"}) {
+		t.Fatalf("unexpected first page: %+v", first)
+	}
+	last, err := client.JoinedGroups(t.Context(), JoinedGroupsOptions{PageSize: 1, Cursor: first.NextCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.NextCursor != "" || !reflect.DeepEqual(last.GroupIDs, []string{"opaque-002"}) || requests != 2 {
+		t.Fatalf("unexpected last page: %+v, requests %d", last, requests)
+	}
+}
+
+func TestClientJoinedGroupsResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"empty", 200, `{"code":0,"next_cursor":"","joined_group_chats":{"group_id":[]}}`, ""},
+		{"http error", 503, `unavailable`, "unexpected status 503"},
+		{"invalid json", 200, `{`, "decode response body"},
+		{"invalid cursor", 200, `{"code":2003,"message":"invalid cursor"}`, "api returned code 2003: invalid cursor"},
+		{
+			name:   "validation error",
+			status: 200,
+			body: `{"code":102,"message":"Request body contains invalid input","rid":"rid-1",` +
+				`"validation_errors":[{"field":"PageSize","reason":"invalid"}]}`,
+			want: "api returned code 102: Request body contains invalid input",
+		},
+		{"code only", 200, `{"code":102}`, "api returned code 102"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := joinedGroupsTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			result, err := client.JoinedGroups(t.Context(), JoinedGroupsOptions{PageSize: 100})
+			if tc.want != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("expected %q, got %v", tc.want, err)
+				}
+				return
+			}
+			if err != nil || len(result.GroupIDs) != 0 || result.NextCursor != "" {
+				t.Fatalf("unexpected empty page: %+v, error %v", result, err)
+			}
+		})
+	}
+}
+
+func TestClientJoinedGroupsValidation(t *testing.T) {
+	var nilClient *Client
+	if _, err := nilClient.JoinedGroups(t.Context(), JoinedGroupsOptions{}); err == nil {
+		t.Fatal("expected nil client error")
+	}
+	tokenErr := errors.New("token unavailable")
+	client := NewClient(Config{}, WithTokenProvider(func(context.Context, *http.Client, string, string) (string, error) {
+		return "", tokenErr
+	}))
+	for _, size := range []int{-1, 101} {
+		_, err := client.JoinedGroups(t.Context(), JoinedGroupsOptions{PageSize: size})
+		if err == nil || !strings.Contains(err.Error(), "page size") {
+			t.Fatalf("expected page size error for %d, got %v", size, err)
+		}
+	}
+	if _, err := client.JoinedGroups(t.Context(), JoinedGroupsOptions{}); !errors.Is(err, tokenErr) {
+		t.Fatalf("expected wrapped token error, got %v", err)
 	}
 }
