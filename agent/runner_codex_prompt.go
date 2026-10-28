@@ -149,9 +149,13 @@ func buildTurnPromptResult(message InboundMessage) turnPrompt {
 		prompt, imagePaths = buildSingleTurnPrompt(message, true)
 	}
 
+	contextParts := make([]string, 0, 2+len(message.historicalMessages))
+	contextImagePaths := make([]string, 0, len(imagePaths)+len(message.historicalMessages))
+	appendConversationContextParts(&contextParts, &contextImagePaths, message)
+	contextParts = append(contextParts, prompt)
 	return turnPrompt{
-		Text:        prompt,
-		ImagePaths:  imagePaths,
+		Text:        strings.TrimSpace(strings.Join(contextParts, "\n\n")),
+		ImagePaths:  append(contextImagePaths, imagePaths...),
 		Attachments: collectPromptAttachments(message),
 	}
 }
@@ -212,7 +216,6 @@ func buildSingleTurnPrompt(message InboundMessage, includeReplyMention bool) (st
 	var parts []string
 	var imagePaths []string
 
-	appendConversationContextParts(&parts, &imagePaths, message)
 	if currentMessageContext := formatCurrentMessageContext(message, includeReplyMention); currentMessageContext != "" {
 		parts = append(parts, currentMessageContext)
 	}
@@ -290,16 +293,12 @@ func buildSingleTurnPrompt(message InboundMessage, includeReplyMention bool) (st
 // standalone current message:
 //   - mergedMessages contains all current inbound messages in arrival order and is the source of per-message
 //     content, sender metadata, timestamps, and reply mention hints rendered in the prompt.
-//   - initialContext and historicalMessages still belong to the current turn and should be rendered once before
-//     the merged current messages.
-//   - prompt generation here must not depend on any top-level fields other than mergedMessages, initialContext,
-//     and historicalMessages.
+//   - Conversation context and historical messages are rendered once by buildTurnPromptResult.
+//   - Prompt generation here reads only mergedMessages.
 //   - Other top-level non-content fields belong to the dispatcher/runner envelope as usual.
 func buildCompositeTurnPrompt(message InboundMessage) (string, []string) {
 	var parts []string
 	imagePaths := make([]string, 0, len(message.historicalMessages)+len(message.mergedMessages))
-
-	appendConversationContextParts(&parts, &imagePaths, message)
 
 	currentMessages := message.mergedMessages
 	switch len(currentMessages) {
@@ -327,8 +326,15 @@ func buildCompositeTurnPrompt(message InboundMessage) (string, []string) {
 }
 
 func appendConversationContextParts(parts *[]string, imagePaths *[]string, message InboundMessage) {
+	contextLines := make([]string, 0, 2)
+	if groupID := strings.TrimSpace(message.GroupID); groupID != "" {
+		contextLines = append(contextLines, "- group id: `"+groupID+"`")
+	}
 	if message.initialContext != "" {
-		*parts = append(*parts, "Conversation context:\n"+message.initialContext)
+		contextLines = append(contextLines, message.initialContext)
+	}
+	if len(contextLines) > 0 {
+		*parts = append(*parts, "Conversation context:\n"+strings.Join(contextLines, "\n"))
 	}
 
 	if len(message.historicalMessages) == 0 {
@@ -362,6 +368,9 @@ func formatCurrentMessageContext(message InboundMessage, includeReplyMention boo
 		"Current message context:",
 		"- time: " + formatCurrentMessageTime(message.SentAtUnix),
 		"- sender: `" + formatCurrentMessageSenderName(message.Sender) + "`",
+	}
+	if id := strings.TrimSpace(message.MessageID); id != "" {
+		lines = append(lines, "- bot message id: `"+id+"`")
 	}
 	if includeReplyMention {
 		if mentionHint := strings.TrimSpace(message.SenderMentionHint); mentionHint != "" {
@@ -406,6 +415,14 @@ func formatCurrentMessageSenderName(sender string) string {
 }
 
 func formatReferencedMessage(message ReferencedMessage) (string, []string) {
+	part, refs := formatReferencedMessageContent(message)
+	if id := strings.TrimSpace(message.MessageID); id != "" && part != "" {
+		part = strings.Replace(part, "Quoted message:\n", "Quoted message:\n- bot message id: `"+id+"`\n", 1)
+	}
+	return part, refs
+}
+
+func formatReferencedMessageContent(message ReferencedMessage) (string, []string) {
 	referencedImagePaths := allImagePaths(message.ImagePath, message.ImagePaths)
 	referencedFilePaths := allFilePaths(message.FilePath, message.FilePaths)
 	referencedVideoPaths := allVideoPaths(message.VideoPath, message.VideoPaths)
@@ -488,6 +505,9 @@ func formatForwardedMessages(prefix string, messages []ReferencedMessage) (strin
 
 func formatForwardedMessageBlock(index int, message ReferencedMessage) (string, []string) {
 	lines := []string{"Forwarded message " + strconv.Itoa(index) + ":"}
+	if id := strings.TrimSpace(message.MessageID); id != "" {
+		lines = append(lines, "- bot message id: `"+id+"`")
+	}
 	lines = append(lines, "- time: "+formatCurrentMessageTime(message.SentAtUnix))
 	lines = append(lines, "- sender: "+formatCurrentMessageSenderName(message.Sender))
 

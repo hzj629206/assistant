@@ -346,6 +346,8 @@ func (a *SeaTalkAgentAdapter) processInteractiveEvent(ctx context.Context, req s
 
 	message := agent.InboundMessage{
 		ID:                req.EventID,
+		MessageID:         strings.TrimSpace(event.MessageID),
+		GroupID:           strings.TrimSpace(target.groupID),
 		ConversationKey:   conversationKey(target.isGroup, target.employeeCode, target.groupID, threadRef),
 		Kind:              agent.MessageKindText,
 		Sender:            formatCurrentMessageSender(event.Email, event.SeatalkID, 1),
@@ -617,6 +619,9 @@ func (a *SeaTalkAgentAdapter) resolveReferencedMessage(ctx context.Context, resp
 		return nil, err
 	}
 
+	if strings.TrimSpace(message.MessageID) == "" {
+		message.MessageID = strings.TrimSpace(messageID)
+	}
 	return normalizeQuotedMessage(ctx, responder, message)
 }
 
@@ -1069,6 +1074,7 @@ func (a *SeaTalkAgentAdapter) normalizeThreadHistoryMessage(
 
 	history := agent.InboundMessage{
 		ID:              strings.TrimSpace(message.MessageID),
+		MessageID:       strings.TrimSpace(message.MessageID),
 		ConversationKey: conversationKey,
 		Kind:            kind,
 		Sender:          formatCurrentMessageSender(message.Sender.Email, message.Sender.SeatalkID, message.Sender.SenderType),
@@ -1078,6 +1084,10 @@ func (a *SeaTalkAgentAdapter) normalizeThreadHistoryMessage(
 			message.Sender.SeatalkID,
 			message.Sender.Email,
 		).MarkdownTag(),
+	}
+
+	if responder != nil {
+		history.GroupID = strings.TrimSpace(responder.target.groupID)
 	}
 
 	if len(imageURLs) > 0 && responder != nil && responder.client != nil {
@@ -1826,6 +1836,7 @@ func (t seaTalkReplyTarget) logValue() string {
 
 func normalizeQuotedMessage(ctx context.Context, responder *SeaTalkResponder, message seatalk.GetMessageResult) (*agent.ReferencedMessage, error) {
 	referenced := &agent.ReferencedMessage{
+		MessageID:  strings.TrimSpace(message.MessageID),
 		Sender:     formatCurrentMessageSender(message.Sender.Email, message.Sender.SeatalkID, message.Sender.SenderType),
 		SentAtUnix: currentMessageUnixTime(message.MessageSentTime, 0),
 	}

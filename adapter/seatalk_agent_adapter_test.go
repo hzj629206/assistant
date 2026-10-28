@@ -120,6 +120,9 @@ func TestSeaTalkAgentAdapterEnqueuesWebSocketSubscriberMessage(t *testing.T) {
 	if reqCall.Message.ID != "evt-websocket-1" {
 		t.Fatalf("unexpected message ID: %q", reqCall.Message.ID)
 	}
+	if reqCall.Message.GroupID != "" || reqCall.Message.MessageID != "msg-websocket-1" {
+		t.Fatalf("unexpected private message identifiers: %+v", reqCall.Message)
+	}
 	if reqCall.Message.Text != "hello from websocket" {
 		t.Fatalf("unexpected routed message text: %q", reqCall.Message.Text)
 	}
@@ -512,6 +515,9 @@ func TestSeaTalkAgentAdapterEnqueuesInteractiveClickEvent(t *testing.T) {
 	reqCall := runner.LastRequest()
 	if reqCall.Message.ConversationKey != "seatalk:private:e_1:thread-1" {
 		t.Fatalf("unexpected conversation key: %q", reqCall.Message.ConversationKey)
+	}
+	if reqCall.Message.ID != req.EventID || reqCall.Message.MessageID != event.MessageID {
+		t.Fatalf("unexpected interactive message identifiers: %+v", reqCall.Message)
 	}
 	if reqCall.Message.Responder == nil {
 		t.Fatal("expected responder to be attached")
@@ -3793,5 +3799,38 @@ func jsonResponse(t *testing.T, body any) *http.Response {
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(bytes.NewReader(payload)),
+	}
+}
+
+func TestSeaTalkMessageNormalizationPreservesIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	message := seatalk.PrivateThreadMessage{
+		MessageID: "message-1",
+		Tag:       "text",
+		Text:      &seatalk.ThreadTextMessage{PlainText: "hello"},
+	}
+	adapter := newSeaTalkAgentAdapterWithClient(nil, nil)
+	responder := &SeaTalkResponder{target: seaTalkReplyTarget{isGroup: true, groupID: "group-1"}}
+	history, ok, err := adapter.normalizeThreadHistoryMessage(
+		context.Background(), responder, "seatalk:group:group-1:thread-1", message,
+	)
+	if err != nil || !ok {
+		t.Fatalf("normalize history failed: ok=%t err=%v", ok, err)
+	}
+	if history.MessageID != message.MessageID || history.GroupID != "group-1" {
+		t.Fatalf("unexpected history identifiers: %+v", history)
+	}
+	quoted, err := normalizeQuotedMessage(context.Background(), nil, message)
+	if err != nil || quoted == nil || quoted.MessageID != message.MessageID {
+		t.Fatalf("unexpected quoted message: %+v err=%v", quoted, err)
+	}
+	forwarded, ok := normalizeForwardedMessageMap(map[string]any{
+		"message_id": "forwarded-1",
+		"tag":        "text",
+		"text":       map[string]any{"content": "forwarded text"},
+	})
+	if !ok || forwarded.message.MessageID != "forwarded-1" {
+		t.Fatalf("unexpected forwarded message: %+v", forwarded)
 	}
 }

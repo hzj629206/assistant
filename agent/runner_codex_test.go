@@ -1995,3 +1995,69 @@ func closedDone(err error) <-chan error {
 	close(ch)
 	return ch
 }
+
+func TestBuildTurnPromptPreservesMessageIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	for _, groupID := range []string{"", "group-1"} {
+		t.Run("group="+groupID, func(t *testing.T) {
+			t.Parallel()
+
+			message := InboundMessage{
+				ConversationKey: "conversation-1",
+				GroupID:         groupID,
+				ID:              "event-current",
+				MessageID:       "current-1",
+				Kind:            MessageKindText,
+				Text:            "current message",
+				QuotedMessage: &ReferencedMessage{
+					MessageID: "quoted-1", Kind: MessageKindText, Text: "quoted text",
+				},
+			}
+			history := message
+			history.MessageID = "history-1"
+			history.QuotedMessage = nil
+			next := message
+			next.ID = "event-next"
+			next.MessageID = "current-2"
+			next.QuotedMessage = nil
+			next.Kind = MessageKindForwarded
+			next.ForwardedMessages = []ReferencedMessage{{
+				MessageID: "forwarded-1", Kind: MessageKindText, Text: "forwarded text",
+			}}
+
+			for _, current := range []InboundMessage{message, combineInboundMessages([]InboundMessage{message, next})} {
+				current = prependHistoricalMessages(current, []InboundMessage{history})
+				prompt, _ := buildTurnPrompt(current)
+				for _, id := range []string{"history-1", "current-1", "quoted-1"} {
+					if !strings.Contains(prompt, "- bot message id: `"+id+"`") {
+						t.Fatalf("missing message ID %q in prompt: %s", id, prompt)
+					}
+				}
+				if strings.Contains(prompt, "conversation id:") || strings.Contains(prompt, message.ConversationKey) {
+					t.Fatalf("internal conversation ID leaked into prompt: %s", prompt)
+				}
+				if groupID != "" && strings.Count(prompt, "- group id: `"+groupID+"`") != 1 {
+					t.Fatalf("missing group ID in prompt: %s", prompt)
+				}
+				if groupID == "" && strings.Contains(prompt, "- group id:") {
+					t.Fatalf("unexpected group ID in private prompt: %s", prompt)
+				}
+				messageContext := formatCurrentMessageContext(message, true)
+				if strings.Contains(messageContext, "conversation id:") || strings.Contains(messageContext, "group id:") {
+					t.Fatalf("conversation identifiers repeated at message level: %s", messageContext)
+				}
+				if len(current.mergedMessages) > 0 {
+					for _, id := range []string{"current-2", "forwarded-1"} {
+						if !strings.Contains(prompt, "- bot message id: `"+id+"`") {
+							t.Fatalf("missing batched message ID %q in prompt: %s", id, prompt)
+						}
+					}
+				}
+				if strings.Contains(prompt, "event-current") || strings.Contains(prompt, "event-next") {
+					t.Fatalf("event ID leaked into message context: %s", prompt)
+				}
+			}
+		})
+	}
+}

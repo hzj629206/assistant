@@ -105,6 +105,7 @@ func routePrivateMessage(req seatalk.EventRequest, event *seatalk.MessageFromBot
 	return seaTalkRoute{
 		message: agent.InboundMessage{
 			ID:              req.EventID,
+			MessageID:       strings.TrimSpace(event.Message.MessageID),
 			ConversationKey: conversationKey(false, event.EmployeeCode, "", threadRef),
 			Kind:            kind,
 			Sender:          formatCurrentMessageSender(event.Email, event.SeatalkID, 1),
@@ -175,6 +176,8 @@ func routeMentionedGroupMessage(req seatalk.EventRequest, event *seatalk.NewMent
 	return seaTalkRoute{
 		message: agent.InboundMessage{
 			ID:              req.EventID,
+			MessageID:       strings.TrimSpace(event.Message.MessageID),
+			GroupID:         strings.TrimSpace(event.GroupID),
 			ConversationKey: conversationKey(true, "", event.GroupID, threadRef),
 			Kind:            kind,
 			Sender:          formatCurrentMessageSender(event.Message.Sender.Email, event.Message.Sender.SeatalkID, event.Message.Sender.SenderType),
@@ -252,6 +255,8 @@ func routeThreadMessage(req seatalk.EventRequest, event *seatalk.NewMessageRecei
 	return seaTalkRoute{
 		message: agent.InboundMessage{
 			ID:              req.EventID,
+			MessageID:       strings.TrimSpace(event.Message.MessageID),
+			GroupID:         strings.TrimSpace(event.GroupID),
 			ConversationKey: conversationKey(true, "", event.GroupID, event.Message.ThreadID),
 			Kind:            kind,
 			Sender:          formatCurrentMessageSender(event.Message.Sender.Email, event.Message.Sender.SeatalkID, event.Message.Sender.SenderType),
@@ -580,6 +585,7 @@ func collectForwardedMessageDrafts(messages []map[string]any) []forwardedMessage
 func normalizeForwardedMessageMap(message map[string]any) (forwardedMessageDraft, bool) {
 	referenced := forwardedMessageDraft{
 		message: agent.ReferencedMessage{
+			MessageID:  strings.TrimSpace(stringValue(message["message_id"])),
 			Sender:     extractForwardedSender(message["sender"]),
 			SentAtUnix: extractUnixTimestamp(message["message_sent_time"]),
 		},
