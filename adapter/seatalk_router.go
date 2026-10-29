@@ -177,7 +177,6 @@ func routeMentionedGroupMessage(req seatalk.EventRequest, event *seatalk.NewMent
 		message: agent.InboundMessage{
 			ID:              req.EventID,
 			MessageID:       strings.TrimSpace(event.Message.MessageID),
-			GroupID:         strings.TrimSpace(event.GroupID),
 			ConversationKey: conversationKey(true, "", event.GroupID, threadRef),
 			Kind:            kind,
 			Sender:          formatCurrentMessageSender(event.Message.Sender.Email, event.Message.Sender.SeatalkID, event.Message.Sender.SenderType),
@@ -256,7 +255,6 @@ func routeThreadMessage(req seatalk.EventRequest, event *seatalk.NewMessageRecei
 		message: agent.InboundMessage{
 			ID:              req.EventID,
 			MessageID:       strings.TrimSpace(event.Message.MessageID),
-			GroupID:         strings.TrimSpace(event.GroupID),
 			ConversationKey: conversationKey(true, "", event.GroupID, event.Message.ThreadID),
 			Kind:            kind,
 			Sender:          formatCurrentMessageSender(event.Message.Sender.Email, event.Message.Sender.SeatalkID, event.Message.Sender.SenderType),

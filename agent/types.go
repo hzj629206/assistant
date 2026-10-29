@@ -45,8 +45,6 @@ type ReferencedMessage struct {
 type InboundMessage struct {
 	// ConversationKey identifies the source conversation used to load and persist conversation state.
 	ConversationKey string
-	// GroupID identifies the source platform group chat when available.
-	GroupID string
 	// MessageID identifies the source platform message, independently of the event ID.
 	MessageID string
 	// ID is the unique inbound event identifier used for deduplication and tracing.

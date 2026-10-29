@@ -326,15 +326,8 @@ func buildCompositeTurnPrompt(message InboundMessage) (string, []string) {
 }
 
 func appendConversationContextParts(parts *[]string, imagePaths *[]string, message InboundMessage) {
-	contextLines := make([]string, 0, 2)
-	if groupID := strings.TrimSpace(message.GroupID); groupID != "" {
-		contextLines = append(contextLines, "- group id: `"+groupID+"`")
-	}
 	if message.initialContext != "" {
-		contextLines = append(contextLines, message.initialContext)
-	}
-	if len(contextLines) > 0 {
-		*parts = append(*parts, "Conversation context:\n"+strings.Join(contextLines, "\n"))
+		*parts = append(*parts, "Conversation context:\n"+message.initialContext)
 	}
 
 	if len(message.historicalMessages) == 0 {

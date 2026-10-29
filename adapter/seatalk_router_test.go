@@ -32,7 +32,7 @@ func TestSeaTalkRouterRoutesPrivateMessage(t *testing.T) {
 	if !ok {
 		t.Fatal("expected private message to be routable")
 	}
-	if message.message.ID != req.EventID || message.message.MessageID != "msg-1" || message.message.GroupID != "" {
+	if message.message.ID != req.EventID || message.message.MessageID != "msg-1" {
 		t.Fatalf("unexpected message identifiers: %+v", message.message)
 	}
 	if message.message.ConversationKey != "seatalk:private:e_1:msg-1" {
@@ -119,7 +119,7 @@ func TestSeaTalkRouterRoutesGroupThreadMessage(t *testing.T) {
 	if !ok {
 		t.Fatal("expected thread message to be routable")
 	}
-	if message.message.ID != req.EventID || message.message.MessageID != "msg-2" || message.message.GroupID != "group-1" {
+	if message.message.ID != req.EventID || message.message.MessageID != "msg-2" {
 		t.Fatalf("unexpected message identifiers: %+v", message.message)
 	}
 	if message.message.ConversationKey != "seatalk:group:group-1:thread-1" {
@@ -244,7 +244,7 @@ func TestSeaTalkRouterRoutesMentionedGroupMessage(t *testing.T) {
 	if !ok {
 		t.Fatal("expected mentioned group message to be routable")
 	}
-	if message.message.ID != req.EventID || message.message.MessageID != "msg-4" || message.message.GroupID != "group-2" {
+	if message.message.ID != req.EventID || message.message.MessageID != "msg-4" {
 		t.Fatalf("unexpected message identifiers: %+v", message.message)
 	}
 	if message.message.ConversationKey != "seatalk:group:group-2:msg-4" {

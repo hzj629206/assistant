@@ -120,7 +120,7 @@ func TestSeaTalkAgentAdapterEnqueuesWebSocketSubscriberMessage(t *testing.T) {
 	if reqCall.Message.ID != "evt-websocket-1" {
 		t.Fatalf("unexpected message ID: %q", reqCall.Message.ID)
 	}
-	if reqCall.Message.GroupID != "" || reqCall.Message.MessageID != "msg-websocket-1" {
+	if reqCall.Message.MessageID != "msg-websocket-1" {
 		t.Fatalf("unexpected private message identifiers: %+v", reqCall.Message)
 	}
 	if reqCall.Message.Text != "hello from websocket" {
@@ -1106,7 +1106,7 @@ func TestSeaTalkAgentAdapterLoadsInitialContextForFirstMentionedThreadMessage(t 
 	}
 
 	reqCall := runner.LastRequest()
-	expectedInitialContext := "Group profile:\n- name: Demo Group\n" +
+	expectedInitialContext := "Group profile:\n- group id: `group-1`\n- name: Demo Group\n" +
 		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
 	if reqCall.Message.InitialContext() != expectedInitialContext {
 		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
@@ -1306,7 +1306,7 @@ func TestSeaTalkAgentAdapterLoadsGroupContextWithoutThreadHistoryForTopLevelMent
 	}
 
 	reqCall := runner.LastRequest()
-	expectedInitialContext := "Group profile:\n- name: Demo Group\n" +
+	expectedInitialContext := "Group profile:\n- group id: `group-1`\n- name: Demo Group\n" +
 		"Group thread guidance:\n- The sender mention hint in the message context only shows the mention format; it does not imply that a mention is required.\n- The current message may include message tags. The tag `group_mentioned_message` means you were explicitly mentioned in that message.\n- If you are not mentioned explicitly, reply only when a user-facing response is clearly necessary. Avoid replies that do not add meaningful value.\n- When you are explicitly mentioned, first decide whether the mention is a real task request, direct addressing, or only a reference to you.\n  - For references or introductions, usually do not reply.\n  - For a real task request or direct addressing, a reply is required.\n  - If the reply addresses one or more senders, include mentions for the relevant sender or senders by following the sender mention hint in the message context.\n- When you need to mention someone not a sender, use one of these tags:\n  - `<mention-tag target=\"seatalk://user?id=SEATALK_ID\"/>`, SEATALK_ID is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_seatalk_id=SEATALK_ID]`\n  - `<mention-tag target=\"seatalk://user?email=USER_EMAIL\"/>`, USER_EMAIL is identified from:\n    - Message mention format: `@USERNAME [mentioned_user_email=USER_EMAIL]`\n    - Group member format: `<USER_EMAIL>`"
 	if reqCall.Message.InitialContext() != expectedInitialContext {
 		t.Fatalf("unexpected initial context: %q", reqCall.Message.InitialContext())
@@ -1786,7 +1786,7 @@ func TestSeaTalkAgentAdapterIncludesSmallGroupUserListInInitialContext(t *testin
 	if err != nil {
 		t.Fatalf("load group profile failed: %v", err)
 	}
-	expected := "Group profile:\n- name: Small Group\n- users:\n  - e_1 <alice@example.com>\n  - e_2 <bob@example.com>"
+	expected := "Group profile:\n- group id: `group-1`\n- name: Small Group\n- users:\n  - e_1 <alice@example.com>\n  - e_2 <bob@example.com>"
 	if contextBlock != expected {
 		t.Fatalf("unexpected group profile:\n%s", contextBlock)
 	}
@@ -3818,7 +3818,7 @@ func TestSeaTalkMessageNormalizationPreservesIdentifiers(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("normalize history failed: ok=%t err=%v", ok, err)
 	}
-	if history.MessageID != message.MessageID || history.GroupID != "group-1" {
+	if history.MessageID != message.MessageID {
 		t.Fatalf("unexpected history identifiers: %+v", history)
 	}
 	quoted, err := normalizeQuotedMessage(context.Background(), nil, message)

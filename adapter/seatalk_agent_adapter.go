@@ -347,7 +347,6 @@ func (a *SeaTalkAgentAdapter) processInteractiveEvent(ctx context.Context, req s
 	message := agent.InboundMessage{
 		ID:                req.EventID,
 		MessageID:         strings.TrimSpace(event.MessageID),
-		GroupID:           strings.TrimSpace(target.groupID),
 		ConversationKey:   conversationKey(target.isGroup, target.employeeCode, target.groupID, threadRef),
 		Kind:              agent.MessageKindText,
 		Sender:            formatCurrentMessageSender(event.Email, event.SeatalkID, 1),
@@ -882,6 +881,7 @@ func (a *SeaTalkAgentAdapter) loadGroupProfile(ctx context.Context, groupID stri
 
 	lines := []string{
 		"Group profile:",
+		"- group id: `" + strings.TrimSpace(groupID) + "`",
 		"- name: " + fallbackValue(strings.TrimSpace(result.Group.GroupName)),
 	}
 	if result.Group.GroupUserTotal < 10 {
@@ -1084,10 +1084,6 @@ func (a *SeaTalkAgentAdapter) normalizeThreadHistoryMessage(
 			message.Sender.SeatalkID,
 			message.Sender.Email,
 		).MarkdownTag(),
-	}
-
-	if responder != nil {
-		history.GroupID = strings.TrimSpace(responder.target.groupID)
 	}
 
 	if len(imageURLs) > 0 && responder != nil && responder.client != nil {

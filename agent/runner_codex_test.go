@@ -2005,7 +2005,6 @@ func TestBuildTurnPromptPreservesMessageIdentifiers(t *testing.T) {
 
 			message := InboundMessage{
 				ConversationKey: "conversation-1",
-				GroupID:         groupID,
 				ID:              "event-current",
 				MessageID:       "current-1",
 				Kind:            MessageKindText,
@@ -2014,6 +2013,10 @@ func TestBuildTurnPromptPreservesMessageIdentifiers(t *testing.T) {
 					MessageID: "quoted-1", Kind: MessageKindText, Text: "quoted text",
 				},
 			}
+			if groupID != "" {
+				message.initialContext = "Group profile:\n- group id: `" + groupID + "`"
+			}
+
 			history := message
 			history.MessageID = "history-1"
 			history.QuotedMessage = nil
@@ -2043,6 +2046,13 @@ func TestBuildTurnPromptPreservesMessageIdentifiers(t *testing.T) {
 				if groupID == "" && strings.Contains(prompt, "- group id:") {
 					t.Fatalf("unexpected group ID in private prompt: %s", prompt)
 				}
+				followup := current
+				followup.initialContext = ""
+				followupPrompt, _ := buildTurnPrompt(followup)
+				if strings.Contains(followupPrompt, "- group id:") {
+					t.Fatalf("group ID repeated after initial context: %s", followupPrompt)
+				}
+
 				messageContext := formatCurrentMessageContext(message, true)
 				if strings.Contains(messageContext, "conversation id:") || strings.Contains(messageContext, "group id:") {
 					t.Fatalf("conversation identifiers repeated at message level: %s", messageContext)
