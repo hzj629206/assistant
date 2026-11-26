@@ -98,7 +98,7 @@ func parseStatusConfigOptions(raw json.RawMessage) []SessionConfigOption {
 
 	var structured []struct {
 		Name         string `json:"name"`
-		CurrentValue string `json:"currentValue"`
+		CurrentValue any    `json:"currentValue"`
 		Options      []struct {
 			Name        string `json:"name"`
 			Description string `json:"description"`
@@ -114,9 +114,13 @@ func parseStatusConfigOptions(raw json.RawMessage) []SessionConfigOption {
 					Description: choice.Description,
 				})
 			}
+			currentValue := ""
+			if item.CurrentValue != nil {
+				currentValue = stringifyStatusConfigValue(item.CurrentValue)
+			}
 			options = append(options, SessionConfigOption{
 				Name:         item.Name,
-				CurrentValue: item.CurrentValue,
+				CurrentValue: currentValue,
 				Options:      choices,
 			})
 		}

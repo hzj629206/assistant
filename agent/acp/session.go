@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultProtocolVersion  = 1
+	defaultProtocolVersion  = 2
 	defaultClientName       = "assistant"
 	defaultClientVersion    = "1.0.0"
 	processTerminateTimeout = 5 * time.Second
@@ -38,10 +38,13 @@ type processSession struct {
 	observer     Observer
 	permission   PermissionHandler
 
-	sessionMu sync.RWMutex
-	sessionID string
-	caps      AgentCapabilities
-	status    SessionMetadata
+	sessionMu       sync.RWMutex
+	sessionID       string
+	caps            AgentCapabilities
+	status          SessionMetadata
+	protocolVersion int
+	childSessions   map[string]string
+	replayComplete  bool
 
 	turnMu     sync.Mutex
 	activeTurn *processActiveTurn
@@ -66,6 +69,7 @@ type processActiveTurn struct {
 	interruptFinished  bool
 	interruptErr       error
 	interrupted        bool
+	v2                 *v2TurnState
 }
 
 type scheduledTurn struct {
@@ -115,11 +119,13 @@ func StartSession(ctx context.Context, options SessionOptions) (Session, error) 
 		return nil, fmt.Errorf("acp stdin pipe failed: %w", err)
 	}
 
-	stdout, err := cmd.StdoutPipe()
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
+		_ = stdin.Close()
 		cancel()
 		return nil, fmt.Errorf("acp stdout pipe failed: %w", err)
 	}
+	cmd.Stdout = stdoutWriter
 
 	session := &processSession{
 		lifecycleCtx: sessionCtx,
@@ -139,16 +145,24 @@ func StartSession(ctx context.Context, options SessionOptions) (Session, error) 
 	session.transport = newRPCTransport(stdout, stdin, session.handleNotification, session.handleRequest)
 
 	if err = cmd.Start(); err != nil {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
+		_ = stdin.Close()
 		cancel()
 		return nil, fmt.Errorf("start acp command %q failed: %w", command, err)
 	}
 
+	_ = stdoutWriter.Close()
+	readDone := make(chan struct{})
 	session.wg.Go(func() {
+		defer close(readDone)
+		defer func() { _ = stdout.Close() }()
 		session.transport.readLoop(sessionCtx)
 	})
 
 	session.wg.Go(func() {
 		rawWaitErr := cmd.Wait()
+		<-readDone
 		waitErr := ignoreExpectedExit(rawWaitErr)
 		session.closed.Store(true)
 		if rawWaitErr == nil {
@@ -173,81 +187,29 @@ func StartSession(ctx context.Context, options SessionOptions) (Session, error) 
 }
 
 func (s *processSession) handshake(ctx context.Context, resumeSessionID string, authMethod string, mcpServers []MCPServer, workDir string) error {
-	initializeParams := map[string]any{
-		"protocolVersion": defaultProtocolVersion,
-		"clientCapabilities": map[string]any{
-			"fs": map[string]any{
-				"readTextFile":  false,
-				"writeTextFile": false,
-			},
-			"terminal": false,
-		},
-		"clientInfo": map[string]any{
-			"name":    defaultClientName,
-			"version": defaultClientVersion,
-		},
-	}
-	log.Printf("acp initialize started")
-	result, err := s.transport.call(ctx, "initialize", initializeParams)
+	authMethod = strings.TrimSpace(authMethod)
+	initialized, err := s.initialize(ctx)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("acp initialize failed: timed out after %s waiting for agent response", processHandshakeTimeout)
-		}
-		return fmt.Errorf("acp initialize failed: %w", err)
+		return err
 	}
-
-	var initResponse struct {
-		ProtocolVersion int `json:"protocolVersion"`
-		AgentInfo       struct {
-			Name    string `json:"name"`
-			Title   string `json:"title"`
-			Version string `json:"version"`
-		} `json:"agentInfo"`
-		AuthMethods []struct {
-			ID string `json:"id"`
-		} `json:"authMethods"`
-		AgentCapabilities struct {
-			LoadSession        bool `json:"loadSession"`
-			PromptCapabilities struct {
-				Image           bool `json:"image"`
-				EmbeddedContext bool `json:"embeddedContext"`
-			} `json:"promptCapabilities"`
-			MCPCapabilities struct {
-				HTTP bool `json:"http"`
-			} `json:"mcpCapabilities"`
-		} `json:"agentCapabilities"`
+	mcpServers, err = initialized.prepareMCPServers(mcpServers)
+	if err != nil {
+		return err
 	}
-	if err = json.Unmarshal(result, &initResponse); err != nil {
-		return fmt.Errorf("decode acp initialize response failed: %w", err)
-	}
-	s.caps = AgentCapabilities{
-		Prompt: PromptCapabilities{
-			Image:           initResponse.AgentCapabilities.PromptCapabilities.Image,
-			EmbeddedContext: initResponse.AgentCapabilities.PromptCapabilities.EmbeddedContext,
-		},
-		MCP: MCPCapabilities{
-			HTTP: initResponse.AgentCapabilities.MCPCapabilities.HTTP,
-		},
-	}
-	log.Printf(
-		"acp initialize completed: protocol_version=%d agent_name=%s agent_title=%s agent_version=%s load_session=%t prompt_image=%t prompt_embedded_context=%t mcp_http=%t auth_methods=%d",
-		initResponse.ProtocolVersion,
-		sanitizeLogValue(initResponse.AgentInfo.Name),
-		sanitizeLogValue(initResponse.AgentInfo.Title),
-		sanitizeLogValue(initResponse.AgentInfo.Version),
-		initResponse.AgentCapabilities.LoadSession,
-		initResponse.AgentCapabilities.PromptCapabilities.Image,
-		initResponse.AgentCapabilities.PromptCapabilities.EmbeddedContext,
-		initResponse.AgentCapabilities.MCPCapabilities.HTTP,
-		len(initResponse.AuthMethods),
-	)
 
 	if strings.TrimSpace(authMethod) != "" {
-		if !supportsAuthMethod(initResponse.AuthMethods, authMethod) {
+		if !supportsAuthMethod(initialized.authMethods, authMethod) {
 			return fmt.Errorf("acp agent does not advertise auth method %q", authMethod)
 		}
 		log.Printf("acp authenticate started: method=%s", sanitizeLogValue(authMethod))
-		if _, err = s.transport.call(ctx, "authenticate", map[string]any{"methodId": authMethod}); err != nil {
+		method := "authenticate"
+		if initialized.version == 2 {
+			if err = initialized.validateAuthMethod(authMethod); err != nil {
+				return err
+			}
+			method = "auth/login"
+		}
+		if _, err = s.transport.call(ctx, method, map[string]any{"methodId": authMethod}); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return fmt.Errorf("acp authenticate failed: timed out after %s waiting for agent response", processHandshakeTimeout)
 			}
@@ -256,18 +218,21 @@ func (s *processSession) handshake(ctx context.Context, resumeSessionID string, 
 		log.Printf("acp authenticate completed: method=%s", sanitizeLogValue(authMethod))
 	}
 
-	if strings.TrimSpace(resumeSessionID) != "" && initResponse.AgentCapabilities.LoadSession {
-		log.Printf("acp session/load started: requested_session=%s", sanitizeLogValue(resumeSessionID))
+	if strings.TrimSpace(resumeSessionID) != "" && initialized.loadSession {
+		log.Printf("acp session restore started: protocol_version=%d requested_session=%s", initialized.version, sanitizeLogValue(resumeSessionID))
 		if err = s.loadSession(ctx, resumeSessionID, workDir, mcpServers); err == nil {
 			return nil
 		}
-		log.Printf("acp session/load failed, starting new session instead: requested_session=%s err=%v", resumeSessionID, err)
+		log.Printf("acp session restore failed, starting new session instead: requested_session=%s err=%v", sanitizeLogValue(resumeSessionID), err)
 	}
 
 	return s.newSession(ctx, workDir, mcpServers)
 }
 
 func (s *processSession) loadSession(ctx context.Context, sessionID string, workDir string, mcpServers []MCPServer) error {
+	if s.negotiatedVersion() == 2 {
+		return s.resumeV2Session(ctx, sessionID, workDir, mcpServers)
+	}
 	log.Printf("acp session/load request sent: requested_session=%s cwd=%s mcp_servers=%d", sanitizeLogValue(sessionID), sanitizeLogValue(workDir), len(mcpServers))
 	result, err := s.transport.call(ctx, "session/load", map[string]any{
 		"sessionId":  sessionID,
@@ -303,10 +268,24 @@ func (s *processSession) loadSession(ctx context.Context, sessionID string, work
 }
 
 func (s *processSession) newSession(ctx context.Context, workDir string, mcpServers []MCPServer) error {
+	if s.negotiatedVersion() == 2 {
+		s.prepareV2Session("")
+	}
 	log.Printf("acp session/new started: cwd=%s mcp_servers=%d", sanitizeLogValue(workDir), len(mcpServers))
-	result, err := s.transport.call(ctx, "session/new", map[string]any{
+	var payload struct {
+		SessionID     string          `json:"sessionId"`
+		Modes         SessionModes    `json:"modes"`
+		ConfigOptions json.RawMessage `json:"configOptions"`
+	}
+	var decodeErr error
+	_, err := s.transport.callWithCallbacks(ctx, "session/new", map[string]any{
 		"cwd":        workDir,
 		"mcpServers": mcpServers,
+	}, nil, func(result json.RawMessage) {
+		decodeErr = json.Unmarshal(result, &payload)
+		if decodeErr == nil && strings.TrimSpace(payload.SessionID) != "" {
+			s.setSessionState(payload.SessionID, payload.Modes, payload.ConfigOptions)
+		}
 	})
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -314,18 +293,12 @@ func (s *processSession) newSession(ctx context.Context, workDir string, mcpServ
 		}
 		return err
 	}
-	var payload struct {
-		SessionID     string          `json:"sessionId"`
-		Modes         SessionModes    `json:"modes"`
-		ConfigOptions json.RawMessage `json:"configOptions"`
-	}
-	if err = json.Unmarshal(result, &payload); err != nil {
-		return fmt.Errorf("decode session/new response failed: %w", err)
+	if decodeErr != nil {
+		return fmt.Errorf("decode session/new response failed: %w", decodeErr)
 	}
 	if strings.TrimSpace(payload.SessionID) == "" {
 		return errors.New("session/new returned empty sessionId")
 	}
-	s.setSessionState(payload.SessionID, payload.Modes, payload.ConfigOptions)
 	logModes("session/new", payload.SessionID, payload.Modes)
 	logConfigOptions("session/new", payload.SessionID, payload.ConfigOptions)
 	return nil
@@ -378,6 +351,9 @@ func (t *scheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 		return TurnResult{}, context.Canceled
 	}
 	defer s.finishActiveTurn(activeTurn)
+	if s.negotiatedVersion() == 2 {
+		return s.runV2Turn(ctx, activeTurn, t.blocks)
+	}
 
 	s.promptMu.Lock()
 	s.promptBuilder = &strings.Builder{}
@@ -388,12 +364,12 @@ func (t *scheduledTurn) Run(ctx context.Context) (TurnResult, error) {
 		s.promptMu.Unlock()
 	}()
 
-	go s.watchTurnInterrupt(ctx, activeTurn)
-
-	result, err := s.transport.call(ctx, "session/prompt", map[string]any{
+	result, err := s.transport.callWithCallbacks(ctx, "session/prompt", map[string]any{
 		"sessionId": activeTurn.sessionID,
 		"prompt":    t.blocks,
-	})
+	}, func() {
+		go s.watchTurnInterrupt(ctx, activeTurn)
+	}, nil)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("acp session/prompt failed: %w", err)
 	}
@@ -499,7 +475,8 @@ func (s *processSession) setSessionState(sessionID string, modes SessionModes, c
 	s.sessionMu.Lock()
 	s.sessionID = strings.TrimSpace(sessionID)
 	s.status = SessionMetadata{
-		SessionID: s.sessionID,
+		SessionID:       s.sessionID,
+		ProtocolVersion: s.protocolVersion,
 		Modes: SessionModes{
 			CurrentModeID:  strings.TrimSpace(modes.CurrentModeID),
 			AvailableModes: append([]SessionMode(nil), modes.AvailableModes...),
@@ -510,7 +487,11 @@ func (s *processSession) setSessionState(sessionID string, modes SessionModes, c
 }
 
 func (s *processSession) Close() error {
-	if s == nil || s.closed.Swap(true) {
+	if s == nil {
+		return nil
+	}
+	if s.closed.Swap(true) {
+		s.cancel()
 		return nil
 	}
 
@@ -573,7 +554,9 @@ func (s *processSession) finishActiveTurn(activeTurn *processActiveTurn) {
 	if activeTurn == nil {
 		return
 	}
-	s.cancelPendingPermissions(activeTurn)
+	if s.negotiatedVersion() != 2 {
+		s.cancelPendingPermissions(activeTurn)
+	}
 	s.turnMu.Lock()
 	if s.activeTurn == activeTurn {
 		s.activeTurn = nil
@@ -721,19 +704,38 @@ func (s *processSession) watchTurnInterrupt(ctx context.Context, activeTurn *pro
 
 	done, shouldSend := s.requestTurnInterrupt(activeTurn)
 	if shouldSend {
-		err := s.transport.notify("session/cancel", map[string]any{"sessionId": activeTurn.sessionID})
+		sent, err := s.sendTurnCancel(activeTurn)
 		if err != nil {
 			log.Printf("acp session/cancel failed: session_id=%s err=%v", sanitizeLogValue(activeTurn.sessionID), err)
-		} else {
+		} else if sent {
 			log.Printf("acp session/cancel sent: session_id=%s", sanitizeLogValue(activeTurn.sessionID))
 		}
-		s.cancelPendingPermissions(activeTurn)
+		if s.negotiatedVersion() != 2 {
+			s.cancelPendingPermissions(activeTurn)
+		}
 		s.finishTurnInterrupt(activeTurn, err)
 		return
 	}
 	if done == nil {
 		return
 	}
+}
+
+func (s *processSession) sendTurnCancel(turn *processActiveTurn) (bool, error) {
+	// Recheck the turn while holding the wire lock. A delayed watcher must
+	// either cancel before the next prompt is written or send nothing.
+	s.transport.writeMu.Lock()
+	defer s.transport.writeMu.Unlock()
+	s.turnMu.Lock()
+	current := s.activeTurn == turn && (turn.v2 == nil || !turn.v2.finished)
+	s.turnMu.Unlock()
+	if !current {
+		return false, nil
+	}
+	err := s.transport.encoder.Encode(map[string]any{
+		"jsonrpc": "2.0", "method": "session/cancel", "params": map[string]any{"sessionId": turn.sessionID},
+	})
+	return true, err
 }
 
 func logACPStopReason(sessionID string, result json.RawMessage) {
@@ -766,7 +768,15 @@ func (s *processSession) handleNotification(method string, params json.RawMessag
 	if s.observer.OnNotification != nil {
 		s.observer.OnNotification(method, params)
 	}
+	if method == "$/cancel_request" {
+		s.handlePermissionCancellation(params)
+		return
+	}
 	if method != "session/update" {
+		return
+	}
+	if s.negotiatedVersion() == 2 {
+		s.handleV2Notification(params)
 		return
 	}
 
@@ -827,27 +837,59 @@ func (s *processSession) handleRequest(method string, id json.RawMessage, params
 	}
 
 	var request struct {
-		Options []PermissionOption `json:"options"`
+		SessionID   string             `json:"sessionId"`
+		Title       *string            `json:"title"`
+		Description string             `json:"description"`
+		Subject     json.RawMessage    `json:"subject"`
+		Options     []PermissionOption `json:"options"`
 	}
 	if err := json.Unmarshal(params, &request); err != nil {
 		_ = s.transport.respondError(id, -32602, "invalid params")
 		return
 	}
-
-	permissionRequest := PermissionRequest{
-		Method:    method,
-		SessionID: s.SessionID(),
-		Options:   request.Options,
-		Raw:       append(json.RawMessage(nil), params...),
+	v2 := s.negotiatedVersion() == 2
+	if v2 && (request.SessionID == "" || request.Title == nil || len(request.Options) == 0) {
+		_ = s.transport.respondError(id, -32602, "sessionId, title and non-empty options are required")
+		return
 	}
+	if request.SessionID == "" {
+		request.SessionID = s.SessionID()
+	}
+	if v2 {
+		s.sessionMu.RLock()
+		_, child := s.childSessions[request.SessionID]
+		known := child || request.SessionID == s.sessionID || s.sessionID == ""
+		s.sessionMu.RUnlock()
+		if !known {
+			_ = s.transport.respondErrorData(id, -32002, "unknown session", map[string]any{"sessionId": request.SessionID})
+			return
+		}
+	}
+	permissionRequest := PermissionRequest{
+		Method:      method,
+		SessionID:   request.SessionID,
+		Description: request.Description,
+		Subject:     append(json.RawMessage(nil), request.Subject...),
+		Options:     request.Options,
+		Raw:         append(json.RawMessage(nil), params...),
+	}
+	if request.Title != nil {
+		permissionRequest.Title = *request.Title
+	}
+	log.Printf("acp permission requested: session_id=%s request_id=%s title=%s options=%d", sanitizeLogValue(request.SessionID), sanitizeLogValue(string(id)), sanitizeLogValue(permissionRequest.Title), len(request.Options))
 	if s.observer.OnPermissionRequest != nil {
 		s.observer.OnPermissionRequest(permissionRequest)
 	}
 
 	activeTurn := s.currentActiveTurn()
+	if v2 {
+		// Only the agent knows whether a request belongs to foreground or
+		// background work. Let $/cancel_request cancel v2 requests by ID.
+		activeTurn = nil
+	}
 	permissionCtx := s.lifecycleCtx
 	cancel := func() {}
-	if activeTurn != nil {
+	if activeTurn != nil || v2 {
 		permissionCtx, cancel = context.WithCancel(s.lifecycleCtx)
 	}
 	pending := s.registerPendingPermission(id, permissionRequest, activeTurn, cancel)
@@ -856,47 +898,65 @@ func (s *processSession) handleRequest(method string, id json.RawMessage, params
 		_ = s.transport.respondSuccess(id, buildPermissionResult(PermissionDecision{}))
 		return
 	}
-	defer s.unregisterPendingPermission(pending)
+	if v2 {
+		go s.runPermissionHandler(permissionCtx, pending)
+		return
+	}
+	s.runPermissionHandler(permissionCtx, pending)
+}
 
-	if s.wasTurnInterrupted(pending.activeTurn) {
+func (s *processSession) runPermissionHandler(ctx context.Context, pending *pendingPermissionRequest) {
+	defer s.unregisterPendingPermission(pending)
+	stop := context.AfterFunc(ctx, func() { s.respondPendingPermissionCancelled(pending) })
+	defer stop()
+	defer pending.cancel()
+
+	if ctx.Err() != nil || s.wasTurnInterrupted(pending.activeTurn) {
 		s.respondPendingPermissionCancelled(pending)
 		return
 	}
 
-	decision, err := s.permission(permissionCtx, permissionRequest)
-	if errors.Is(err, context.Canceled) && s.wasTurnInterrupted(pending.activeTurn) {
+	decision, err := s.permission(ctx, pending.request)
+	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 		s.respondPendingPermissionCancelled(pending)
 		return
 	}
 	if err != nil {
 		if s.tryFinishPendingPermission(pending) {
-			_ = s.transport.respondError(id, -32603, err.Error())
+			_ = s.transport.respondError(pending.rawID, -32603, err.Error())
 		}
 		return
 	}
-	if s.observer.OnPermissionResult != nil {
-		s.observer.OnPermissionResult(permissionRequest, decision)
-	}
 	if s.tryFinishPendingPermission(pending) {
-		_ = s.transport.respondSuccess(id, buildPermissionResult(decision))
+		log.Printf("acp permission answered: session_id=%s request_id=%s allow=%t option_id=%s", sanitizeLogValue(pending.request.SessionID), sanitizeLogValue(string(pending.rawID)), decision.Allow, sanitizeLogValue(decision.OptionID))
+		if s.observer.OnPermissionResult != nil {
+			s.observer.OnPermissionResult(pending.request, decision)
+		}
+		_ = s.transport.respondSuccess(pending.rawID, buildPermissionResult(decision))
+	}
+}
+
+func (s *processSession) handlePermissionCancellation(params json.RawMessage) {
+	var notification struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal(params, &notification); err != nil {
+		return
+	}
+	s.permissionMu.Lock()
+	pending := s.pendingPermission[permissionRequestKey(notification.RequestID)]
+	s.permissionMu.Unlock()
+	if pending != nil {
+		s.respondPendingPermissionCancelled(pending)
 	}
 }
 
 func (s *processSession) registerPendingPermission(id json.RawMessage, request PermissionRequest, activeTurn *processActiveTurn, cancel context.CancelFunc) *pendingPermissionRequest {
-	key := strings.Trim(string(bytes.TrimSpace(id)), "\"")
-	if key == "" {
+	rawID := string(bytes.TrimSpace(id))
+	if rawID == "" || rawID == "null" {
 		return nil
 	}
-
-	if activeTurn == nil {
-		return &pendingPermissionRequest{
-			id:      key,
-			rawID:   append(json.RawMessage(nil), id...),
-			request: request,
-			cancel:  cancel,
-			done:    make(chan struct{}),
-		}
-	}
+	key := permissionRequestKey(id)
 
 	pending := &pendingPermissionRequest{
 		id:         key,
@@ -914,6 +974,14 @@ func (s *processSession) registerPendingPermission(id json.RawMessage, request P
 	s.pendingPermission[key] = pending
 	s.permissionMu.Unlock()
 	return pending
+}
+
+func permissionRequestKey(id json.RawMessage) string {
+	var text string
+	if err := json.Unmarshal(id, &text); err == nil {
+		return "string:" + text
+	}
+	return "number:" + string(bytes.TrimSpace(id))
 }
 
 func (s *processSession) unregisterPendingPermission(pending *pendingPermissionRequest) {
@@ -960,6 +1028,7 @@ func (s *processSession) respondPendingPermissionCancelled(pending *pendingPermi
 	if !s.tryFinishPendingPermission(pending) {
 		return
 	}
+	log.Printf("acp permission canceled: session_id=%s request_id=%s", sanitizeLogValue(pending.request.SessionID), sanitizeLogValue(string(pending.rawID)))
 	if s.observer.OnPermissionResult != nil {
 		s.observer.OnPermissionResult(pending.request, PermissionDecision{})
 	}
@@ -985,15 +1054,13 @@ func (s *processSession) cancelPendingPermissions(activeTurn *processActiveTurn)
 	}
 }
 
-func supportsAuthMethod(authMethods []struct {
-	ID string `json:"id"`
-}, authMethod string) bool {
-	authMethod = strings.TrimSpace(authMethod)
-	if authMethod == "" {
+func supportsAuthMethod(authMethods []authMethod, configured string) bool {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
 		return true
 	}
 	for _, candidate := range authMethods {
-		if strings.TrimSpace(candidate.ID) == authMethod {
+		if strings.TrimSpace(candidate.ID) == configured {
 			return true
 		}
 	}

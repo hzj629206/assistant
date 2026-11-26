@@ -8,10 +8,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/yuin/goldmark"
-	goldmarkast "github.com/yuin/goldmark/ast"
-	"github.com/yuin/goldmark/extension"
-	goldmarktext "github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/v2/extension"
+	"github.com/yuin/goldmark/v2/parser"
+
+	goldmarkast "github.com/yuin/goldmark/v2/ast"
 )
 
 func normalizeSeaTalkMarkdown(value string) string {
@@ -49,7 +49,7 @@ func escapeSeaTalkMarkdownOrderedSectionNumbers(value string) string {
 // Tables must be parsed as top-level blocks so they are preserved intact when
 // a response is normalized or split to meet SeaTalk's message size limit.
 func parseSeaTalkMarkdown(source []byte) goldmarkast.Node {
-	return goldmark.New(goldmark.WithExtensions(extension.Table)).Parser().Parse(goldmarktext.NewReader(source))
+	return parser.New(parser.WithExtensions(extension.NewTableParser())).Parse(source)
 }
 
 type seaTalkMarkdownEdit struct {
@@ -66,16 +66,16 @@ func collectSeaTalkMarkdownEdits(document goldmarkast.Node, source []byte) []sea
 			return goldmarkast.WalkContinue, nil
 		}
 
-		fencedCodeBlock, ok := node.(*goldmarkast.FencedCodeBlock)
-		if ok {
+		fencedCodeBlock, ok := node.(*goldmarkast.CodeBlock)
+		if ok && fencedCodeBlock.CodeBlockKind == goldmarkast.CodeBlockKindFenced {
 			edit, ok := seaTalkMarkdownCodeFenceEdit(fencedCodeBlock, source)
 			if ok {
 				edits = append(edits, edit)
 			}
 		}
 
-		emphasis, ok := node.(*goldmarkast.Emphasis)
-		if ok {
+		if seaTalkMarkdownEmphasisLevel(node) > 0 {
+			emphasis := node
 			edit, ok := seaTalkMarkdownUnnestInlineLabelEdit(emphasis, source)
 			if ok {
 				edits = append(edits, edit)
@@ -223,12 +223,8 @@ func seaTalkMarkdownListItemBlockIsSingleLine(node goldmarkast.Node) bool {
 	}
 
 	switch value := node.(type) {
-	case *goldmarkast.TextBlock:
-		lines := value.Lines()
-		return lines != nil && lines.Len() == 1
 	case *goldmarkast.Paragraph:
-		lines := value.Lines()
-		return lines != nil && lines.Len() == 1
+		return len(value.Source()) == 1
 	default:
 		return false
 	}
@@ -486,8 +482,8 @@ func seaTalkMarkdownUnorderedListItemMarkerEdit(listItem *goldmarkast.ListItem, 
 
 // seaTalkMarkdownItalicToBoldEdits rewrites tight inline italic into bold so
 // SeaTalk renders emphasis reliably even when spacing is missing.
-func seaTalkMarkdownItalicToBoldEdits(emphasis *goldmarkast.Emphasis, source []byte) []seaTalkMarkdownEdit {
-	if emphasis == nil || emphasis.Level != 1 {
+func seaTalkMarkdownItalicToBoldEdits(emphasis goldmarkast.Node, source []byte) []seaTalkMarkdownEdit {
+	if emphasis == nil || seaTalkMarkdownEmphasisLevel(emphasis) != 1 {
 		return nil
 	}
 	if seaTalkMarkdownHasEmphasisAncestor(emphasis) {
@@ -523,18 +519,31 @@ func seaTalkMarkdownItalicToBoldEdits(emphasis *goldmarkast.Emphasis, source []b
 	}
 }
 
-func seaTalkMarkdownIsBoldItalicEmphasis(emphasis *goldmarkast.Emphasis) bool {
-	if emphasis == nil || emphasis.Level != 1 || emphasis.ChildCount() != 1 {
+// seaTalkMarkdownEmphasisLevel maps the separate v2 emphasis nodes to their
+// source delimiter widths so normalization can handle both forms uniformly.
+func seaTalkMarkdownEmphasisLevel(node goldmarkast.Node) int {
+	switch node.(type) {
+	case *goldmarkast.Emphasis:
+		return 1
+	case *goldmarkast.Strong:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func seaTalkMarkdownIsBoldItalicEmphasis(emphasis goldmarkast.Node) bool {
+	if emphasis == nil || seaTalkMarkdownEmphasisLevel(emphasis) != 1 || emphasis.ChildCount() != 1 {
 		return false
 	}
 
-	child, ok := emphasis.FirstChild().(*goldmarkast.Emphasis)
-	return ok && child.Level == 2
+	_, ok := emphasis.FirstChild().(*goldmarkast.Strong)
+	return ok
 }
 
 func seaTalkMarkdownHasEmphasisAncestor(node goldmarkast.Node) bool {
 	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
-		if _, ok := parent.(*goldmarkast.Emphasis); ok {
+		if seaTalkMarkdownEmphasisLevel(parent) > 0 {
 			return true
 		}
 	}
@@ -544,8 +553,8 @@ func seaTalkMarkdownHasEmphasisAncestor(node goldmarkast.Node) bool {
 
 // seaTalkMarkdownUnnestInlineLabelEdit splits emphasis around nested inline
 // labels such as code spans so SeaTalk does not receive unsupported nesting.
-func seaTalkMarkdownUnnestInlineLabelEdit(emphasis *goldmarkast.Emphasis, source []byte) (seaTalkMarkdownEdit, bool) {
-	if emphasis == nil || emphasis.Level < 1 {
+func seaTalkMarkdownUnnestInlineLabelEdit(emphasis goldmarkast.Node, source []byte) (seaTalkMarkdownEdit, bool) {
+	if emphasis == nil || seaTalkMarkdownEmphasisLevel(emphasis) < 1 {
 		return seaTalkMarkdownEdit{}, false
 	}
 
@@ -568,10 +577,10 @@ func seaTalkMarkdownUnnestInlineLabelEdit(emphasis *goldmarkast.Emphasis, source
 			continue
 		}
 
-		childStart := child.Pos()
+		childStart := seaTalkMarkdownInlineNodeStart(child, source)
 		childStop := seaTalkMarkdownInlineNodeStop(child, source)
-		if emphasisChild, ok := child.(*goldmarkast.Emphasis); ok && childStop > contentEnd {
-			if adjustedStop, ok := seaTalkMarkdownSharedTrailingEmphasisStop(emphasisChild, source, contentEnd); ok {
+		if seaTalkMarkdownEmphasisLevel(child) > 0 && childStop > contentEnd {
+			if adjustedStop, ok := seaTalkMarkdownSharedTrailingEmphasisStop(child, source, contentEnd); ok {
 				childStop = adjustedStop
 			}
 		}
@@ -609,7 +618,7 @@ func seaTalkMarkdownUnnestInlineLabelEdit(emphasis *goldmarkast.Emphasis, source
 
 func seaTalkMarkdownIsUnsupportedNestedInline(node goldmarkast.Node) bool {
 	switch node.(type) {
-	case *goldmarkast.CodeSpan, *goldmarkast.Emphasis:
+	case *goldmarkast.CodeSpan, *goldmarkast.Emphasis, *goldmarkast.Strong:
 		return true
 	default:
 		return false
@@ -618,7 +627,7 @@ func seaTalkMarkdownIsUnsupportedNestedInline(node goldmarkast.Node) bool {
 
 func seaTalkMarkdownAppendWrappedEmphasisSegment(
 	builder *strings.Builder,
-	emphasis *goldmarkast.Emphasis,
+	emphasis goldmarkast.Node,
 	source []byte,
 	start int,
 	stop int,
@@ -635,12 +644,12 @@ func seaTalkMarkdownAppendWrappedEmphasisSegment(
 }
 
 func seaTalkMarkdownWrappedEmphasisDelimiter(
-	emphasis *goldmarkast.Emphasis,
+	emphasis goldmarkast.Node,
 	source []byte,
 	start int,
 	stop int,
 ) string {
-	if emphasis == nil || emphasis.Level < 1 {
+	if emphasis == nil || seaTalkMarkdownEmphasisLevel(emphasis) < 1 {
 		return ""
 	}
 
@@ -671,17 +680,17 @@ func seaTalkMarkdownWrappedEmphasisDelimiter(
 	return delimiter + delimiter
 }
 
-func seaTalkMarkdownEffectiveEmphasisBounds(emphasis *goldmarkast.Emphasis, source []byte) (int, int, int, bool) {
-	if emphasis == nil || emphasis.Level < 1 {
+func seaTalkMarkdownEffectiveEmphasisBounds(emphasis goldmarkast.Node, source []byte) (int, int, int, bool) {
+	if emphasis == nil || seaTalkMarkdownEmphasisLevel(emphasis) < 1 {
 		return 0, 0, 0, false
 	}
 
 	opening := emphasis.Pos()
-	delimiterWidth := emphasis.Level
+	delimiterWidth := seaTalkMarkdownEmphasisLevel(emphasis)
 	target := emphasis
 	if outer, ok := seaTalkMarkdownBoldItalicOuterForInner(emphasis); ok {
 		opening = outer.Pos()
-		delimiterWidth = outer.Level + emphasis.Level
+		delimiterWidth = seaTalkMarkdownEmphasisLevel(outer) + seaTalkMarkdownEmphasisLevel(emphasis)
 		target = outer
 	}
 
@@ -693,32 +702,43 @@ func seaTalkMarkdownEffectiveEmphasisBounds(emphasis *goldmarkast.Emphasis, sour
 	return opening, delimiterWidth, closing, true
 }
 
-func seaTalkMarkdownBoldItalicOuterForInner(emphasis *goldmarkast.Emphasis) (*goldmarkast.Emphasis, bool) {
-	if emphasis == nil || emphasis.Level != 2 {
+func seaTalkMarkdownBoldItalicOuterForInner(emphasis goldmarkast.Node) (goldmarkast.Node, bool) {
+	if emphasis == nil || seaTalkMarkdownEmphasisLevel(emphasis) != 2 {
 		return nil, false
 	}
 
-	parent, ok := emphasis.Parent().(*goldmarkast.Emphasis)
-	if !ok || parent.Level != 1 || parent.ChildCount() != 1 || parent.FirstChild() != emphasis {
+	parent := emphasis.Parent()
+	if seaTalkMarkdownEmphasisLevel(parent) != 1 || parent.ChildCount() != 1 || parent.FirstChild() != emphasis {
 		return nil, false
 	}
 
 	return parent, true
 }
 
+func seaTalkMarkdownInlineNodeStart(node goldmarkast.Node, source []byte) int {
+	start := node.Pos()
+	if _, ok := node.(*goldmarkast.CodeSpan); ok && start >= 0 && start <= len(source) {
+		// v2 code spans point at their content rather than the opening delimiter.
+		for start > 0 && source[start-1] == '`' {
+			start--
+		}
+	}
+	return start
+}
+
 func seaTalkMarkdownInlineNodeStop(node goldmarkast.Node, source []byte) int {
 	switch value := node.(type) {
 	case *goldmarkast.CodeSpan:
 		stop := seaTalkMarkdownNodeStop(node, source)
-		return min(len(source), stop+seaTalkMarkdownRepeatedMarkerWidth(source, value.Pos(), '`'))
-	case *goldmarkast.Emphasis:
+		return min(len(source), stop+seaTalkMarkdownRepeatedMarkerWidth(source, stop, '`'))
+	case *goldmarkast.Emphasis, *goldmarkast.Strong:
 		opening, delimiterWidth, closing, ok := seaTalkMarkdownEffectiveEmphasisBounds(value, source)
 		if !ok {
 			stop := seaTalkMarkdownNodeStop(node, source)
-			return min(len(source), stop+value.Level)
+			return min(len(source), stop+seaTalkMarkdownEmphasisLevel(value))
 		}
 		if closing < opening+delimiterWidth {
-			return min(len(source), closing+value.Level)
+			return min(len(source), closing+seaTalkMarkdownEmphasisLevel(value))
 		}
 		return min(len(source), closing+delimiterWidth)
 	default:
@@ -727,7 +747,7 @@ func seaTalkMarkdownInlineNodeStop(node goldmarkast.Node, source []byte) int {
 }
 
 func seaTalkMarkdownSharedTrailingEmphasisStop(
-	emphasis *goldmarkast.Emphasis,
+	emphasis goldmarkast.Node,
 	source []byte,
 	contentEnd int,
 ) (int, bool) {
@@ -837,7 +857,7 @@ func seaTalkMarkdownSoftLineBreakEdit(textNode *goldmarkast.Text, source []byte)
 		return seaTalkMarkdownEdit{}, false
 	}
 
-	start := textNode.Segment.Stop
+	start := textNode.Value.Index().Stop
 	stop := nextText.Pos()
 	if start < 0 || stop < start || stop > len(source) {
 		return seaTalkMarkdownEdit{}, false
@@ -850,7 +870,7 @@ func seaTalkMarkdownSoftLineBreakEdit(textNode *goldmarkast.Text, source []byte)
 	}, true
 }
 
-func seaTalkMarkdownItalicClosingDelimiterPosition(emphasis *goldmarkast.Emphasis, source []byte) (int, bool) {
+func seaTalkMarkdownItalicClosingDelimiterPosition(emphasis goldmarkast.Node, source []byte) (int, bool) {
 	if emphasis == nil || emphasis.LastChild() == nil {
 		return 0, false
 	}
@@ -902,15 +922,27 @@ func seaTalkMarkdownNodeStop(node goldmarkast.Node, source []byte) int {
 		return -1
 	}
 	if textNode, ok := node.(*goldmarkast.Text); ok {
-		return textNode.Segment.Stop
+		return textNode.Value.Index().Stop
+	}
+	if codeSpan, ok := node.(*goldmarkast.CodeSpan); ok {
+		indices := codeSpan.Value.Indices()
+		if len(indices) > 0 {
+			return indices[len(indices)-1].Stop
+		}
 	}
 	if node.LastChild() != nil {
 		return seaTalkMarkdownNodeStop(node.LastChild(), source)
 	}
-	if node.Type() == goldmarkast.TypeBlock {
-		lines := node.Lines()
-		if lines != nil && lines.Len() > 0 {
-			return lines.At(lines.Len() - 1).Stop
+	if block, ok := node.(goldmarkast.BlockNode); ok {
+		lines := block.Source()
+		switch value := node.(type) {
+		case *goldmarkast.CodeBlock:
+			lines = value.Value.Segments()
+		case *goldmarkast.HTMLBlock:
+			lines = value.Value.Segments()
+		}
+		if len(lines) > 0 {
+			return lines[len(lines)-1].Stop
 		}
 	}
 	if node.Pos() < 0 {
@@ -934,7 +966,7 @@ func seaTalkMarkdownListIsNested(list *goldmarkast.List) bool {
 
 // seaTalkMarkdownCodeFenceEdit strips fenced-code info strings because SeaTalk
 // supports plain fences more reliably than language-tagged fences.
-func seaTalkMarkdownCodeFenceEdit(node *goldmarkast.FencedCodeBlock, source []byte) (seaTalkMarkdownEdit, bool) {
+func seaTalkMarkdownCodeFenceEdit(node *goldmarkast.CodeBlock, source []byte) (seaTalkMarkdownEdit, bool) {
 	if node == nil {
 		return seaTalkMarkdownEdit{}, false
 	}
@@ -1029,7 +1061,7 @@ func seaTalkMarkdownPromoteNodeContinuationLineEdits(node goldmarkast.Node, sour
 	}
 
 	stop := seaTalkMarkdownNodeStop(node, source)
-	if _, ok := node.(*goldmarkast.FencedCodeBlock); ok {
+	if codeBlock, ok := node.(*goldmarkast.CodeBlock); ok && codeBlock.CodeBlockKind == goldmarkast.CodeBlockKindFenced {
 		stop = seaTalkMarkdownFencedCodeBlockStop(node, source)
 	}
 	for position < stop {

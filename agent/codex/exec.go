@@ -140,8 +140,7 @@ func (c *CodexExec) Run(args CodexExecArgs) (*ExecStream, error) {
 		if waitErr == nil {
 			return nil
 		}
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](waitErr); ok {
 			return fmt.Errorf("codex exec exited with %v: %s", exitErr.ProcessState, strings.TrimSpace(stderr.String()))
 		}
 		return waitErr
@@ -279,7 +278,7 @@ func encodeTOMLLiteral(value reflect.Value) (string, error) {
 		return "", errors.New("nil values are not supported")
 	}
 
-	if number, ok := value.Interface().(json.Number); ok {
+	if number, ok := reflect.TypeAssert[json.Number](value); ok {
 		return number.String(), nil
 	}
 

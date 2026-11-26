@@ -40,8 +40,15 @@ func (*AppServerRunner) AttestationGenerate(context.Context, appproto.Attestatio
 }
 
 func (*AppServerRunner) ApplyPatchApproval(_ context.Context, params appproto.ApplyPatchApprovalParams) (*appproto.ApplyPatchApprovalResponse, error) {
-	logAppServerRequest("auto-approved apply patch request", params)
 	response := appproto.SanitizedApplyPatchApprovalResponseJSON{Decision: appproto.MustReviewDecision("approved")}
+	message := "auto-approved apply patch request"
+	if params.GrantRoot != nil && *params.GrantRoot != "" {
+		response.Decision = appproto.MustReviewDecision(map[string]any{
+			"denied": map[string]string{"rejection": "Additional filesystem write access is not allowed."},
+		})
+		message = "denied apply patch write access expansion"
+	}
+	logAppServerRequest(message, params)
 	return &response, nil
 }
 
@@ -52,21 +59,71 @@ func (*AppServerRunner) ExecCommandApproval(_ context.Context, params appproto.E
 }
 
 func (*AppServerRunner) ItemCommandExecutionRequestApproval(_ context.Context, params appproto.CommandExecutionRequestApprovalParams) (*appproto.CommandExecutionRequestApprovalResponse, error) {
-	logAppServerRequest("auto-approved command execution request", params)
 	response := appproto.CommandExecutionRequestApprovalResponse{Decision: appproto.MustCommandExecutionApprovalDecision("accept")}
+	message := "auto-approved command execution request"
+	if appServerRequestsAdditionalWrite(params.AdditionalPermissions) {
+		response.Decision = appproto.MustCommandExecutionApprovalDecision("decline")
+		message = "declined command execution write access expansion"
+	}
+	logAppServerRequest(message, params)
 	return &response, nil
 }
 
 func (*AppServerRunner) ItemFileChangeRequestApproval(_ context.Context, params appproto.FileChangeRequestApprovalParams) (*appproto.FileChangeRequestApprovalResponse, error) {
-	logAppServerRequest("auto-approved file change request", params)
 	response := appproto.SanitizedFileChangeRequestApprovalResponseJSON{Decision: "accept"}
+	message := "auto-approved file change request"
+	if params.GrantRoot != nil && *params.GrantRoot != "" {
+		response.Decision = appproto.FileChangeApprovalDecisionDecline
+		message = "declined file change write access expansion"
+	}
+	logAppServerRequest(message, params)
 	return &response, nil
 }
 
 func (*AppServerRunner) ItemPermissionsRequestApproval(_ context.Context, params appproto.PermissionsRequestApprovalParams) (*appproto.PermissionsRequestApprovalResponse, error) {
-	logAppServerRequest("auto-approved permissions request", params)
 	response := appproto.PermissionsRequestApprovalResponse{Permissions: params.Permissions}
+	message := "auto-approved permissions request"
+	if appServerRequestsAdditionalWrite(params.Permissions) {
+		// An empty permission profile denies the request without returning a protocol error.
+		response.Permissions = appproto.AdditionalPermissionProfile{}
+		message = "denied permissions request with write access expansion"
+	}
+	logAppServerRequest(message, params)
 	return &response, nil
+}
+
+// appServerRequestsAdditionalWrite checks explicit permission metadata only.
+// Requests without that metadata retain their existing approval behavior.
+func appServerRequestsAdditionalWrite(permissions any) bool {
+	if permissions == nil {
+		return false
+	}
+	payload, err := json.Marshal(permissions)
+	if err != nil {
+		log.Printf("app-server runner cannot inspect additional write permissions: marshal_err=%v", err)
+		return false
+	}
+	var profile struct {
+		FileSystem struct {
+			Write   []json.RawMessage `json:"write"`
+			Entries []struct {
+				Access string `json:"access"`
+			} `json:"entries"`
+		} `json:"fileSystem"`
+	}
+	if err := json.Unmarshal(payload, &profile); err != nil {
+		log.Printf("app-server runner cannot inspect additional write permissions: decode_err=%v", err)
+		return false
+	}
+	if len(profile.FileSystem.Write) != 0 {
+		return true
+	}
+	for _, entry := range profile.FileSystem.Entries {
+		if entry.Access == string(appproto.FileSystemAccessModeWrite) {
+			return true
+		}
+	}
+	return false
 }
 
 func (*AppServerRunner) ItemToolRequestUserInput(context.Context, appproto.ToolRequestUserInputParams) (*appproto.ToolRequestUserInputResponse, error) {

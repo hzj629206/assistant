@@ -50,8 +50,13 @@ func (c *ClaudeClient) RunTurn(ctx context.Context, input string, opts RunOption
 
 	output, err := cmd.Output()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if outputFormat == JSONOutput {
+			var result ClaudeResult
+			if json.Unmarshal(output, &result) == nil && result.Err() != nil {
+				return &result, result.Err()
+			}
+		}
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			stderrText := strings.TrimSpace(string(exitErr.Stderr))
 			if stderrText != "" {
 				return nil, NewClaudeError(ErrorCommand, stderrText)
@@ -71,7 +76,7 @@ func (c *ClaudeClient) RunTurn(ctx context.Context, input string, opts RunOption
 	if err = json.Unmarshal(output, result); err != nil {
 		return nil, fmt.Errorf("decode claude json output failed: %w", err)
 	}
-	return result, nil
+	return result, result.Err()
 }
 
 // InputFormat controls Claude CLI stdin input formatting.
@@ -296,31 +301,98 @@ func NewValidationError(message string, field string, value any) *ClaudeError {
 
 // ClaudeResult represents the final Claude CLI result message.
 type ClaudeResult struct {
-	Type             string  `json:"type"`
-	Subtype          string  `json:"subtype,omitempty"`
-	Result           string  `json:"result,omitempty"`
-	StructuredOutput any     `json:"structured_output,omitempty"`
-	CostUSD          float64 `json:"total_cost_usd"`
-	DurationMS       int64   `json:"duration_ms"`
-	DurationAPIMS    int64   `json:"duration_api_ms"`
-	IsError          bool    `json:"is_error"`
-	NumTurns         int     `json:"num_turns"`
-	SessionID        string  `json:"session_id"`
+	Type                 string   `json:"type"`
+	Subtype              string   `json:"subtype,omitempty"`
+	Result               string   `json:"result,omitempty"`
+	StructuredOutput     any      `json:"structured_output,omitempty"`
+	CostUSD              float64  `json:"total_cost_usd"`
+	DurationMS           int64    `json:"duration_ms"`
+	DurationAPIMS        int64    `json:"duration_api_ms"`
+	IsError              bool     `json:"is_error"`
+	NumTurns             int      `json:"num_turns"`
+	SessionID            string   `json:"session_id"`
+	Errors               []string `json:"errors,omitempty"`
+	APIErrorStatus       *int     `json:"api_error_status,omitempty"`
+	StopReason           string   `json:"stop_reason,omitempty"`
+	TerminalReason       string   `json:"terminal_reason,omitempty"`
+	StartupFailureReason string   `json:"startup_failure_reason,omitempty"`
+}
+
+// ResultError preserves the CLI's diagnostic fields when a turn fails.
+type ResultError struct {
+	Result *ClaudeResult
+}
+
+func (e *ResultError) Error() string {
+	if e == nil || e.Result == nil {
+		return "claude code returned an error result: unknown error"
+	}
+	result := e.Result
+	var details []string
+	for _, message := range result.Errors {
+		if message = strings.TrimSpace(message); message != "" {
+			details = append(details, message)
+		}
+	}
+	if len(details) == 0 && strings.TrimSpace(result.Result) != "" {
+		details = append(details, strings.TrimSpace(result.Result))
+	}
+	if len(details) == 0 && result.StartupFailureReason != "" {
+		details = append(details, result.StartupFailureReason)
+	}
+	if len(details) == 0 && result.Subtype != "" && result.Subtype != "success" {
+		details = append(details, result.Subtype)
+	}
+	if len(details) == 0 && result.APIErrorStatus != nil {
+		details = append(details, fmt.Sprintf("API error (HTTP %d)", *result.APIErrorStatus))
+	}
+	if len(details) == 0 {
+		details = append(details, "unknown error")
+	}
+	return "claude code returned an error result: " + strings.Join(details, "; ")
+}
+
+// Err reports CLI failures even when the subprocess remains available for another turn.
+func (r *ClaudeResult) Err() error {
+	if r == nil {
+		return errors.New("claude code returned no result")
+	}
+	if r.IsError || strings.HasPrefix(r.Subtype, "error_") {
+		return &ResultError{Result: r}
+	}
+	return nil
 }
 
 // Message represents a streamed Claude CLI message.
 type Message struct {
-	Type             string          `json:"type"`
-	Subtype          string          `json:"subtype,omitempty"`
-	Message          json.RawMessage `json:"message,omitempty"`
-	SessionID        string          `json:"session_id"`
-	CostUSD          float64         `json:"total_cost_usd,omitempty"`
-	DurationMS       int64           `json:"duration_ms,omitempty"`
-	DurationAPIMS    int64           `json:"duration_api_ms,omitempty"`
-	IsError          bool            `json:"is_error,omitempty"`
-	NumTurns         int             `json:"num_turns,omitempty"`
-	Result           string          `json:"result,omitempty"`
-	StructuredOutput any             `json:"structured_output,omitempty"`
+	Type                 string          `json:"type"`
+	Subtype              string          `json:"subtype,omitempty"`
+	Message              json.RawMessage `json:"message,omitempty"`
+	SessionID            string          `json:"session_id"`
+	CostUSD              float64         `json:"total_cost_usd,omitempty"`
+	DurationMS           int64           `json:"duration_ms,omitempty"`
+	DurationAPIMS        int64           `json:"duration_api_ms,omitempty"`
+	IsError              bool            `json:"is_error,omitempty"`
+	NumTurns             int             `json:"num_turns,omitempty"`
+	Result               string          `json:"result,omitempty"`
+	StructuredOutput     any             `json:"structured_output,omitempty"`
+	Errors               []string        `json:"errors,omitempty"`
+	APIErrorStatus       *int            `json:"api_error_status,omitempty"`
+	StopReason           string          `json:"stop_reason,omitempty"`
+	TerminalReason       string          `json:"terminal_reason,omitempty"`
+	StartupFailureReason string          `json:"startup_failure_reason,omitempty"`
+	UUID                 string          `json:"uuid,omitempty"`
+	UserMessageUUID      string          `json:"user_message_uuid,omitempty"`
+	UserMessageUUIDs     []string        `json:"user_message_uuids,omitempty"`
+	ParentToolUseID      string          `json:"parent_tool_use_id,omitempty"`
+	Supersedes           []string        `json:"supersedes,omitempty"`
+	Origin               *MessageOrigin  `json:"origin,omitempty"`
+	Capabilities         []string        `json:"capabilities,omitempty"`
+}
+
+// MessageOrigin identifies CLI-generated turns, including background task notifications.
+type MessageOrigin struct {
+	Kind string `json:"kind"`
 }
 
 // MCPServerType identifies the server transport used by an MCP server.

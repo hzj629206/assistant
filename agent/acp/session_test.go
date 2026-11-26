@@ -236,6 +236,27 @@ func TestProcessSessionInterruptWaitsForTurnCompletion(t *testing.T) {
 	}
 }
 
+func TestProcessSessionDelayedInterruptDoesNotCancelNextTurn(t *testing.T) {
+	var output lockedBuffer
+	session := &processSession{sessionID: "root", transport: newRPCTransport(bytes.NewReader(nil), &output, nil, nil)}
+	previous, _, err := session.startActiveTurn("root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.finishActiveTurn(previous)
+	next, _, err := session.startActiveTurn("root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.finishActiveTurn(next)
+	if sent, sendErr := session.sendTurnCancel(previous); sent || sendErr != nil {
+		t.Fatalf("stale turn sent cancellation: sent=%t err=%v", sent, sendErr)
+	}
+	if output.String() != "" {
+		t.Fatalf("delayed cancellation reached the next turn: %q", output.String())
+	}
+}
+
 func TestProcessSessionRunTurnReturnsCanceledWhenInterruptedPromptStillCompletes(t *testing.T) {
 	var output lockedBuffer
 	reader, writer := io.Pipe()
@@ -357,9 +378,7 @@ func TestIgnoreExpectedSignalProcessGroupError(t *testing.T) {
 }
 
 func TestSupportsAuthMethod(t *testing.T) {
-	authMethods := []struct {
-		ID string `json:"id"`
-	}{
+	authMethods := []authMethod{
 		{ID: "agent-login"},
 		{ID: "device-code"},
 	}

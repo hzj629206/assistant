@@ -38,6 +38,109 @@ func TestNewClaudeCodeRunnerPreservesExplicitPermissionMode(t *testing.T) {
 	}
 }
 
+func TestClaudeRunnerPropagatesErrorResultAndKeepsSession(t *testing.T) {
+	t.Parallel()
+	runner := NewClaudeCodeRunner(ClaudeCodeRunnerOptions{})
+	t.Cleanup(func() { _ = runner.Close() })
+	calls := 0
+	runner.sessionFactory = func(context.Context, string, claudecode.RunOptions, claudecode.SessionHooks) (claudecode.Session, error) {
+		return &fakeClaudePersistentSession{runTurn: func(context.Context, []map[string]any) (*claudecode.ClaudeResult, error) {
+			calls++
+			if calls == 1 {
+				return &claudecode.ClaudeResult{Subtype: "success", IsError: true, Result: "API Error: overloaded", SessionID: "session-error"}, nil
+			}
+			return &claudecode.ClaudeResult{Result: "recovered", SessionID: "session-error"}, nil
+		}}, nil
+	}
+	session, err := runner.StartSession(t.Context(), SessionOptions{ConversationKey: "conversation-error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	req := TurnRequest{Conversation: ConversationState{Key: "conversation-error"}, Message: InboundMessage{Kind: MessageKindText, Text: "run"}}
+	result, err := runSessionTurn(t.Context(), session, req)
+	var resultErr *claudecode.ResultError
+	if !errors.As(err, &resultErr) || result.ReplyText != "" {
+		t.Fatalf("error result was presented as a successful reply: result=%+v err=%v", result, err)
+	}
+	result, err = runSessionTurn(t.Context(), session, req)
+	if err != nil || result.ReplyText != "recovered" || result.RunnerThreadID != "session-error" {
+		t.Fatalf("session did not recover: result=%+v err=%v", result, err)
+	}
+}
+
+func TestClaudeControlRequestCancellationReachesTool(t *testing.T) {
+	t.Parallel()
+	for _, source := range []string{"request", "turn"} {
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+			requestCtx, cancelRequest := context.WithCancel(t.Context())
+			defer cancelRequest()
+			turnCtx, cancelTurn := context.WithCancel(t.Context())
+			defer cancelTurn()
+			started := make(chan struct{})
+			toolResult := make(chan error, 1)
+			control := newClaudeControlServer([]Tool{claudeContextTool{call: func(ctx context.Context, _ json.RawMessage) (any, error) {
+				req, ok := TurnRequestFromContext(ctx)
+				if !ok || req.Conversation.Key != "original" {
+					toolResult <- errors.New("missing original turn context")
+					close(started)
+					return nil, errors.New("missing original turn context")
+				}
+				close(started)
+				<-ctx.Done()
+				toolResult <- ctx.Err()
+				return nil, ctx.Err()
+			}}})
+			control.bindTurn(turnCtx, TurnRequest{Conversation: ConversationState{Key: "original"}})
+			done := make(chan error, 1)
+			go func() {
+				_, err := control.handleRequest(requestCtx, map[string]any{
+					"subtype": "mcp_message", "server_name": claudeSDKMCPServerName,
+					"message": map[string]any{"id": "tool-request", "method": "tools/call", "params": map[string]any{"name": "uppercase"}},
+				})
+				done <- err
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("tool did not start")
+			}
+			if source == "request" {
+				cancelRequest()
+			} else {
+				cancelTurn()
+			}
+			select {
+			case err := <-toolResult:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("tool context: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancellation did not reach the MCP tool")
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("MCP control handler did not return")
+			}
+		})
+	}
+}
+
+type claudeContextTool struct {
+	uppercaseTool
+
+	call func(context.Context, json.RawMessage) (any, error)
+}
+
+func (t claudeContextTool) Call(ctx context.Context, input json.RawMessage) (any, error) {
+	return t.call(ctx, input)
+}
+
 func TestNewClaudeCodeRunnerDefaultsSettingSources(t *testing.T) {
 	t.Parallel()
 
@@ -366,10 +469,10 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 			t.Fatal("expected control server with tools")
 		}
 		return &fakeClaudePersistentSession{
-			runTurn: func(_ context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
+			runTurn: func(ctx context.Context, blocks []map[string]any) (*claudecode.ClaudeResult, error) {
 				prompt = readClaudeStreamInput(blocks)
 
-				listResponse, err := hooks.HandleControlRequest(map[string]any{
+				listResponse, err := hooks.HandleControlRequest(ctx, map[string]any{
 					"subtype":     "mcp_message",
 					"server_name": claudeSDKMCPServerName,
 					"message": map[string]any{
@@ -381,7 +484,7 @@ func TestClaudeCodeRunnerRunTurnExposesNativeMCPTools(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				callResponse, err := hooks.HandleControlRequest(map[string]any{
+				callResponse, err := hooks.HandleControlRequest(ctx, map[string]any{
 					"subtype":     "mcp_message",
 					"server_name": claudeSDKMCPServerName,
 					"message": map[string]any{
@@ -1122,12 +1225,16 @@ func (s *fakeClaudePersistentSession) RunTurn(ctx context.Context, blocks []map[
 	}
 	result, err := s.runTurn(ctx, blocks)
 	if result != nil && strings.TrimSpace(result.SessionID) != "" {
+		s.mu.Lock()
 		s.currentSessionID = strings.TrimSpace(result.SessionID)
+		s.mu.Unlock()
 	}
 	return result, err
 }
 
 func (s *fakeClaudePersistentSession) SessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.currentSessionID
 }
 

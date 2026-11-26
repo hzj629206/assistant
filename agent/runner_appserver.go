@@ -113,13 +113,13 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	}
 
 	if startOptions.ApprovalPolicy == nil {
-		startOptions.ApprovalPolicy = appcodex.ApprovalPolicyOnRequest
+		startOptions.ApprovalPolicy = defaultAppServerApprovalPolicy()
 	}
 	if resumeOptions.ApprovalPolicy == nil {
-		resumeOptions.ApprovalPolicy = appcodex.ApprovalPolicyOnRequest
+		resumeOptions.ApprovalPolicy = defaultAppServerApprovalPolicy()
 	}
 	if turnOptions.ApprovalPolicy == nil {
-		turnOptions.ApprovalPolicy = appcodex.ApprovalPolicyOnRequest
+		turnOptions.ApprovalPolicy = defaultAppServerApprovalPolicy()
 	}
 
 	if turnOptions.Effort == nil {
@@ -174,6 +174,21 @@ func NewAppServerRunner(ctx context.Context, options AppServerRunnerOptions) (*A
 	runner.RegisterTools(options.Tools...)
 
 	return runner, nil
+}
+
+// defaultAppServerApprovalPolicy rejects sandbox escalation inside Codex because
+// command approval callbacks do not reliably identify requests to leave the sandbox.
+// Other approval categories remain enabled and use the existing callbacks.
+func defaultAppServerApprovalPolicy() map[string]any {
+	return map[string]any{
+		"granular": map[string]bool{
+			"sandbox_approval":    false,
+			"rules":               true,
+			"skill_approval":      true,
+			"request_permissions": true,
+			"mcp_elicitations":    true,
+		},
+	}
 }
 
 func defaultAppServerSandboxPolicy() SandboxPolicy {

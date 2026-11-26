@@ -3,6 +3,7 @@ package claudecode
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,8 +27,9 @@ var ErrProcessExited = errors.New("claude code process exited")
 var ErrSessionClosed = errors.New("claude code session closed")
 
 // SessionHooks provides session-scoped control callbacks for one persistent Claude session.
+// Callbacks may run concurrently and should stop when their request context is canceled.
 type SessionHooks struct {
-	HandleControlRequest func(map[string]any) (map[string]any, error)
+	HandleControlRequest func(context.Context, map[string]any) (map[string]any, error)
 }
 
 // SessionObserver receives optional runtime callbacks from one persistent Claude session.
@@ -82,7 +85,20 @@ type turnState struct {
 	interruptFinished  bool
 	resultCh           chan *ClaudeResult
 	errCh              chan error
-	assistantTextParts []string
+	userMessageID      string
+	runStarted         bool
+	completed          bool
+	assistantMessages  []assistantText
+}
+
+type assistantText struct {
+	uuid string
+	text string
+}
+
+type controlRequestState struct {
+	cancel context.CancelFunc
+	turn   *turnState
 }
 
 type scheduledTurn struct {
@@ -106,12 +122,14 @@ type persistentProcessSession struct {
 	turnMu  sync.Mutex
 	stateMu sync.Mutex
 
-	currentTurn *turnState
-	sessionID   string
-	initialized bool
-	waitErr     error
-	closed      bool
-	hooks       SessionHooks
+	currentTurn     *turnState
+	sessionID       string
+	initialized     bool
+	waitErr         error
+	closed          bool
+	hooks           SessionHooks
+	controlRequests map[string]*controlRequestState
+	capabilities    []string
 }
 
 // StartSession starts one reusable Claude CLI subprocess.
@@ -163,15 +181,22 @@ func (s *persistentProcessSession) SessionID() string {
 }
 
 func (s *persistentProcessSession) ScheduleTurn(ctx context.Context, blocks []map[string]any) (Turn, error) {
-	inputBytes, err := MarshalStreamJSONUserInput(blocks)
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, fmt.Errorf("generate claude user message ID: %w", err)
+	}
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	messageID := fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:])
+	inputBytes, err := marshalStreamJSONUserInput(blocks, messageID)
 	if err != nil {
 		return nil, err
 	}
-	return s.scheduleTurnWithInput(ctx, inputBytes)
+	return s.scheduleTurnWithInput(ctx, inputBytes, messageID)
 }
 
 //nolint:contextcheck // ScheduleTurn uses the caller context to wait for preemption of the previous turn.
-func (s *persistentProcessSession) scheduleTurnWithInput(ctx context.Context, inputBytes []byte) (Turn, error) {
+func (s *persistentProcessSession) scheduleTurnWithInput(ctx context.Context, inputBytes []byte, messageID string) (Turn, error) {
 	if s == nil {
 		return nil, errors.New("claude session is nil")
 	}
@@ -182,6 +207,7 @@ func (s *persistentProcessSession) scheduleTurnWithInput(ctx context.Context, in
 			return nil, err
 		}
 		turn := &turnState{
+			userMessageID:      messageID,
 			done:               make(chan struct{}),
 			interruptRequested: make(chan struct{}),
 			resultCh:           make(chan *ClaudeResult, 1),
@@ -274,9 +300,11 @@ func (s *persistentProcessSession) ensureStarted(ctx context.Context) error {
 	s.scanDone = make(chan struct{})
 
 	go func() {
+		// Drain stdout before Wait closes its pipe and publishes the process exit.
+		<-s.scanDone
 		s.waitCh <- cmd.Wait()
 	}()
-	go s.scanStdout(stdout)
+	go s.scanStdout(runCtx, stdout)
 	go s.watchExit()
 
 	return nil
@@ -321,7 +349,13 @@ func (s *persistentProcessSession) initialize(ctx context.Context) error {
 		return err
 	case err := <-turn.errCh:
 		return err
+	case result := <-turn.resultCh:
+		if err := result.Err(); err != nil {
+			return err
+		}
+		return NewClaudeError(ErrorCommand, "claude code returned a result before initialization completed")
 	case <-ctx.Done():
+		s.clearCurrentTurn(turn)
 		_ = s.Close()
 		return ctx.Err()
 	}
@@ -333,6 +367,17 @@ func (t *scheduledTurn) Run(ctx context.Context) (*ClaudeResult, error) {
 	}
 	s := t.session
 	turn := t.turn
+	s.stateMu.Lock()
+	if turn.completed {
+		s.stateMu.Unlock()
+		return nil, context.Canceled
+	}
+	if turn.runStarted {
+		s.stateMu.Unlock()
+		return nil, errors.New("claude turn run already started")
+	}
+	turn.runStarted = true
+	s.stateMu.Unlock()
 	defer s.clearCurrentTurn(turn)
 
 	if len(t.inputBytes) > 0 {
@@ -348,10 +393,23 @@ func (t *scheduledTurn) Run(ctx context.Context) (*ClaudeResult, error) {
 		if s.turnInterrupted(turn) {
 			return nil, context.Canceled
 		}
-		return result, nil
+		return result, result.Err()
 	case err := <-turn.errCh:
 		return nil, err
 	case <-ctx.Done():
+		s.sendTurnInterrupt(turn)
+		timer := time.NewTimer(defaultProcessTerminateTimeout)
+		defer timer.Stop()
+		select {
+		case <-turn.resultCh:
+		case drainErr := <-turn.errCh:
+			if drainErr != nil {
+				slog.Debug("claude session failed while canceling turn", "err", drainErr)
+			}
+		case <-timer.C:
+			s.clearCurrentTurn(turn)
+			_ = s.Close()
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -368,6 +426,10 @@ func (t *scheduledTurn) Interrupt(ctx context.Context) error {
 	}
 
 	s.stateMu.Lock()
+	if turn.completed {
+		s.stateMu.Unlock()
+		return nil
+	}
 	if s.closed {
 		s.stateMu.Unlock()
 		return ErrSessionClosed
@@ -379,6 +441,9 @@ func (t *scheduledTurn) Interrupt(ctx context.Context) error {
 	}
 	interruptDone := s.signalTurnInterruptLocked(turn)
 	done := turn.done
+	if !turn.runStarted {
+		s.clearCurrentTurnLocked(turn)
+	}
 	s.stateMu.Unlock()
 
 	select {
@@ -386,7 +451,15 @@ func (t *scheduledTurn) Interrupt(ctx context.Context) error {
 		s.stateMu.Lock()
 		err := turn.interruptErr
 		s.stateMu.Unlock()
-		return err
+		if err != nil {
+			return err
+		}
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	case <-done:
 		return nil
 	case <-ctx.Done():
@@ -411,7 +484,7 @@ func (s *persistentProcessSession) setCurrentTurn(turn *turnState) (*turnState, 
 		return nil, s.waitErr
 	}
 	if s.currentTurn != nil {
-		return s.currentTurn, nil
+		return s.currentTurn, errors.New("claude code turn already active")
 	}
 	s.currentTurn = turn
 	return nil, nil
@@ -439,11 +512,25 @@ func (s *persistentProcessSession) markInitialized() {
 func (s *persistentProcessSession) clearCurrentTurn(turn *turnState) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
+	s.clearCurrentTurnLocked(turn)
+}
+
+func (s *persistentProcessSession) clearCurrentTurnLocked(turn *turnState) {
+	if turn == nil || turn.completed {
+		return
+	}
+	turn.completed = true
 	if s.currentTurn == turn {
 		s.currentTurn = nil
 	}
+	for requestID, request := range s.controlRequests {
+		if request.turn == turn {
+			request.cancel()
+			delete(s.controlRequests, requestID)
+		}
+	}
 	s.completeTurnInterruptLocked(turn, nil)
-	if turn != nil && turn.done != nil {
+	if turn.done != nil {
 		close(turn.done)
 	}
 }
@@ -499,21 +586,26 @@ func (s *persistentProcessSession) watchTurnInterrupt(ctx context.Context, turn 
 	case <-turn.done:
 		return
 	}
+	s.sendTurnInterrupt(turn)
+}
 
+func (s *persistentProcessSession) sendTurnInterrupt(turn *turnState) {
 	s.stateMu.Lock()
 	if s.currentTurn != turn || turn.interruptFinished || turn.interruptSent {
 		s.stateMu.Unlock()
 		return
 	}
 	turn.interruptSent = true
+	request := map[string]any{"subtype": "interrupt"}
+	if slices.Contains(s.capabilities, "interrupt_cancel_queued_v1") {
+		request["cancel_queued"] = true
+	}
 	s.stateMu.Unlock()
 
 	if err := s.writeJSONLine(map[string]any{
 		"type":       "control_request",
-		"request_id": "interrupt",
-		"request": map[string]any{
-			"subtype": "interrupt",
-		},
+		"request_id": turn.interruptRequestID(),
+		"request":    request,
 	}); err != nil {
 		s.stateMu.Lock()
 		if s.currentTurn == turn {
@@ -521,6 +613,13 @@ func (s *persistentProcessSession) watchTurnInterrupt(ctx context.Context, turn 
 		}
 		s.stateMu.Unlock()
 	}
+}
+
+func (t *turnState) interruptRequestID() string {
+	if t.userMessageID == "" {
+		return "interrupt"
+	}
+	return "interrupt-" + t.userMessageID
 }
 
 func (s *persistentProcessSession) writeRaw(data []byte) error {
@@ -538,8 +637,9 @@ func (s *persistentProcessSession) writeJSONLine(payload any) error {
 	return s.writeRaw(append(data, '\n'))
 }
 
-func (s *persistentProcessSession) scanStdout(stdout io.Reader) {
+func (s *persistentProcessSession) scanStdout(ctx context.Context, stdout io.Reader) {
 	defer close(s.scanDone)
+	defer s.cancelControlRequests()
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -552,7 +652,7 @@ func (s *persistentProcessSession) scanStdout(stdout io.Reader) {
 		var envelope map[string]any
 		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
 			s.failCurrentTurn(NewClaudeError(ErrorValidation, fmt.Sprintf("failed to parse JSON message: %v", err)))
-			_ = s.Close()
+			go func() { _ = s.Close() }()
 			return
 		}
 
@@ -560,7 +660,7 @@ func (s *persistentProcessSession) scanStdout(stdout io.Reader) {
 		case "control_response":
 			s.handleControlResponse(envelope)
 		case "control_request":
-			s.handleControlRequest(envelope)
+			s.handleControlRequest(ctx, envelope)
 		default:
 			s.handleStreamMessage(envelope, line)
 		}
@@ -568,6 +668,7 @@ func (s *persistentProcessSession) scanStdout(stdout io.Reader) {
 
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		s.failCurrentTurn(NewClaudeError(ErrorCommand, fmt.Sprintf("failed to scan stream output: %v", err)))
+		go func() { _ = s.Close() }()
 	}
 }
 
@@ -596,34 +697,64 @@ func (s *persistentProcessSession) handleControlResponse(envelope map[string]any
 		}
 		s.markInitialized()
 		turn.initRespCh <- nil
-	case "interrupt":
+	case turn.interruptRequestID():
+		s.stateMu.Lock()
+		defer s.stateMu.Unlock()
 		if turn.interruptDone == nil {
 			return
 		}
 		subtype, _ := response["subtype"].(string)
 		if subtype == "error" {
-			s.stateMu.Lock()
 			s.completeTurnInterruptLocked(turn, fmt.Errorf("interrupt failed: %v", response["error"]))
-			s.stateMu.Unlock()
 			return
 		}
-		s.stateMu.Lock()
 		s.completeTurnInterruptLocked(turn, nil)
-		s.stateMu.Unlock()
 	default:
 		return
 	}
 }
 
-func (s *persistentProcessSession) handleControlRequest(envelope map[string]any) {
+func (s *persistentProcessSession) handleControlRequest(ctx context.Context, envelope map[string]any) {
 	requestID, _ := envelope["request_id"].(string)
 	request, _ := envelope["request"].(map[string]any)
 	subtype, _ := request["subtype"].(string)
+	s.stateMu.Lock()
+	if s.closed || s.waitErr != nil {
+		s.stateMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	pending := &controlRequestState{cancel: cancel}
+	if s.currentTurn != nil && s.currentTurn.initRespCh == nil {
+		pending.turn = s.currentTurn
+	}
+	if s.controlRequests == nil {
+		s.controlRequests = make(map[string]*controlRequestState)
+	}
+	if previous := s.controlRequests[requestID]; previous != nil {
+		previous.cancel()
+	}
+	s.controlRequests[requestID] = pending
+	handler := s.hooks.HandleControlRequest
+	s.stateMu.Unlock()
 	if s.observer.OnControlRequest != nil {
 		s.observer.OnControlRequest(s.pid(), requestID, subtype)
 	}
 
-	handler := s.controlRequestHandler()
+	go s.respondToControlRequest(ctx, requestID, request, pending, handler)
+}
+
+func (s *persistentProcessSession) respondToControlRequest(
+	ctx context.Context,
+	requestID string,
+	request map[string]any,
+	pending *controlRequestState,
+	handler func(context.Context, map[string]any) (map[string]any, error),
+) {
+	defer pending.cancel()
+	if ctx.Err() != nil {
+		return
+	}
 	var (
 		response map[string]any
 		err      error
@@ -631,7 +762,7 @@ func (s *persistentProcessSession) handleControlRequest(envelope map[string]any)
 	if handler == nil {
 		err = errors.New("control request handling is unavailable")
 	} else {
-		response, err = handler(request)
+		response, err = handler(ctx, request)
 	}
 	responseEnvelope := map[string]any{
 		"request_id": requestID,
@@ -647,27 +778,56 @@ func (s *persistentProcessSession) handleControlRequest(envelope map[string]any)
 		"type":     "control_response",
 		"response": responseEnvelope,
 	}
-	if err = s.writeJSONLine(payload); err != nil {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		responseEnvelope["subtype"] = "error"
+		responseEnvelope["error"] = fmt.Sprintf("encode control response: %v", err)
+		delete(responseEnvelope, "response")
+		data, err = json.Marshal(payload)
+	}
+	if err == nil {
+		s.writeMu.Lock()
+		s.stateMu.Lock()
+		active := !s.closed && ctx.Err() == nil && s.controlRequests[requestID] == pending
+		if s.controlRequests[requestID] == pending {
+			delete(s.controlRequests, requestID)
+		}
+		s.stateMu.Unlock()
+		if active {
+			_, err = s.stdinPipe.Write(append(data, '\n'))
+		}
+		s.writeMu.Unlock()
+	} else {
+		s.stateMu.Lock()
+		if s.controlRequests[requestID] == pending {
+			delete(s.controlRequests, requestID)
+		}
+		s.stateMu.Unlock()
+	}
+	if err != nil {
 		s.failCurrentTurn(NewClaudeError(ErrorCommand, fmt.Sprintf("failed to write control response: %v", err)))
 		_ = s.Close()
 	}
 }
 
-func (s *persistentProcessSession) controlRequestHandler() func(map[string]any) (map[string]any, error) {
-	if s == nil {
-		return nil
-	}
-
+func (s *persistentProcessSession) cancelControlRequests() {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	return s.hooks.HandleControlRequest
+	s.cancelControlRequestsLocked()
+}
+
+func (s *persistentProcessSession) cancelControlRequestsLocked() {
+	for requestID, pending := range s.controlRequests {
+		pending.cancel()
+		delete(s.controlRequests, requestID)
+	}
 }
 
 func (s *persistentProcessSession) handleStreamMessage(envelope map[string]any, line string) {
 	var msg Message
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		s.failCurrentTurn(NewClaudeError(ErrorValidation, fmt.Sprintf("failed to decode stream message: %v", err)))
-		_ = s.Close()
+		go func() { _ = s.Close() }()
 		return
 	}
 
@@ -700,6 +860,11 @@ func (s *persistentProcessSession) handleSystemMessage(msg *Message) {
 		s.sessionID = sessionID
 		s.stateMu.Unlock()
 	}
+	if msg.Subtype == "init" {
+		s.stateMu.Lock()
+		s.capabilities = slices.Clone(msg.Capabilities)
+		s.stateMu.Unlock()
+	}
 	if s.observer.OnSystemMessage != nil {
 		s.observer.OnSystemMessage(s.pid(), msg)
 	}
@@ -718,15 +883,36 @@ func (s *persistentProcessSession) handleAssistantMessage(msg *Message) {
 	}
 
 	turn := s.getCurrentTurn()
-	if turn == nil {
+	if turn == nil || !turn.acceptsMessage(msg) {
 		return
 	}
+	turn.assistantMessages = slices.DeleteFunc(turn.assistantMessages, func(previous assistantText) bool {
+		return previous.uuid != "" && (previous.uuid == msg.UUID || slices.Contains(msg.Supersedes, previous.uuid))
+	})
+	var text strings.Builder
 	for _, block := range roleMessage.Content {
 		if block.Type != "text" || block.Text == "" {
 			continue
 		}
-		turn.assistantTextParts = append(turn.assistantTextParts, block.Text)
+		text.WriteString(block.Text)
 	}
+	turn.assistantMessages = append(turn.assistantMessages, assistantText{uuid: msg.UUID, text: text.String()})
+}
+
+func (t *turnState) acceptsMessage(msg *Message) bool {
+	if msg.ParentToolUseID != "" {
+		return false
+	}
+	if t.userMessageID == "" {
+		return true
+	}
+	if len(msg.UserMessageUUIDs) > 0 {
+		return slices.Contains(msg.UserMessageUUIDs, t.userMessageID)
+	}
+	if msg.UserMessageUUID != "" {
+		return msg.UserMessageUUID == t.userMessageID
+	}
+	return msg.Origin == nil || msg.Origin.Kind != "task-notification"
 }
 
 func (s *persistentProcessSession) handleUserMessage(msg *Message) {
@@ -753,16 +939,21 @@ func (s *persistentProcessSession) handleResultMessage(envelope map[string]any, 
 	}
 
 	result := &ClaudeResult{
-		Type:             msg.Type,
-		Subtype:          msg.Subtype,
-		Result:           msg.Result,
-		StructuredOutput: msg.StructuredOutput,
-		CostUSD:          msg.CostUSD,
-		DurationMS:       msg.DurationMS,
-		DurationAPIMS:    msg.DurationAPIMS,
-		IsError:          msg.IsError,
-		NumTurns:         msg.NumTurns,
-		SessionID:        msg.SessionID,
+		Type:                 msg.Type,
+		Subtype:              msg.Subtype,
+		Result:               msg.Result,
+		StructuredOutput:     msg.StructuredOutput,
+		CostUSD:              msg.CostUSD,
+		DurationMS:           msg.DurationMS,
+		DurationAPIMS:        msg.DurationAPIMS,
+		IsError:              msg.IsError,
+		NumTurns:             msg.NumTurns,
+		SessionID:            msg.SessionID,
+		Errors:               msg.Errors,
+		APIErrorStatus:       msg.APIErrorStatus,
+		StopReason:           msg.StopReason,
+		TerminalReason:       msg.TerminalReason,
+		StartupFailureReason: msg.StartupFailureReason,
 	}
 
 	s.stateMu.Lock()
@@ -771,19 +962,34 @@ func (s *persistentProcessSession) handleResultMessage(envelope map[string]any, 
 	}
 	turn := s.currentTurn
 	s.stateMu.Unlock()
-	if turn != nil && result.Result == "" && result.StructuredOutput == nil {
-		result.Result = strings.Join(turn.assistantTextParts, "")
+	if turn == nil || !turn.acceptsMessage(msg) {
+		return
 	}
-	if turn != nil {
-		turn.resultCh <- result
+	if result.Err() == nil && result.Result == "" && result.StructuredOutput == nil {
+		var text strings.Builder
+		for _, message := range turn.assistantMessages {
+			text.WriteString(message.text)
+		}
+		result.Result = text.String()
+	}
+	select {
+	case turn.resultCh <- result:
+	default:
+		slog.Warn("ignoring duplicate claude result", "session_id", result.SessionID)
 	}
 }
 
 func (s *persistentProcessSession) handleControlCancelRequest(envelope map[string]any) {
+	requestID, _ := envelope["request_id"].(string)
+	s.stateMu.Lock()
+	if pending := s.controlRequests[requestID]; pending != nil {
+		pending.cancel()
+		delete(s.controlRequests, requestID)
+	}
+	s.stateMu.Unlock()
 	if s.observer.OnControlCancelRequest == nil {
 		return
 	}
-	requestID, _ := envelope["request_id"].(string)
 	s.observer.OnControlCancelRequest(s.pid(), requestID)
 }
 
@@ -791,6 +997,7 @@ func (s *persistentProcessSession) watchExit() {
 	rawWaitErr := awaitProcess(s.waitCh)
 	err := IgnoreExpectedExit(rawWaitErr)
 	s.stateMu.Lock()
+	s.cancelControlRequestsLocked()
 	closed := s.closed
 	if s.waitErr == nil {
 		if err == nil && !closed {
@@ -809,7 +1016,12 @@ func (s *persistentProcessSession) watchExit() {
 		s.stateMu.Lock()
 		s.completeTurnInterruptLocked(turn, err)
 		s.stateMu.Unlock()
-		turn.errCh <- err
+		if len(turn.resultCh) == 0 {
+			select {
+			case turn.errCh <- err:
+			default:
+			}
+		}
 	}
 }
 
@@ -852,6 +1064,7 @@ func (s *persistentProcessSession) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.cancelControlRequestsLocked()
 	cmd := s.cmd
 	stdinPipe := s.stdinPipe
 	cancel := s.cancel
@@ -861,6 +1074,9 @@ func (s *persistentProcessSession) Close() error {
 	var turnDone chan struct{}
 	if turn != nil && turn.done != nil {
 		turnDone = s.signalTurnInterruptLocked(turn)
+		if !turn.runStarted {
+			s.clearCurrentTurnLocked(turn)
+		}
 	}
 	s.stateMu.Unlock()
 

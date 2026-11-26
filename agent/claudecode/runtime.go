@@ -72,6 +72,10 @@ func BuildUserContentBlocks(prompt string, imagePaths []string) ([]map[string]an
 
 // MarshalStreamJSONUserInput encodes one Claude stream-json user input event.
 func MarshalStreamJSONUserInput(blocks []map[string]any) ([]byte, error) {
+	return marshalStreamJSONUserInput(blocks, "")
+}
+
+func marshalStreamJSONUserInput(blocks []map[string]any, messageID string) ([]byte, error) {
 	content := blocks
 	if len(content) == 0 {
 		content = []map[string]any{{
@@ -86,6 +90,9 @@ func MarshalStreamJSONUserInput(blocks []map[string]any) ([]byte, error) {
 			"role":    "user",
 			"content": content,
 		},
+	}
+	if messageID != "" {
+		payload["uuid"] = messageID
 	}
 
 	data, err := json.Marshal(payload)

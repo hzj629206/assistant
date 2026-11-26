@@ -2,6 +2,45 @@ package adapter
 
 import "testing"
 
+func TestNormalizeSeaTalkMarkdownPreservesInlineCodeSource(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "multiple backtick delimiters",
+			input: "**before ``a`b`` after**",
+			want:  "**before** ``a`b`` **after**",
+		},
+		{
+			name:  "code span whitespace",
+			input: "**before ` code ` after**",
+			want:  "**before** ` code ` **after**",
+		},
+		{
+			name:  "code span line break",
+			input: "**before `first\nsecond` after**",
+			want:  "**before** `first\nsecond` **after**",
+		},
+		{
+			name:  "code span entities and escapes",
+			input: "**before `&amp; \\*raw\\*` after**",
+			want:  "**before** `&amp; \\*raw\\*` **after**",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := normalizeSeaTalkMarkdown(test.input); got != test.want {
+				t.Fatalf("normalize Markdown: got %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeSeaTalkMarkdownPreservesTables(t *testing.T) {
 	t.Parallel()
 

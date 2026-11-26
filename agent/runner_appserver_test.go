@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -939,12 +938,12 @@ func TestItemFileChangeRequestApprovalAcceptsByDefault(t *testing.T) {
 	}
 }
 
-func TestItemPermissionsRequestApprovalMirrorsRequestedPermissions(t *testing.T) {
+func TestItemPermissionsRequestApprovalDeniesRequestedPermissions(t *testing.T) {
 	t.Parallel()
 
 	runner := &AppServerRunner{}
 	permissions := map[string]any{
-		"shell": "allow",
+		"fileSystem": map[string]any{"write": []string{"/opt/output"}},
 	}
 	response, err := runner.ItemPermissionsRequestApproval(context.Background(), protocol.PermissionsRequestApprovalParams{
 		ThreadID:    "thread-1",
@@ -958,8 +957,295 @@ func TestItemPermissionsRequestApprovalMirrorsRequestedPermissions(t *testing.T)
 	if response == nil {
 		t.Fatal("expected response")
 	}
-	if !reflect.DeepEqual(response.Permissions, permissions) {
-		t.Fatalf("unexpected permissions: %#v", response.Permissions)
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal approval response: %v", err)
+	}
+	if string(payload) != `{"permissions":{}}` {
+		t.Fatalf("expected no permission grants, got %s", payload)
+	}
+}
+
+func TestAppServerRPCDispatchesApprovalRequests(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name   string
+		method string
+		params string
+		result string
+	}{
+		{
+			name:   "command with structured decisions",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"kind":"command","startedAtMs":0,"environmentId":null,
+				"approvalId":"approval-1","reason":"Network access requires approval",
+				"command":"curl https://example.com","cwd":"/tmp",
+				"commandActions":[{"type":"unknown","command":"curl https://example.com"}],
+				"additionalPermissions":{"network":{"enabled":true}},
+				"networkApprovalContext":{"host":"example.com","protocol":"https"},
+				"proposedExecpolicyAmendment":["curl"],
+				"proposedNetworkPolicyAmendments":[{"host":"example.com","action":"allow"}],
+				"availableDecisions":[
+					"accept","acceptForSession","decline","cancel",
+					{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["curl"]}},
+					{"applyNetworkPolicyAmendment":{
+						"network_policy_amendment":{"host":"example.com","action":"allow"}
+					}}
+				]
+			}`,
+			result: `{"decision":"accept"}`,
+		},
+		{
+			name:   "command without kind",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"command":"pwd","cwd":"/tmp"
+			}`,
+			result: `{"decision":"accept"}`,
+		},
+		{
+			name:   "command requests outside write access",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"command":"touch /opt/output/result.txt","cwd":"/workspace",
+				"reason":"Write outside the workspace",
+				"additionalPermissions":{"fileSystem":{"write":["/opt/output"]}},
+				"availableDecisions":["accept","decline",
+					{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["touch"]}}
+				]
+			}`,
+			result: `{"decision":"decline"}`,
+		},
+		{
+			name:   "write stdin",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"kind":"writeStdin","startedAtMs":0,"environmentId":null,
+				"availableDecisions":["accept","decline","cancel"]
+			}`,
+			result: `{"decision":"accept"}`,
+		},
+		{
+			name:   "file change requests outside write root",
+			method: "item/fileChange/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"grantRoot":"/opt/output","reason":"Write outside the workspace"
+			}`,
+			result: `{"decision":"decline"}`,
+		},
+		{
+			name:   "file change without grant root",
+			method: "item/fileChange/requestApproval",
+			params: `{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1"}`,
+			result: `{"decision":"accept"}`,
+		},
+		{
+			name:   "legacy patch requests outside write root",
+			method: "applyPatchApproval",
+			params: `{
+				"conversationId":"thread-1","callId":"item-1","grantRoot":"/opt/output",
+				"fileChanges":{"/opt/output/result.txt":{"type":"add","content":"result"}}
+			}`,
+			result: `{"decision":{"denied":{"rejection":"Additional filesystem write access is not allowed."}}}`,
+		},
+		{
+			name:   "legacy patch without grant root",
+			method: "applyPatchApproval",
+			params: `{
+				"conversationId":"thread-1","callId":"item-1",
+				"fileChanges":{"/opt/output/result.txt":{"type":"add","content":"result"}}
+			}`,
+			result: `{"decision":"approved"}`,
+		},
+		{
+			name:   "legacy command without explicit permission metadata",
+			method: "execCommandApproval",
+			params: `{
+				"conversationId":"thread-1","callId":"item-1",
+				"command":["touch","/opt/output/result.txt"],"cwd":"/workspace","parsedCmd":[],
+				"reason":"Write outside the workspace"
+			}`,
+			result: `{"decision":"approved"}`,
+		},
+		{
+			name:   "additional filesystem and network permissions",
+			method: "item/permissions/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"startedAtMs":0,"environmentId":null,"cwd":"/tmp",
+				"reason":"Access an external directory and the network",
+				"permissions":{
+					"fileSystem":{"read":["/opt/data"],"write":["/opt/output"]},
+					"network":{"enabled":true}
+				}
+			}`,
+			result: `{"permissions":{}}`,
+		},
+		{
+			name:   "additional filesystem entries",
+			method: "item/permissions/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","cwd":"/workspace",
+				"permissions":{"fileSystem":{"entries":[
+					{"path":{"type":"path","path":"/opt/output"},"access":"write"}
+				]}}
+			}`,
+			result: `{"permissions":{}}`,
+		},
+		{
+			name:   "unknown additional permissions",
+			method: "item/permissions/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","cwd":"/workspace",
+				"permissions":{"futurePermission":{"enabled":true}}
+			}`,
+			result: `{"permissions":{"futurePermission":{"enabled":true}}}`,
+		},
+		{
+			name:   "network and read permissions retain automatic approval",
+			method: "item/permissions/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","cwd":"/workspace",
+				"permissions":{"network":{"enabled":true},"fileSystem":{"read":["/opt/data"]}}
+			}`,
+			result: `{"permissions":{"network":{"enabled":true},"fileSystem":{"read":["/opt/data"]}}}`,
+		},
+		{
+			name:   "command read entries retain automatic approval",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"additionalPermissions":{"fileSystem":{"entries":[
+					{"path":{"type":"path","path":"/opt/data"},"access":"read"}
+				]}}
+			}`,
+			result: `{"decision":"accept"}`,
+		},
+		{
+			name:   "command write entries decline",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"additionalPermissions":{"fileSystem":{"entries":[
+					{"path":{"type":"path","path":"/opt/output"},"access":"write"}
+				]}}
+			}`,
+			result: `{"decision":"decline"}`,
+		},
+		{
+			name:   "command reason alone retains automatic approval",
+			method: "item/commandExecution/requestApproval",
+			params: `{
+				"threadId":"thread-1","turnId":"turn-1","itemId":"item-1",
+				"reason":"Write outside the workspace"
+			}`,
+			result: `{"decision":"accept"}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientInfo := protocol.ClientInfo{Name: "assistant-test", Version: "test"}
+			transcript := []apprpc.TranscriptEntry{
+				appServerWriteLine(t, apprpc.JSONRPCRequest{
+					ID:     apprpc.NewIntRequestID(1),
+					Method: "initialize",
+					Params: appServerMustRaw(t, protocol.InitializeParams{
+						ClientInfo:   clientInfo,
+						Capabilities: &protocol.InitializeCapabilities{ExperimentalApi: true},
+					}),
+				}),
+				{Direction: apprpc.TranscriptRead, Line: `{"id":1,"result":{}}`},
+				appServerWriteLine(t, apprpc.JSONRPCNotification{Method: "initialized"}),
+				appServerWriteLine(t, apprpc.JSONRPCRequest{
+					ID:     apprpc.NewIntRequestID(2),
+					Method: "turn/start",
+					Params: json.RawMessage(`{"threadId":"thread-1","input":[]}`),
+				}),
+				appServerReadLine(t, apprpc.JSONRPCRequest{
+					ID:     apprpc.NewIntRequestID(99),
+					Method: test.method,
+					Params: json.RawMessage(test.params),
+				}),
+				appServerWriteLine(t, apprpc.JSONRPCResponse{
+					ID:     apprpc.NewIntRequestID(99),
+					Result: json.RawMessage(test.result),
+				}),
+				{Direction: apprpc.TranscriptRead, Line: `{"id":2,"result":{"turn":{"id":"turn-1"}}}`},
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			runner := &AppServerRunner{turnOptions: appcodex.TurnOptions{
+				Cwd: "/workspace",
+				SandboxPolicy: SandboxPolicy{
+					"type":          "workspaceWrite",
+					"writableRoots": []string{"/workspace", "/configured-output"},
+				},
+			}}
+			client, closeFn, _, err := newAppServerRPCClient(ctx, appcodex.Options{
+				Transport:  apprpc.NewReplayTransport(transcript),
+				ClientInfo: clientInfo,
+			}, nil, newAppServerRequestCallbacks(runner))
+			if err != nil {
+				t.Fatalf("initialize RPC client: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := closeFn(); err != nil {
+					t.Errorf("close RPC client: %v", err)
+				}
+			})
+
+			// The turn response is released only after the SDK decodes the approval,
+			// dispatches our callback, and sends the expected JSON-RPC response.
+			params := json.RawMessage(`{"threadId":"thread-1","input":[]}`)
+			if err := client.Call(ctx, "turn/start", params, nil); err != nil {
+				t.Fatalf("complete turn request after approval: %v", err)
+			}
+		})
+	}
+}
+
+func TestAppServerRequestsAdditionalWrite(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		permissions any
+		want        bool
+	}{
+		{name: "missing permissions"},
+		{name: "network only", permissions: json.RawMessage(`{"network":{"enabled":true}}`)},
+		{name: "read only", permissions: json.RawMessage(`{"fileSystem":{"read":["/opt/data"]}}`)},
+		{name: "empty writes", permissions: json.RawMessage(`{"fileSystem":{"write":[]}}`)},
+		{name: "null writes", permissions: json.RawMessage(`{"fileSystem":{"write":null}}`)},
+		{name: "unknown fields", permissions: json.RawMessage(`{"futurePermission":{"enabled":true}}`)},
+		{
+			name:        "write paths",
+			permissions: json.RawMessage(`{"fileSystem":{"write":["/opt/output"]}}`),
+			want:        true,
+		},
+		{
+			name: "typed SDK profile",
+			permissions: protocol.AdditionalPermissionProfile{FileSystem: &protocol.AdditionalFileSystemPermissions{
+				Write: new(protocol.AdditionalFileSystemPermissionsWrite{"/opt/output"}),
+			}},
+			want: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := appServerRequestsAdditionalWrite(test.permissions); got != test.want {
+				t.Fatalf("write access expansion = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -1109,6 +1395,10 @@ func TestShouldIgnoreAppServerNotification(t *testing.T) {
 func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 	t.Parallel()
 
+	approvalPolicy := json.RawMessage(`{"granular":{
+		"sandbox_approval":false,"rules":true,"skill_approval":true,
+		"request_permissions":true,"mcp_elicitations":true
+	}}`)
 	cwd := filepath.Join(t.TempDir(), "workspace")
 	if err := os.MkdirAll(cwd, 0o750); err != nil {
 		t.Fatalf("create cwd failed: %v", err)
@@ -1140,7 +1430,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			Params: appServerMustRaw(t, map[string]any{
 				"model":                 testDefaultModel,
 				"cwd":                   cwd,
-				"approvalPolicy":        "on-request",
+				"approvalPolicy":        approvalPolicy,
 				"developerInstructions": "Global system prompt.",
 				"config": map[string]any{
 					"web_search": "live",
@@ -1178,7 +1468,7 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 					},
 				},
 				"cwd":            cwd,
-				"approvalPolicy": "on-request",
+				"approvalPolicy": approvalPolicy,
 				"sandboxPolicy": map[string]any{
 					"type": "readOnly",
 				},
@@ -1246,6 +1536,22 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 				},
 			}),
 		}),
+		appServerWriteLine(t, apprpc.JSONRPCRequest{
+			ID:     apprpc.NewIntRequestID(4),
+			Method: "thread/resume",
+			Params: appServerMustRaw(t, map[string]any{
+				"threadId":       "thr-native",
+				"model":          testDefaultModel,
+				"cwd":            cwd,
+				"approvalPolicy": approvalPolicy,
+				"sandbox":        "read-only",
+				"config":         map[string]any{"web_search": "live"},
+			}),
+		}),
+		appServerReadLine(t, apprpc.JSONRPCResponse{
+			ID:     apprpc.NewIntRequestID(4),
+			Result: appServerMustRaw(t, map[string]any{"threadId": "thr-native"}),
+		}),
 	}
 
 	runner, err := NewAppServerRunner(context.Background(), AppServerRunnerOptions{
@@ -1258,6 +1564,10 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 			},
 		},
 		StartOptions: appcodex.ThreadStartOptions{
+			Model: testDefaultModel,
+			Cwd:   cwd,
+		},
+		ResumeOptions: appcodex.ThreadResumeOptions{
 			Model: testDefaultModel,
 			Cwd:   cwd,
 		},
@@ -1292,6 +1602,17 @@ func TestNewAppServerRunnerUsesExperimentalDynamicToolCalls(t *testing.T) {
 	}
 	if result.ReplyText != "HELLO" {
 		t.Fatalf("unexpected reply text: %q", result.ReplyText)
+	}
+	// Resuming an existing thread must also override its previous approval policy.
+	resumed, err := runner.StartSession(context.Background(), SessionOptions{
+		ConversationKey: "resumed",
+		ResumeSessionID: result.RunnerThreadID,
+	})
+	if err != nil {
+		t.Fatalf("resume session failed: %v", err)
+	}
+	if resumed.ID() != result.RunnerThreadID {
+		t.Fatalf("unexpected resumed thread id: %s", resumed.ID())
 	}
 }
 

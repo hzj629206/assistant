@@ -503,6 +503,29 @@ func TestACPRunnerSessionStatusIncludesACPMetadata(t *testing.T) {
 	}
 }
 
+func TestACPRunnerSessionStatusIncludesV2BooleanOptions(t *testing.T) {
+	t.Parallel()
+
+	session := &acpRunnerSession{
+		runner: NewACPRunner(t.Context(), ACPRunnerOptions{Command: "agent"}),
+		session: &fakeACPSession{status: acp.SessionMetadata{
+			ProtocolVersion: 2,
+			ConfigOptions: json.RawMessage(`[
+				{"configId":"mode","name":"Mode","category":"mode","type":"select","currentValue":"code","options":[{"value":"code","name":"Code"}]},
+				{"configId":"fast","name":"Fast","type":"boolean","currentValue":false},
+				{"configId":"plan","name":"Plan","type":"boolean","currentValue":true}
+			]`),
+		}},
+	}
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.ConfigOptions) != 3 || status.ConfigOptions[0].CurrentValue != "code" || status.ConfigOptions[1].CurrentValue != "false" || status.ConfigOptions[2].CurrentValue != "true" {
+		t.Fatalf("incorrect v2 config values: %+v", status.ConfigOptions)
+	}
+}
+
 func TestACPRunnerSessionInterruptWaitsForActiveTurnCompletion(t *testing.T) {
 	t.Parallel()
 

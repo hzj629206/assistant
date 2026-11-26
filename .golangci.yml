@@ -91,6 +91,7 @@ linters:
         - exhaustive
         # Checks if all structure fields are initialized.
         - exhaustruct
+        - exhaustruct_v5
         # Computes and checks the cyclomatic complexity of functions.
         - gocyclo
         # Checks the struct tags.

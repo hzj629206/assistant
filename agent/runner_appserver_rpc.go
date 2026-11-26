@@ -356,7 +356,8 @@ func newAppServerRPCClient(ctx context.Context, options appcodex.Options, existi
 		}
 	}
 
-	rpcClient, err := apprpc.NewClientChecked(transport, apprpc.ClientOptions{
+	// Temporary SDK field-name workaround; see appServerApprovalTransport for removal criteria.
+	rpcClient, err := apprpc.NewClientChecked(appServerApprovalTransport{Transport: transport}, apprpc.ClientOptions{
 		Logger:         logger,
 		RequestHandler: callbacks,
 	})

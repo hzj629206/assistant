@@ -244,6 +244,7 @@ func TestPersistentProcessSessionHandleResultMessagePreservesWhitespaceOnlyResul
 
 func newTestTurnState() *turnState {
 	return &turnState{
+		runStarted:         true,
 		done:               make(chan struct{}),
 		interruptRequested: make(chan struct{}),
 		errCh:              make(chan error, 1),
@@ -300,6 +301,7 @@ func TestPersistentProcessSessionInterruptWritesInterruptRequest(t *testing.T) {
 			"subtype":    "success",
 		},
 	})
+	session.clearCurrentTurn(turn)
 
 	select {
 	case err := <-done:
@@ -359,6 +361,7 @@ func TestPersistentProcessSessionInterruptIsIdempotentForConcurrentCallers(t *te
 			"subtype":    "success",
 		},
 	})
+	session.clearCurrentTurn(turn)
 
 	select {
 	case err := <-doneA:

@@ -50,9 +50,10 @@ type SessionOptions struct {
 
 // SessionMetadata contains ACP session state exposed by the protocol.
 type SessionMetadata struct {
-	SessionID     string
-	Modes         SessionModes
-	ConfigOptions json.RawMessage
+	SessionID       string
+	ProtocolVersion int
+	Modes           SessionModes
+	ConfigOptions   json.RawMessage
 }
 
 // SessionMode describes one ACP mode returned by the agent.
@@ -125,10 +126,13 @@ type PermissionHandler func(context.Context, PermissionRequest) (PermissionDecis
 
 // PermissionRequest describes one ACP permission request.
 type PermissionRequest struct {
-	Method    string
-	SessionID string
-	Options   []PermissionOption
-	Raw       json.RawMessage
+	Method      string
+	SessionID   string
+	Title       string
+	Description string
+	Subject     json.RawMessage
+	Options     []PermissionOption
+	Raw         json.RawMessage
 }
 
 // PermissionOption describes one ACP permission option.
@@ -148,6 +152,7 @@ type PermissionDecision struct {
 type SessionUpdate struct {
 	SessionID     string
 	SessionUpdate string
+	MessageID     string
 	ContentType   string
 	Text          string
 	Raw           json.RawMessage

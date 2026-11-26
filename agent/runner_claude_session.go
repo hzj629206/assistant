@@ -216,10 +216,15 @@ func (s *claudeRunnerSession) runClaudeTurn(ctx context.Context, req TurnRequest
 		imageCount,
 	)
 	result, err := turn.Run(turnCtx)
+	s.setSessionID(claudecode.ResolveSessionID(s.currentSessionID(), result))
 	if err != nil {
+		log.Printf("claude code runner turn failed: conversation=%s session_id=%s err=%v", req.Conversation.Key, s.currentSessionID(), err)
 		return nil, mapClaudeSessionError(err)
 	}
-	s.setSessionID(claudecode.ResolveSessionID(s.currentSessionID(), result))
+	if err = result.Err(); err != nil {
+		log.Printf("claude code runner turn failed: conversation=%s session_id=%s err=%v", req.Conversation.Key, s.currentSessionID(), err)
+		return nil, err
+	}
 	log.Printf(
 		"claude code runner completed turn: conversation=%s session_id=%s result_len=%d",
 		req.Conversation.Key,

@@ -67,7 +67,9 @@ and only keeps already-running turns or commands alive for a short grace period.
 
 ## Requirements
 
-This project requires `Go 1.26+`.
+This project requires `Go 1.27.4+`.
+
+For linting, use `golangci-lint v2.15.0+` built with `Go 1.27.4+`.
 
 This project depends on a locally installed agent CLI for the daemon you choose to run.
 
@@ -147,7 +149,13 @@ go install github.com/hzj629206/assistant/cmd/codexd@master
 After installation, run the service with `codexd`.
 
 Security note for `codexd`: both backends use `read-only` sandbox mode by default.
-The default `appserver` backend uses `on-request` approval, while the `exec` backend uses `never` approval.
+The default `appserver` backend uses granular approval with `sandbox_approval=false`,
+while the `exec` backend uses `never` approval.
+Codex rejects sandbox escalation before invoking the runner's approval callbacks, including attempts to write outside
+the configured writable roots. Execpolicy rule, skill, `request_permissions`, and MCP elicitation prompts remain enabled.
+The runner also denies explicit additional filesystem write grants through `grantRoot`, `additionalPermissions.fileSystem`,
+or `permissions.fileSystem` write fields. MCP tool approvals and other requests that do not require sandbox escalation
+retain their existing callback behavior.
 `WebSearch` and `NetworkAccess` are enabled by default for the local `codex` CLI backend.
 Do not store sensitive data in the working directory because the bot is able to read files from that directory, search the web, and access network resources.
 
@@ -174,6 +182,8 @@ go install github.com/hzj629206/assistant/cmd/acpd@master
 ```
 
 After installation, run the service with `acpd`.
+
+The ACP runner requests protocol v2 and continues with v1 when the agent selects it. It supports the [ACP v2 preview](https://agentclientprotocol.com/protocol/v2/migration) prompt lifecycle, message replacements and chunks, session replay through `session/resume`, `auth/login`, HTTP MCP capability negotiation, and cancellable permission requests. Foreground completion is driven by `state_update`, and child-session output is kept separate from the parent reply. Session status accepts both select and boolean configuration values. The v2 preview may change; experimental extensions are not advertised.
 
 Security note for `acpd`: the service launches a locally configured `ACP`-compatible agent process and inherits the capabilities, permissions, and authentication flow exposed by that local agent runtime. Any permission request that still requires user confirmation is currently accepted silently by default.
 Do not store sensitive data in the working directory because the configured `ACP` agent may be able to read local files, invoke tools, and access external resources depending on its implementation and configuration.

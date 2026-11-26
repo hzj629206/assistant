@@ -257,17 +257,18 @@ func (s *claudeControlServer) mcpConfigJSON() (string, error) {
 	return s.server.BuildMCPConfigJSON()
 }
 
-func (s *claudeControlServer) handleRequest(request map[string]any) (map[string]any, error) {
+func (s *claudeControlServer) handleRequest(ctx context.Context, request map[string]any) (map[string]any, error) {
 	if s == nil || s.server == nil {
 		return nil, errors.New("claude control server is nil")
 	}
 
-	ctx := context.Background()
 	s.mu.RLock()
-	if s.turnCtx != nil {
-		ctx = s.turnCtx
-	}
+	turnCtx := s.turnCtx
+	req := s.req
 	s.mu.RUnlock()
+	ctx, cancel := joinRunnerContext(ctx, turnCtx)
+	defer cancel()
+	ctx = ContextWithTurnRequest(ctx, req)
 	return s.server.HandleRequest(ctx, request)
 }
 
@@ -314,10 +315,7 @@ func (s *claudeControlServer) ListTools() []claudecode.MCPToolDefinition {
 }
 
 func (s *claudeControlServer) CallTool(ctx context.Context, toolName string, arguments map[string]any) (any, error) {
-	s.mu.RLock()
-	req := s.req
-	turnCtx := s.turnCtx
-	s.mu.RUnlock()
+	req, _ := TurnRequestFromContext(ctx)
 
 	tool, ok := s.tools[toolName]
 	if !ok {
@@ -336,13 +334,7 @@ func (s *claudeControlServer) CallTool(ctx context.Context, toolName string, arg
 		len(inputJSON),
 	)
 
-	//nolint:contextcheck // Tool calls use the active turn context when available, otherwise the request context.
-	toolCtx := ctx
-	if turnCtx != nil {
-		toolCtx = turnCtx
-	}
-	toolCtx = ContextWithTurnRequest(toolCtx, req)
-	result, err := tool.Call(toolCtx, inputJSON)
+	result, err := tool.Call(ctx, inputJSON)
 	if err != nil {
 		log.Printf(
 			"claude code runner MCP tool failed: conversation=%s tool=%s err=%v",
